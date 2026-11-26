@@ -8,6 +8,8 @@ Run a terminal command on a fresh Google Colab VM. `oncolab` provisions the VM, 
 
 [Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Security](#security-and-cleanup)
 
+![A live oncolab command from a Mac: echo Hello, world!](https://github.com/progbeat/oncolab/blob/99a0792072239bc1f8c0f8942b9cde2374abdf02/demo.webp?raw=true)
+
 ## Installation
 
 You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH.
