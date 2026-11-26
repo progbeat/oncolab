@@ -1,10 +1,10 @@
-# On Colab
+# oncolab
 
 [![Tests](https://github.com/progbeat/oncolab/actions/workflows/tests.yml/badge.svg)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
 [![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://github.com/progbeat/oncolab/blob/main/pyproject.toml)
 
-Run a terminal command on a fresh Google Colab VM. On Colab provisions the VM, sets up your environment, and releases the VM when the command exits. It runs ordinary commands, scripts already on the VM, or an interactive shell. You do not need to write a notebook or wrap your command in Python.
+Run a terminal command on a fresh Google Colab VM. `oncolab` provisions the VM, sets up your environment, and releases the VM when the command exits. It runs ordinary commands, scripts already on the VM, or an interactive shell. You do not need to write a notebook or wrap your command in Python.
 
 [Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Security](#security-and-cleanup)
 
@@ -12,7 +12,7 @@ Run a terminal command on a fresh Google Colab VM. On Colab provisions the VM, s
 
 You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH.
 
-**Colab CLI is a separate prerequisite.** On Colab calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. If it is not installed, use:
+**Colab CLI is a separate prerequisite.** `oncolab` calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. If it is not installed, use:
 
 ```sh
 uv tool install google-colab-cli
@@ -20,7 +20,7 @@ colab version
 colab sessions
 ```
 
-On Colab was tested with Colab CLI 0.8.0; it does not pin that version. If you already have Colab CLI installed, skip its installation. Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install On Colab:
+`oncolab` was tested with Colab CLI 0.8.0; it does not pin that version. If you already have Colab CLI installed, skip its installation. Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install `oncolab`:
 
 ```sh
 uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
@@ -39,11 +39,11 @@ oncolab -- bash -c 'uname -m && pwd'      # a shell expression, evaluated on the
 printf 'print(123)\n' | oncolab python3   # piped stdin; stdout is command output
 ```
 
-Commands start in `/content`. A terminal is allocated when both stdin and stdout are terminals. Put On Colab options before your command; everything after the command name is passed to it. Use `--` to mark the boundary explicitly. `-A` opts in to SSH agent forwarding; use it only when you trust the VM and its setup. Run `oncolab --help` for accelerator and memory options.
+Commands start in `/content`. A terminal is allocated when both stdin and stdout are terminals. Put `oncolab` options before your command; everything after the command name is passed to it. Use `--` to mark the boundary explicitly. `-A` opts in to SSH agent forwarding; use it only when you trust the VM and its setup. Run `oncolab --help` for accelerator and memory options.
 
 ## Configuration
 
-No config is required. On Colab reads `$XDG_CONFIG_HOME/oncolab/config.toml` (normally `~/.config/oncolab/config.toml`) or the exact path passed to `--config`. It never discovers setup from the current project. Configs are trusted local executable configuration, not files to accept from strangers.
+No config is required. `oncolab` reads `$XDG_CONFIG_HOME/oncolab/config.toml` (normally `~/.config/oncolab/config.toml`) or the exact path passed to `--config`. It never discovers setup from the current project. Configs are trusted local executable configuration, not files to accept from strangers.
 
 ```toml
 [rclone]
@@ -94,7 +94,7 @@ entrypoint = ["env", "HOME=/content/my-home"]
 run = ["mkdir", "-p", "/content/my-home"]
 ```
 
-For a wrapper script installed by setup, use `entrypoint = ["/path/to/runner"]` and finish the wrapper with `exec "$@"`. To inline a shell wrapper, use `entrypoint = ["sh", "-c", 'export MY_VAR=value; exec "$@"', "oncolab"]`; the last element is the shell's `$0`, not part of the user command. A wrapper can use `runuser` to change UID, but root-owned FUSE mounts remain owner-only by default. Use HOME-only changes if that process needs those mounts; On Colab does not enable cross-user mount access.
+For a wrapper script installed by setup, use `entrypoint = ["/path/to/runner"]` and finish the wrapper with `exec "$@"`. To inline a shell wrapper, use `entrypoint = ["sh", "-c", 'export MY_VAR=value; exec "$@"', "oncolab"]`; the last element is the shell's `$0`, not part of the user command. A wrapper can use `runuser` to change UID, but root-owned FUSE mounts remain owner-only by default. Use HOME-only changes if that process needs those mounts; `oncolab` does not enable cross-user mount access.
 
 ## Security and cleanup
 
