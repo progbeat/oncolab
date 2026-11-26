@@ -1,0 +1,5 @@
+entrypoint = ["sh", "-c", 'export HOME=/content/my-home; exec "$@"', "oncolab"]
+
+[setup.home]
+description = "Preparing HOME…"
+run = ["mkdir", "-p", "/content/my-home"]

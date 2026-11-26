@@ -1,0 +1,39 @@
+[rclone]
+config = "~/.config/rclone/rclone.conf"
+
+[mounts.work]
+source = "gdrive:work"
+target = "/content/work"
+read_only = false
+
+# Optional second mount; configure its remote before enabling it.
+# [mounts.reference]
+# source = "reference:archive"
+# target = "/mnt/reference"
+# read_only = true
+
+[setup.git]
+description = "Preparing Git…"
+run = '''
+current=$(git --version)
+current=${current#git version }
+dpkg --compare-versions "$current" ge 2.45.1 && exit 0
+. /etc/os-release
+[ "$ID:$VERSION_ID:$(uname -m)" = "ubuntu:24.04:x86_64" ] || exit 0
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL 'https://ppa.launchpadcontent.net/git-core/ppa/ubuntu/pool/main/g/git/git_2.56.1-0ppa1~ubuntu24.04.1_amd64.deb' -o "$tmp/git.deb"
+printf '%s  %s\n' 393c26f55ca46ac58b8bdc193f254c0922ea690a98ebe96b3811295f7a10d754 "$tmp/git.deb" | sha256sum -c --status
+dpkg-deb -x "$tmp/git.deb" "$HOME/.local/git"
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/git" <<'SH'
+#!/bin/sh
+export GIT_EXEC_PATH="$HOME/.local/git/usr/lib/git-core"
+exec "$HOME/.local/git/usr/bin/git" "$@"
+SH
+chmod +x "$HOME/.local/bin/git"
+'''
+
+[setup.git-on]
+description = "Installing git on…"
+run = "curl -fsSL https://sh.progbeat.dev/git-on | sh"
