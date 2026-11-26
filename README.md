@@ -12,15 +12,15 @@ Run a terminal command on a fresh Google Colab VM. On Colab provisions the VM, s
 
 You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH.
 
-**Colab CLI is a separate prerequisite.** On Colab calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. This release was tested with Colab CLI **0.8.0**. If it is not installed, use:
+**Colab CLI is a separate prerequisite.** On Colab calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. If it is not installed, use:
 
 ```sh
-uv tool install 'google-colab-cli==0.8.0'
+uv tool install google-colab-cli
 colab version
 colab sessions
 ```
 
-Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install On Colab:
+On Colab was tested with Colab CLI 0.8.0; it does not pin that version. If you already have Colab CLI installed, skip its installation. Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install On Colab:
 
 ```sh
 uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
