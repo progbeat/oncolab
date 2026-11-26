@@ -82,15 +82,24 @@ def allocate(flags, terminal, color):
     if name:
         return name, 0
     error = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", result.stderr)
-    if re.search(rb"ColabRequestError:\s+Failed to issue request POST\s+"
-                 rb"https://colab\.research\.google\.com/tun/m/assign\?\S+:"
-                 rb"\s*Service Unavailable\s*$", error):
+    if allocation_unavailable(error):
         print("oncolab: Google Colab could not allocate a VM (503 Service Unavailable). "
               "Try again in a moment.", file=sys.stderr)
     else:
         sys.stderr.buffer.write(result.stdout + result.stderr)
     return None, result.returncode or 1
 
+
+
+def allocation_unavailable(stderr):
+    # Rich may wrap the URL in the final exception across terminal lines.
+    _, found, message = stderr.rpartition(b"ColabRequestError:")
+    return bool(found and re.fullmatch(
+        rb"\s*Failed to issue request POST\s+"
+        rb"https://colab\.research\.google\.com/tun/m/assign\?[^:]*:"
+        rb"\s*Service Unavailable\s*",
+        message,
+    ))
 
 def cancel_footer(echo, color):
     tty = sys.stderr.isatty() and os.environ.get("TERM", "dumb") != "dumb"

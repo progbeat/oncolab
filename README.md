@@ -99,7 +99,7 @@ For a wrapper script installed by setup, use `entrypoint = ["/path/to/runner"]` 
 ## Development
 
 ```sh
-uv sync --locked
-uv run --locked python -m unittest discover -s tests -v
+uv --no-config sync --locked
+uv --no-config run --locked python -m unittest discover -s tests -v
 uv build
 ```

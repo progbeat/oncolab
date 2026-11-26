@@ -100,8 +100,9 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
                     await cmd()
                 return None
             self.assertEqual(await remote.setup_all(run, {"mounts": mounts, "setup": {}}, drive), 0)
-            sent = {call.kwargs["fs"]: call.kwargs["vfsOpt"]["ReadOnly"] for call in drive.rc.await_args_list}
+            sent = {call.kwargs["fs"]: call.kwargs["vfsOpt"]["ReadOnly"] for call in drive.rc.await_args_list if call.args == ("mount/mount",)}
             self.assertEqual(sent, {"demo:work": False, "demo:ref": True})
+            self.assertEqual(drive.rc.await_args.args, ("config/setpath",))
             self.assertFalse(drive.socket.exists())
             self.assertFalse(drive.config.exists())
 
@@ -164,3 +165,10 @@ class CLI(unittest.TestCase):
         payload = ["sh", "-c", 'printf "%s\\n%s\\n" "$VALUE" "$1"', "payload", 'a b $c']
         result = subprocess.run([*config["entrypoint"], *payload], capture_output=True)
         self.assertEqual((result.returncode, result.stdout), (0, b"hello world\na b $c\n"))
+
+    def test_recognizes_wrapped_colab_service_unavailable(self):
+        self.assertTrue(cli.allocation_unavailable(
+            b"Trail\nColabRequestError: Failed to issue request POST \r\n"
+            b"https://colab.research.google.com/tun/m/assign?nbh=ab\r\nc&variant=DEFAULT:"
+            b"\r\n Service Unavailable\r\n"))
+        self.assertFalse(cli.allocation_unavailable(b"ColabRequestError: Unrelated Service Unavailable"))

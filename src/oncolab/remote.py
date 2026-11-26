@@ -87,11 +87,6 @@ class DriveMounts:
         )
         for _ in range(150):
             if self.socket.is_socket():
-                # The daemon has loaded the config by this point. Token refresh
-                # must not rewrite plaintext credentials to the staging path.
-                await self.rc("config/listremotes")
-                await self.rc("config/setpath", path="/dev/null")
-                self.config.unlink()
                 return
             if self.server.poll() is not None:
                 break
@@ -160,7 +155,11 @@ async def setup_all(run, plan, drive):
 
     if drive:
         try:
-            await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
+            mount_results = await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
+            if not any(mount_results):
+                # Allow the initial OAuth refresh to save to the private tmpfs
+                # file; an empty path makes rclone retry a failed save.
+                await drive.rc("config/setpath", path="/dev/null")
         finally:
             drive.seal()
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
