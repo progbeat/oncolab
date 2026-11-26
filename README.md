@@ -18,7 +18,7 @@ uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
 oncolab --version
 ```
 
-If the tools aren't on your PATH, run `uv tool update-shell`, then reopen your terminal. On the first run, follow the Colab CLI’s sign-in prompt if it appears. Install [rclone](https://rclone.org/install/) locally only if you want Drive mounts.
+If the tools aren't on your PATH, run `uv tool update-shell`, then reopen your terminal. Run `colab sessions` once and complete any sign-in prompts there before running On Colab. Set up a Colab-compatible SSH key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Install [rclone](https://rclone.org/install/) locally only if you want Drive mounts.
 
 ## Usage
 
@@ -89,7 +89,7 @@ For a wrapper script installed by setup, use `entrypoint = ["/path/to/runner"]` 
 
 ## Security and cleanup
 
-- Only selected rclone sections travel over SSH stdin. They are staged in a private RAM-backed directory; the daemon switches to in-memory configuration and clears the staging file. Encrypted configs and FIFO loading are not part of v0.1. Never embed credentials in setup, CLI arguments, or the TOML.
+- Only selected rclone sections travel over SSH stdin. They are staged in a private RAM-backed directory; after mounting, the daemon switches to an in-memory path and the entire staging directory is removed. Encrypted configs and FIFO loading are not part of v0.1. Never embed credentials in setup, CLI arguments, or the TOML.
 - The rclone management interface is a Unix socket inside that private directory, with no TCP listener. Its pathname is removed after the mount phase, **before the entrypoint or user command**. That blocks new connections by pathname, not connections already open. Setup and the VM itself must be trusted. The daemon stays alive to serve FUSE.
 - `read_only` controls access through that mount, not the OAuth grant. Use a separately authorized least-privilege remote if the credential itself must be read-only. The configured scope is checked, but that value is not proof of what an existing OAuth token was granted.
 - SSH normally trusts the authenticated Colab bridge, as the official CLI does. For independently verified host keys, set `[ssh]` with `known_hosts = "/path/to/known_hosts"` containing the trusted key for `colab-runtime`. Do not trust a key copied from an unverified connection.

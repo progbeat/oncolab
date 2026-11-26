@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import stat
 import subprocess as sp
 import sys
@@ -103,8 +104,10 @@ class DriveMounts:
         self.attached.append(target)
 
     def seal(self):
-        self.socket.unlink(missing_ok=True)
-        self.config.unlink(missing_ok=True)
+        try:
+            shutil.rmtree(self.directory)
+        except FileNotFoundError:
+            pass
 
     def close(self):
         self.seal()
@@ -156,10 +159,15 @@ async def setup_all(run, plan, drive):
     if drive:
         try:
             mount_results = await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
-            if not any(mount_results):
+            if drive.socket.exists():
                 # Allow the initial OAuth refresh to save to the private tmpfs
                 # file; an empty path makes rclone retry a failed save.
-                await drive.rc("config/setpath", path="/dev/null")
+                try:
+                    await drive.rc("config/setpath", path="/dev/null")
+                except RuntimeError:
+                    if not any(mount_results):
+                        raise
+                    print("oncolab: could not detach rclone from its staging path", file=sys.stderr)
         finally:
             drive.seal()
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -209,13 +217,7 @@ def main():
             print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)
             released = False
         if released:
-            try:
-                if drive:
-                    drive.directory.rmdir()
-            except OSError:
-                print("oncolab: could not remove the staging directory", file=sys.stderr)
-            finally:
-                unassign()
+            unassign()
     return (status if status >= 0 else 128 - status) if released else 125
 
 
