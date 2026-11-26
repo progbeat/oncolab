@@ -170,9 +170,11 @@ def main():
     parser.add_argument("--version", action="version", version=f"oncolab {version('oncolab')}")
     parser.add_argument("--config", type=Path, help="Use an explicit local TOML configuration")
     hardware = parser.add_mutually_exclusive_group()
-    hardware.add_argument("--gpu", metavar="MODEL")
-    hardware.add_argument("--tpu", metavar="MODEL")
-    parser.add_argument("--high-mem", action="store_true")
+    hardware.add_argument("--gpu", metavar="MODEL",
+                          help="Request a GPU: T4, L4, G4, A100, H100 (subject to availability)")
+    hardware.add_argument("--tpu", metavar="MODEL",
+                          help="Request a TPU: V5E1, V6E1 (subject to availability)")
+    parser.add_argument("--high-mem", action="store_true", help="Request a high-memory VM")
     parser.add_argument("-A", "--forward-agent", action="store_true", help="Forward the local SSH agent")
     parser.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND")
     args = parser.parse_args()
