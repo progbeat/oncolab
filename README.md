@@ -10,15 +10,24 @@ Run a terminal command on a fresh Google Colab VM. On Colab provisions the VM, s
 
 ## Installation
 
-You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH. Install the official Colab CLI alongside On Colab:
+You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH.
+
+**Colab CLI is a separate prerequisite.** On Colab calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. This release was tested with Colab CLI **0.8.0**. If it is not installed, use:
 
 ```sh
-uv tool install google-colab-cli
+uv tool install 'google-colab-cli==0.8.0'
+colab version
+colab sessions
+```
+
+Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install On Colab:
+
+```sh
 uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
 oncolab --version
 ```
 
-If the tools aren't on your PATH, run `uv tool update-shell`, then reopen your terminal. Run `colab sessions` once and complete any sign-in prompts there before running On Colab. Set up a Colab-compatible SSH key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Install [rclone](https://rclone.org/install/) locally only if you want Drive mounts.
+If the tools aren't on your PATH, run `uv tool update-shell` and reopen your terminal. Install [rclone](https://rclone.org/install/) locally only if you want Drive mounts.
 
 ## Usage
 
