@@ -1,0 +1,11 @@
+# No Google Drive or local rclone required.
+# oncolab --config examples/setup.toml -- cat /tmp/oncolab-sample/value
+
+[setup.directory]
+description = "Preparing sample directory…"
+run = ["mkdir", "-p", "/tmp/oncolab-sample"]
+
+[setup.sample]
+description = "Writing sample file…"
+run = "printf '%s\\n' ready > /tmp/oncolab-sample/value"
+depends = ["directory"]

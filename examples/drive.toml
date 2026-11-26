@@ -1,0 +1,21 @@
+# Replace these remote names and paths with those in your own rclone config.
+# oncolab --config examples/drive.toml -- ls /content/work /mnt/reference
+
+[rclone]
+# config = "~/.config/rclone/rclone.conf"
+allow_full_drive = false
+
+[mounts.work]
+source = "gdrive:work"
+target = "/content/work"
+read_only = false
+
+[mounts.reference]
+source = "reference:archive"
+target = "/mnt/reference"
+read_only = true
+
+[setup.check-reference]
+description = "Checking the reference mount…"
+run = 'test -r "$ONCOLAB_MOUNT_REFERENCE"'
+depends = ["mounts.reference"]
