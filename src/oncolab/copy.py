@@ -103,7 +103,7 @@ def copy_receiver(result, targets):
         receive_archive(sys.stdin.buffer, targets)
         status = "ok"
     except (OSError, ValueError, tarfile.TarError) as exc:
-        print(f"oncolab: {exc}", file=sys.stderr)
+        print(exc, file=sys.stderr)
     finally:
         Path(result).write_text(status)
     return int(status != "ok")

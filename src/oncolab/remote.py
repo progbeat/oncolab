@@ -148,7 +148,8 @@ async def setup_all(run, plan, drive):
                     sys.stderr.buffer.write(result.stdout)
                 if result.stderr:
                     sys.stderr.buffer.write(result.stderr)
-                print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
+                if name != "copy":  # The local transfer reports its concrete error.
+                    print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
