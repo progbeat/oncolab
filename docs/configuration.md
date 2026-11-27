@@ -9,8 +9,8 @@ marks the boundary. The remaining arguments are passed to the command. Use
 
 ## SSH
 
-The GitHub SSH connection used by `uv tool install` follows your usual GitHub
-setup. The separate Colab connection does not read `~/.ssh/config`. `oncolab`
+The public installer uses HTTPS; no GitHub SSH key is needed. The connection
+to Colab does not read `~/.ssh/config`. `oncolab`
 looks for `~/.ssh/id_ed25519.pub` first, then `~/.ssh/id_ecdsa.pub`, and uses the
 matching identity if found. Otherwise it falls back to the official CLI's
 selection. For a new key, see the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md).
