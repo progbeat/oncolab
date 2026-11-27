@@ -8,7 +8,24 @@ repo=$GITHUB_REPOSITORY
 wheel="oncolab-$version-py3-none-any.whl"
 sdist="oncolab-$version.tar.gz"
 
-if [[ ! $expected_digest =~ ^[a-f0-9]{64}$ ]]; then
+if [[ $expected_digest == --recover ]]; then
+    # Only an absent published release (or a draft) calls for a fresh build.
+    if ! state=$(gh api "repos/$repo/releases/tags/$tag" \
+        --jq 'if .draft then "draft" elif .immutable then "immutable" else "mutable" end' 2>&1); then
+        if [[ $state == *'(HTTP 404)' ]]; then
+            exit 3
+        fi
+        printf '%s\n' "$state" >&2
+        exit 1
+    fi
+    if [[ $state == draft ]]; then
+        exit 3
+    fi
+    if [[ $state != immutable ]]; then
+        echo "$tag is not a published immutable release" >&2
+        exit 1
+    fi
+elif [[ ! $expected_digest =~ ^[a-f0-9]{64}$ ]]; then
     echo "Missing or invalid checksum manifest digest from the release job" >&2
     exit 1
 fi
@@ -16,7 +33,8 @@ if [[ $(gh api "repos/$repo/git/ref/tags/$tag" --jq .object.sha) != "$GITHUB_SHA
     echo "$tag does not point at the tested commit" >&2
     exit 1
 fi
-if [[ $(gh release view "$tag" --repo "$repo" --json isDraft,isImmutable --jq '.isImmutable and (.isDraft | not)') != true ]]; then
+if [[ $expected_digest != --recover ]] &&
+    [[ $(gh release view "$tag" --repo "$repo" --json isDraft,isImmutable --jq '.isImmutable and (.isDraft | not)') != true ]]; then
     echo "$tag is not a published immutable release" >&2
     exit 1
 fi
@@ -30,10 +48,12 @@ if command -v sha256sum >/dev/null; then
 else
     checksum=(shasum -a 256)
 fi
-manifest=$("${checksum[@]}" -- sha256.sum)
-if [[ ${manifest%% *} != "$expected_digest" ]]; then
-    echo "$tag checksum manifest does not match the smoke-tested distributions" >&2
-    exit 1
+if [[ $expected_digest != --recover ]]; then
+    manifest=$("${checksum[@]}" -- sha256.sum)
+    if [[ ${manifest%% *} != "$expected_digest" ]]; then
+        echo "$tag checksum manifest does not match the smoke-tested distributions" >&2
+        exit 1
+    fi
 fi
 if ! "${checksum[@]}" -- "$wheel" "$sdist" | cmp -s - sha256.sum; then
     echo "$tag distribution checksums do not match" >&2

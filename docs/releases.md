@@ -33,7 +33,10 @@ GitHub applies immutability at publication. The workflow verifies the result
 after publishing; if the setting is off, this check alerts you but does not
 prevent publication. If a run fails, inspect the release before rerunning it
 at the same commit: a pre-existing tag is accepted only if it still points to that exact
-commit. Never delete or move a published version tag. Published release notes
+commit. If the release is already immutable but its job failed, the retry
+downloads, verifies and smoke-tests the original distributions instead of
+rebuilding different bytes for the same version. Never delete or move a
+published version tag. Published release notes
 are preserved in GitHub Releases; `RELEASES.md` is just the current draft.
 
 ## One-time PyPI setup

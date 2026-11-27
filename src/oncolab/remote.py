@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import os
 import shutil
@@ -208,6 +209,20 @@ async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
                     pass
             return sp.CompletedProcess([], 1, None, b"oncolab: copy receiver exited or did not start\n")
         await asyncio.sleep(.10)
+
+
+def quiesce_archive(result, deadline):
+    lock = Path(result).with_name("publication-lock")
+    with lock.open("a") as publication:
+        while True:
+            try:
+                fcntl.flock(publication, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(.05, remaining))
 
 
 def enter_workdir(plan):
@@ -424,6 +439,29 @@ class Lifecycle:
                 for dep in self.nodes[name][1]:
                     hold(dep)
 
+        archives = {}
+        for name in self.began:
+            if result := self.nodes[name][0].get("copy_result"):
+                try:
+                    Path(result).with_name("cancelled").touch()
+                    archives[name] = result
+                except OSError as exc:
+                    print(f"oncolab: could not cancel copy for {self.nodes[name][0]['description']}: "
+                          f"{exc.strerror}; leaving the VM running", file=sys.stderr)
+                    hold(name)
+                    failed = True
+        deadline = time.monotonic() + 5
+        for name, result in archives.items():
+            try:
+                idle = quiesce_archive(result, deadline)
+            except OSError:
+                idle = False
+            if not idle:
+                print(f"oncolab: copy for {self.nodes[name][0]['description']} did not stop; "
+                      "leaving the VM running", file=sys.stderr)
+                hold(name)
+                failed = True
+
         for name in reversed(self.nodes):
             if name not in self.began or name in held:
                 continue
@@ -485,7 +523,7 @@ async def setup_all(run, plan, drive, lifecycle=None):
             if copy_supplies_workdir and not result.returncode:
                 enter_workdir(plan)
             return result
-        submit("copy", "Copying files…", copy)
+        submit("copy", "Copying files…", copy, step={"copy_result": copy_result})
 
     drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]

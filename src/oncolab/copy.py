@@ -1,11 +1,13 @@
 """One-way file staging over a separate SSH channel."""
 import errno
+import fcntl
 import os
 import select
 import shutil
 import sys
 import tarfile
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 
 
@@ -140,22 +142,28 @@ def receive_archive(stream, targets, modes=None, *, cancelled=None):
             pass
         if not complete or not all(PurePosixPath(str(i)) in seen for i in range(len(targets))):
             raise ValueError("Incomplete copy stream")
-        if cancelled and (cancelled.is_file() or not cancelled.parent.is_dir()):
-            raise ValueError("Copy cancelled before writing its destinations")
-        paths = [Path(target) for target in targets]
-        for target in paths:
-            if target.resolve() != target or target.exists():
-                raise ValueError(f"--copy destination already exists or contains a symlink: {target}")
-        for i, target in enumerate(paths):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.resolve() != target:
-                raise ValueError(f"--copy destination contains a symlink: {target}")
-            source = root / str(i)
-            mode = modes[i] if modes else None
-            if mode is None:
-                publish(source, target, directory_modes)
-            else:
-                publish(source, target, directory_modes, mode)
+        # Serialize destination writes against runner cancellation. Staging the
+        # tar stream itself does not touch destinations or setup resources.
+        lock = cancelled.with_name("publication-lock").open("a") if cancelled else nullcontext()
+        with lock as publication:
+            if publication:
+                fcntl.flock(publication, fcntl.LOCK_EX)
+            paths = [Path(target) for target in targets]
+            for target in paths:
+                if target.resolve() != target or target.exists():
+                    raise ValueError(f"--copy destination already exists or contains a symlink: {target}")
+            for i, target in enumerate(paths):
+                if cancelled and (cancelled.is_file() or not cancelled.parent.is_dir()):
+                    raise ValueError("Copy cancelled before writing its destinations")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.resolve() != target:
+                    raise ValueError(f"--copy destination contains a symlink: {target}")
+                source = root / str(i)
+                mode = modes[i] if modes else None
+                if mode is None:
+                    publish(source, target, directory_modes)
+                else:
+                    publish(source, target, directory_modes, mode)
 
 
 COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.

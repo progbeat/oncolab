@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import io
 import json
 import os
 import socket
@@ -10,7 +12,7 @@ from signal import SIGINT
 from threading import Event, Thread
 from unittest.mock import Mock, patch
 
-from oncolab import cli, remote
+from oncolab import cli, copy, remote
 from oncolab.config import ConfigError, plan
 
 
@@ -81,6 +83,87 @@ run = ["echo", ""]
 
 
 class Transfers(unittest.TestCase):
+    def test_cancel_waits_for_cross_filesystem_publication_before_teardown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"complete")
+            result = root / "copy-result"
+            archive = io.BytesIO()
+            copy.send_archive(archive, [source])
+            archive.seek(0)
+            lifecycle = remote.Lifecycle()
+            lifecycle.nodes["archive"] = ({
+                "description": "Archive", "copy_result": result,
+                "teardown": ["unused"],
+            }, ())
+            lifecycle.began.add("archive")
+            publishing, cancelling, resume = Event(), Event(), Event()
+            real_copy, real_flock = copy.shutil.copyfileobj, remote.fcntl.flock
+            errors, outcomes = [], []
+
+            def transfer(reader, writer, *args):
+                if isinstance(writer.name, int):
+                    publishing.set()
+                    self.assertTrue(resume.wait(3))
+                return real_copy(reader, writer, *args)
+
+            def receiver():
+                try:
+                    copy.receive_archive(archive, [destination], cancelled=root / "cancelled")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def flock(fd, flags):
+                try:
+                    return real_flock(fd, flags)
+                except BlockingIOError:
+                    cancelling.set()
+                    raise
+
+            def hook(*args, **kwargs):
+                self.assertEqual(destination.read_bytes(), b"complete")
+                destination.unlink()
+                return 0
+
+            with (patch.object(copy.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")),
+                  patch.object(copy.shutil, "copyfileobj", side_effect=transfer),
+                  patch.object(remote.fcntl, "flock", side_effect=flock),
+                  patch.object(remote.sp, "call", side_effect=hook) as teardown):
+                writer = Thread(target=receiver, daemon=True)
+                cleanup = Thread(target=lambda: outcomes.append(lifecycle.cleanup(None)), daemon=True)
+                writer.start()
+                try:
+                    self.assertTrue(publishing.wait(2))
+                    cleanup.start()
+                    self.assertTrue(cancelling.wait(2))
+                    teardown.assert_not_called()
+                finally:
+                    resume.set()
+                    writer.join(3)
+                    if cleanup.ident is not None:
+                        cleanup.join(3)
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes, [True])
+            self.assertFalse(destination.exists())
+
+    def test_unconfirmed_archive_quiescence_pins_its_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lifecycle = remote.Lifecycle()
+            lifecycle.nodes.update({
+                "mount": ({"description": "Mount", "teardown": ["unmount"]}, ()),
+                "archive": ({"description": "Archive", "copy_result": Path(tmp) / "copy-result",
+                             "teardown": ["cleanup-archive"]}, ("mount",)),
+                "independent": ({"description": "Independent", "teardown": ["cleanup-other"]}, ()),
+            })
+            lifecycle.began.update(lifecycle.nodes)
+            with (patch.object(remote, "quiesce_archive", return_value=False),
+                  patch.object(remote.sp, "call", return_value=0) as hook,
+                  patch("sys.stderr")):
+                self.assertFalse(lifecycle.cleanup(None))
+            self.assertTrue((Path(tmp) / "cancelled").exists())
+            self.assertEqual([call.args[0] for call in hook.call_args_list], [["cleanup-other"]])
+
     def test_five_blocked_input_streams_all_start_without_starving_an_archive(self):
         groups = {f"stream-{i}": ((), Path(f"source-{i}")) for i in range(5)}
         groups["archive"] = ([(Path("data.txt"), "/content/data.txt", None)], None)
