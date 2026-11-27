@@ -1,7 +1,9 @@
 import asyncio
+import errno
 import io
 import os
 import shlex
+import stat
 import subprocess
 import tarfile
 import sys
@@ -13,7 +15,7 @@ from unittest.mock import patch
 
 from oncolab.cli import call_with_upload, upload
 from oncolab.config import ConfigError, plan
-from oncolab.copy import copy_plan, notify_failure, publish_result, receive_archive, send_archive
+from oncolab.copy import copy_plan, notify_failure, publish, publish_result, receive_archive, send_archive
 from oncolab.remote import setup_all, wait_copy
 
 
@@ -54,6 +56,34 @@ class Copy(unittest.TestCase):
             self.assertNotEqual((destination / "a b").stat().st_ino, (destination / "hardlink").stat().st_ino)
             with self.assertRaisesRegex(ValueError, "already exists"):
                 receive_archive(io.BytesIO(stream.getvalue()), [destination, file])
+
+    def test_cross_filesystem_copy_is_private_until_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, target = root / "source", root / "target"
+            source.write_text("content")
+            source.chmod(0o644)
+
+            def copy(reader, writer):
+                self.assertEqual(stat.S_IMODE(os.fstat(writer.fileno()).st_mode), 0o600)
+                writer.write(reader.read())
+                if fail:
+                    raise OSError(errno.ENOSPC, "out of space")
+
+            with patch("oncolab.copy.os.link", side_effect=OSError(errno.EXDEV, "cross-device")), \
+                 patch("oncolab.copy.shutil.copyfileobj", side_effect=copy):
+                fail = True
+                with self.assertRaises(OSError) as caught:
+                    publish(source, target)
+                self.assertEqual(caught.exception.errno, errno.ENOSPC)
+                self.assertFalse(target.exists())
+                fail = False
+                publish(source, target)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+                self.assertEqual(target.read_text(), "content")
+                with self.assertRaises(FileExistsError):
+                    publish(source, target)
+                self.assertEqual(target.read_text(), "content")
 
     def test_notification_replaces_empty_marker_without_writing_data(self):
         with tempfile.TemporaryDirectory() as tmp:

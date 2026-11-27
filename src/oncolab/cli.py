@@ -152,15 +152,18 @@ def upload(ssh, target, result, sources, targets):
                 with process.stdin:
                     send_archive(process.stdin, sources)
             except (OSError, ValueError) as exc:
-                local_error = str(exc)
+                local_error = exc
             else:
-                local_error = ""
+                local_error = None
             status = process.wait()
             diagnostic.seek(0)
             detail = diagnostic.read().decode(errors="replace").strip()
         if not status and not local_error:
             return None, True
-        error = local_error or detail or f"copy channel exited with status {status}"
+        # A closed pipe is usually a symptom of the receiver's error.
+        if isinstance(local_error, BrokenPipeError) and detail:
+            local_error = None
+        error = (str(local_error) if local_error is not None else detail) or f"copy channel exited with status {status}"
         if status in (0, COPY_FAILED):
             return error, True
     except OSError as exc:

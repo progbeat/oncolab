@@ -66,9 +66,15 @@ def publish(source, target):
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
-            with source.open("rb") as reader, target.open("xb") as writer:
-                shutil.copyfileobj(reader, writer)
-            shutil.copystat(source, target)
+            with source.open("rb") as reader:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    with os.fdopen(fd, "wb") as writer:
+                        shutil.copyfileobj(reader, writer)
+                    shutil.copystat(source, target)
+                except BaseException:
+                    target.unlink(missing_ok=True)
+                    raise
 
 
 def receive_archive(stream, targets):
