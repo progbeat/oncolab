@@ -36,6 +36,10 @@ class Copy(unittest.TestCase):
             ]:
                 with self.assertRaises(ValueError):
                     copy_plan(specs, "/content", mounts)
+            root_alias = Path(tmp).resolve().parents[-2] / ".."
+            for path in (Path("/"), root_alias):
+                with self.assertRaisesRegex(ValueError, "filesystem root"):
+                    copy_plan([f"{path}:root-copy"], "/content", [])
 
     def test_local_filename_with_colon_cannot_select_another_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -49,6 +53,12 @@ class Copy(unittest.TestCase):
             escaped = str(literal).replace(":", r"\:")
             self.assertEqual(copy_plan([escaped, f"{escaped}:other:file"], "/content", []),
                              [(literal, "/content/train:today"), (literal, "/content/other:file")])
+            literal.unlink()
+            literal.symlink_to(root / "missing")
+            with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                copy_plan([str(literal)], "/content", [])
+            with self.assertRaisesRegex(ValueError, "regular file or directory"):
+                copy_plan([escaped], "/content", [])
 
     def test_copy_preserves_literal_backslashes(self):
         with tempfile.TemporaryDirectory() as tmp:

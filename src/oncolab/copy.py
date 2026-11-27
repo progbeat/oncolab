@@ -24,7 +24,10 @@ def split_copy_spec(spec):
 
 def literal_exists(path):
     try:
-        return Path(path).expanduser().exists()
+        Path(path).expanduser().lstat()
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except OSError as exc:
         if exc.errno != errno.ENAMETOOLONG:
             raise
@@ -46,9 +49,11 @@ def copy_plan(specs, workdir, mounts):
         if not local or sep and not remote:
             raise ValueError("--copy expects LOCAL or LOCAL:REMOTE")
         source = Path(local).expanduser().absolute()
-        if not source.name or source.is_symlink() or not (source.is_file() or source.is_dir()):
+        if source.is_symlink() or not (source.is_file() or source.is_dir()):
             raise ValueError(f"--copy source must be a regular file or directory: {local}")
         source = source.resolve()
+        if not source.name:
+            raise ValueError("--copy cannot upload the local filesystem root")
         target = PurePosixPath(remote) if sep else PurePosixPath(source.name)
         if sep and remote.endswith("/"):
             target /= source.name
