@@ -1,9 +1,9 @@
 name: Tests
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 permissions:
   contents: read
 jobs:
@@ -36,7 +36,7 @@ jobs:
       - run: uv build
 
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-policy.outputs.version != ''
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.release-policy.outputs.version != ''
     needs: [release-policy, python]
     runs-on: ubuntu-latest
     permissions:
