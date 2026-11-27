@@ -128,18 +128,21 @@ step with `copy = "prepare.sh:-"` and run `["bash", "-s"]`.
 
 ### Google Drive mounts
 
-1. Create a dedicated config, for example with
+1. If you do not already have a config, [install rclone](https://rclone.org/install/)
+   locally and run [`rclone config`](https://rclone.org/commands/rclone_config/).
+   For a separate file, use
    `rclone --config ./rclone-colab.conf config`, and add the Google Drive
    remotes you want to use on the VM. Choose OAuth scopes that grant only the
    access you need. `drive.file` is limited to files the app can access; use
    `drive.readonly` for read-only access to existing files.
 2. Copy [the one-folder profile](../examples/work.toml) to `work.toml`, substitute
    your remote and folder, and run `oncolab --config work.toml -- ls /mnt/work`.
+   Set `[rclone].config` to use a dedicated file, or omit it to use the default.
 3. To write through a mount, use `readonly = false` (the default) **and** a remote
    whose OAuth grant permits writing to the intended files.
 
 Declare `mount` as a named setup task so other tasks can wait for it with
-`needs`. For a one-off mount, keep `[rclone].config` in your profile and use:
+`needs`. For a one-off mount with your local default config, use:
 
 ```sh
 oncolab --mount source=gdrive:work,target=/content/work,readonly -- ls /content/work
@@ -157,9 +160,14 @@ non-overlapping directories below `/content`, `/mnt`, `/home`, or `/root`.
 The tool exports `ONCOLAB_MOUNT_<NAME>` to setup and the command (uppercased, with
 hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
 
-`[rclone].config` explicitly selects the file to send. Relative paths are
-resolved beside the TOML profile. All mounts in the session share a single
-config. There is no default rclone config lookup or section filtering.
+All mounts in the session share one rclone config. If `[rclone].config` is
+set, use that file; relative paths resolve beside the TOML profile. Otherwise
+use the local rclone default: `RCLONE_CONFIG`, or the first existing config
+beside the rclone executable, under `$XDG_CONFIG_HOME/rclone`,
+`~/.config/rclone/rclone.conf`, or `~/.rclone.conf`. Once the config exists,
+you do not need a local rclone executable to run oncolab. oncolab installs
+rclone and FUSE on the VM if needed. No mounts means no rclone config is
+read. The selected file is sent in full, without section filtering.
 VFS cache settings use rclone defaults.
 
 If you're upgrading a profile with `[mounts.<name>]`:

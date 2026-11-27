@@ -1,8 +1,10 @@
 import graphlib
 import os
 import re
+import sys
 import tomllib
 from pathlib import Path, PurePosixPath
+from shutil import which
 
 
 class ConfigError(ValueError):
@@ -231,10 +233,33 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
         config["ports"] = forwards
     rclone_path = None
     if mounts:
-        if "config" not in rclone:
-            raise ConfigError("Mounts require an explicit [rclone].config file")
-        rclone_path = local_path(rclone["config"], base, "rclone.config")
+        rclone_path = (local_path(rclone["config"], base, "rclone.config")
+                       if "config" in rclone else default_rclone_config())
     return config, rclone_path, known_hosts
+
+
+def default_rclone_config():
+    if "RCLONE_CONFIG" in os.environ:
+        path = os.environ["RCLONE_CONFIG"]
+        if not path or path == os.devnull or Path(path).name == "notfound":
+            raise ConfigError("RCLONE_CONFIG disables the local config; set [rclone].config for mounts")
+        return Path(path).expanduser()
+
+    candidates = []
+    if executable := which("rclone"):
+        # Go sees the invoked path on macOS and the executable target on Linux.
+        executable = Path(executable).absolute()
+        if sys.platform.startswith("linux"):
+            executable = executable.resolve()
+        candidates.append(executable.with_name("rclone.conf"))
+    if xdg := os.environ.get("XDG_CONFIG_HOME"):
+        candidates.append(Path(xdg) / "rclone/rclone.conf")
+    home = Path.home()
+    candidates.extend((home / ".config/rclone/rclone.conf", home / ".rclone.conf"))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise ConfigError("No local rclone config found; create one with rclone config or set [rclone].config")
 
 
 def read_rclone_config(path):

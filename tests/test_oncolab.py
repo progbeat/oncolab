@@ -79,6 +79,34 @@ mount = { source = "gdrive:a", target = "/mnt/a" }
 mount = { source = "gdrive:b", target = "/mnt/b" }
 """)
 
+    def test_local_rclone_config_precedence_without_running_rclone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.toml"
+            mount = '[setup.work]\nmount = { source = "test:work", target = "/mnt/work" }\n'
+            profile.write_text(mount)
+            executable = root / "bin/rclone"
+            paths = [executable.with_name("rclone.conf"), root / "xdg/rclone/rclone.conf",
+                     root / ".config/rclone/rclone.conf", root / ".rclone.conf"]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            with (patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": str(root / "xdg")}, clear=True),
+                  patch("oncolab.config.which", return_value=str(executable))):
+                for expected in paths:
+                    self.assertEqual(plan(profile)[1], expected)
+                    expected.unlink()
+                with patch.dict(os.environ, {"RCLONE_CONFIG": "~/custom.conf"}):
+                    self.assertEqual(plan(profile)[1], root / "custom.conf")
+                    profile.write_text(mount + '[rclone]\nconfig = "override.conf"\n')
+                    self.assertEqual(plan(profile)[1], root / "override.conf")
+
+    def test_no_mount_does_not_resolve_the_default_rclone_config(self):
+        with (patch.dict(os.environ, {"RCLONE_CONFIG": ""}),
+              patch("oncolab.config.default_rclone_config") as find):
+            self.assertIsNone(self.parse('[setup.run]\nrun = ["true"]\n')[1])
+            find.assert_not_called()
+
     def test_legacy_profile_keys_are_rejected(self):
         for contents, key in (
             ('[setup.old]\nscript = "not-read.sh"\n', "script"),
@@ -289,20 +317,23 @@ target = "/mnt/work"
                 self.assertEqual(operations[1:], ["recover", "close"])
                 self.assertEqual("could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
 
-    def test_mount_without_existing_explicit_config_fails_before_allocation(self):
+    def test_missing_or_disabled_rclone_config_fails_before_allocation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             profile = root / "profile.toml"
-            default = root / "rclone"
-            default.mkdir()
-            (default / "rclone.conf").write_bytes(b"must never read this")
-            for text, error in (("", "explicit [rclone].config"),
-                                ('[rclone]\nconfig = "missing.conf"\n', "config file not found")):
-                with self.subTest(text=text):
+            for text, override, error in (
+                ("", {}, "No local rclone config found"),
+                ("", {"RCLONE_CONFIG": ""}, "RCLONE_CONFIG disables the local config"),
+                ('[rclone]\nconfig = "missing.conf"\n', {}, "config file not found"),
+                ("", {"RCLONE_CONFIG": str(root / "missing.conf")}, "config file not found"),
+            ):
+                with self.subTest(text=text, override=override):
                     profile.write_text(text)
                     args = ["oncolab", "--config", str(profile),
                             "--mount", "source=first:path,target=/mnt/a", "--", "true"]
-                    with (patch("sys.argv", args), patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}),
+                    env = {"HOME": tmp, "XDG_CONFIG_HOME": tmp, **override}
+                    with (patch("sys.argv", args), patch.dict(os.environ, env, clear=True),
+                          patch("oncolab.config.which", return_value=None),
                           patch.object(cli, "allocate") as allocate,
                           patch("sys.stderr", new_callable=io.StringIO) as stderr,
                           self.assertRaises(SystemExit) as exit_status):
@@ -311,14 +342,15 @@ target = "/mnt/work"
                     self.assertIn(error, stderr.getvalue())
                     allocate.assert_not_called()
 
-    def test_whole_rclone_config_uses_only_private_bootstrap_stdin(self):
+    def test_whole_default_rclone_config_uses_only_private_bootstrap_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            profile, config_file = root / "profile.toml", root / "selected.conf"
+            profile, config_file = root / "profile.toml", root / "rclone/rclone.conf"
+            config_file.parent.mkdir()
             raw = (b"[first]\r\ntype=drive\r\ntoken=SECRET_FIXTURE\r\n"
                    b"[second]\r\ntype=crypt\r\n[unused]\r\nopaque=\xff\r\n")
             config_file.write_bytes(raw)
-            profile.write_text('[rclone]\nconfig = "selected.conf"\n')
+            profile.touch()
             args = ["oncolab", "--config", str(profile), "--mount", "source=first:two:three,target=/mnt/a",
                     "--mount", "source=second:,target=/mnt/b,readonly", "--", "true"]
             bootstrap = []
@@ -332,6 +364,8 @@ target = "/mnt/work"
                 return subprocess.CompletedProcess(argv, 0)
 
             with (patch("sys.argv", args), patch.object(cli, "allocate", return_value=("test-session", 0)),
+                  patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp}, clear=True),
+                  patch("oncolab.config.which", return_value=None),
                   patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
                   patch.object(cli.sp, "run", side_effect=run),
                   patch.object(cli.sp, "call", side_effect=lambda argv: run(argv).returncode),

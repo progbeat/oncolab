@@ -29,10 +29,10 @@ config = "./rclone-colab.conf"
 # oncolab --mount source=gdrive:work,target=/content/work -- bash
 #
 # If a mount is requested, oncolab automatically adds setup tasks to
-# install FUSE and rclone if needed, transfer the entire file explicitly
-# selected by rclone.config to private RAM-backed storage, and start a
-# managed daemon. Use a dedicated config with only credentials intended
-# for this VM; oncolab does not select sections or load a default file.
+# install FUSE and rclone if needed, transfer the entire rclone config
+# to private RAM-backed storage, and start a managed daemon.
+# Omit rclone.config to use the local rclone default. Use a dedicated
+# file if the default contains credentials you do not want on the VM.
 #
 # Before the main command starts, oncolab redirects rclone's config
 # writes to /dev/null and removes the staged config and control socket.
