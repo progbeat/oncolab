@@ -1,7 +1,7 @@
 # oncolab
 
 [![CI: passing](https://img.shields.io/github/actions/workflow/status/progbeat/oncolab/tests.yml?branch=master&event=push&label=CI)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
-[![Release v0.2.0](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.2.0)
+[![Latest release](https://img.shields.io/github/v/release/progbeat/oncolab)](https://github.com/progbeat/oncolab/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
 
 Run a terminal command on a fresh Google Colab VM, without writing a notebook.
@@ -28,11 +28,12 @@ Colab account.
 3. Install `oncolab` and run your first command:
 
    ```sh
-   uv tool install 'git+https://github.com/progbeat/oncolab.git@v0.2.0'
+   uv tool install oncolab
    oncolab echo hello
    ```
 
 Expect `hello`. No config or Drive mount is needed.
+To update later, run `uv tool upgrade oncolab`.
 
 ## Run a command
 
@@ -57,6 +58,8 @@ oncolab --gpu T4 --copy train.py --env MODE=train -- python3 train.py
 
 Put `oncolab` flags before the
 command. See `oncolab --help` for accelerator and memory options.
+Use [`-p LOCAL_PORT:REMOTE_PORT`](docs/configuration.md#local-access-to-vm-ports)
+to access a VM service from local loopback.
 
 ## Configure the VM
 
@@ -69,6 +72,8 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   and edit the source path.
 - [Advanced profiles](docs/configuration.md#examples): multiple mounts with
   separate read/write settings, Git-on, or a wrapper that changes `HOME`.
+- [Configuration showcase](examples/showcase.toml): task dependencies,
+  file inputs, managed processes, and teardown.
 
 [Configuration reference](docs/configuration.md) ·
 [Drive permissions and safety](docs/configuration.md#security-and-cleanup)

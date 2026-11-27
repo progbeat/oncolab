@@ -58,24 +58,107 @@ def profile_copies(value, base):
     return copies
 
 
-def plan(path, *, copy_requested=False):
+def argv(value, where):
+    if isinstance(value, str):
+        return ["bash", "-eo", "pipefail", "-c", string(value, where)]
+    if not isinstance(value, list):
+        raise ConfigError(f"{where} must be an array")
+    if not value:
+        raise ConfigError(f"{where} cannot be empty")
+    string(value[0], where)
+    if any(not isinstance(arg, str) or "\0" in arg for arg in value[1:]):
+        raise ConfigError(f"{where} arguments must be strings without NUL bytes")
+    return value
+
+
+def ports(values):
+    result = {}
+    for value in strings(values, "ports"):
+        if not re.fullmatch(r"[0-9]{1,5}:[0-9]{1,5}", value):
+            raise ConfigError("ports and --publish require LOCAL_PORT:REMOTE_PORT")
+        local, remote = map(int, value.split(":"))
+        if not (1 <= local <= 65535 and 1 <= remote <= 65535):
+            raise ConfigError("Port numbers must be between 1 and 65535")
+        if local in result and result[local] != remote:
+            raise ConfigError(f"Conflicting remote ports for local port {local}")
+        result[local] = remote
+    return list(result.items())
+
+
+def mount_option(value):
+    options = {}
+    for option in value.split(","):
+        key, sep, val = option.partition("=")
+        if key in options or (not sep and key != "readonly"):
+            raise ConfigError("--mount requires type=gdrive,source=PATH,target=PATH[,readonly]")
+        if key == "readonly":
+            if sep and val not in ("true", "false"):
+                raise ConfigError("--mount readonly must be true or false")
+            options[key] = not sep or val == "true"
+        else:
+            options[key] = val
+    return options
+
+
+def task_copies(value, base, where):
+    entries = value if isinstance(value, list) else [value]
+    if not entries:
+        raise ConfigError(f"{where} cannot be empty")
+    copies = []
+    for entry in entries:
+        mode = None
+        if isinstance(entry, str):
+            local, sep, remote = string(entry, where).partition(":")
+            if sep:
+                from .copy import literal_exists
+                whole = local_path(entry, base, where)
+                if literal_exists(str(whole)):
+                    raise ConfigError(f"{where}: use a table for literal paths containing ':'")
+            else:
+                remote = None
+        else:
+            table(entry, ("source", "target", "chmod"), where)
+            local = entry.get("source")
+            remote = entry["target"] if "target" in entry else None
+            if "chmod" in entry:
+                mode = entry["chmod"]
+                if type(mode) is not int or not 0 <= mode <= 0o777:
+                    raise ConfigError(f"{where}.chmod must be an integer between 0o000 and 0o777")
+        if remote is not None:
+            remote = string(remote, f"{where}.target")
+        if remote == "-" and mode is not None:
+            raise ConfigError(f"{where}: chmod does not apply to stdin")
+        copies.append((str(local_path(local, base, f"{where}.source")), remote, mode))
+    if sum(remote == "-" for _, remote, _ in copies) > 1:
+        raise ConfigError(f"{where}: only one source may stream into stdin")
+    return copies
+
+
+def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
     from .env import parse_config_env
     if path is None:
         path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "oncolab/config.toml"
         if not path.exists():
-            return {"mounts": {}, "setup": {}, "entrypoint": [], "workdir": "/content", "env": {}}, {}, None
-    path = path.expanduser()
-    with path.open("rb") as file:
-        root = tomllib.load(file)
-    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "copy"), str(path))
+            path = None
+    if path is None:
+        root, base = {}, Path.cwd()
+    else:
+        path = path.expanduser()
+        with path.open("rb") as file:
+            root = tomllib.load(file)
+        base = path.absolute().parent
+    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "copy", "ports"), str(path))
     workdir = PurePosixPath(string(root.get("workdir", "/content"), "workdir"))
     if workdir.anchor != "/" or ".." in workdir.parts:
         raise ConfigError("workdir must be an absolute VM path without '..'")
     env = parse_config_env(root.get("env", {}))
-    base = path.absolute().parent
     copies = profile_copies(root.get("copy", []), base)
     copy_requested = copy_requested or bool(copies)
-    rclone = table(root.get("rclone", {}), ("config", "allow_full_drive"), "rclone")
+    rclone = table(root.get("rclone", {}), ("config", "allow_full_drive", "remote"), "rclone")
+    default_remote = string(rclone.get("remote", "gdrive"), "rclone.remote")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", default_remote):
+        raise ConfigError("rclone.remote must name a configured rclone remote")
+    forwards = ports([*strings(root.get("ports", []), "ports"), *cli_ports])
     allow_full = boolean(rclone.get("allow_full_drive", False), "rclone.allow_full_drive")
     ssh = table(root.get("ssh", {}), ("known_hosts",), "ssh")
     known_hosts = local_path(ssh["known_hosts"], base, "ssh.known_hosts") if "known_hosts" in ssh else None
@@ -83,56 +166,91 @@ def plan(path, *, copy_requested=False):
         raise ConfigError(f"Known hosts file not found: {known_hosts}")
 
     mounts, origins, targets, env_names = {}, {}, [], set()
-    if not isinstance(root.get("mounts", {}), dict):
-        raise ConfigError("mounts must be a table")
-    for name, entry in root.get("mounts", {}).items():
+    def add_mount(name, entry, where, *, explicit=False, alternate=None):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ConfigError(f"Invalid mount name: {name!r}")
+        key = f"mounts.{name}"
+        if explicit:
+            table(entry, ("type", "source", "target", "readonly"), where)
+            if entry.get("type") != "gdrive":
+                raise ConfigError(f"{where} requires type=gdrive (local binds are not supported)")
+        else:
+            table(entry, ("source", "target", "read_only", "config"), where)
+        source = string(entry.get("source"), where + ".source")
+        if explicit:
+            source = f"{default_remote}:{source}"
+        remote, separator, _ = source.partition(":")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", remote):
+            raise ConfigError(f"{where}.source must name a configured rclone remote")
+        target = PurePosixPath(string(entry.get("target"), where + ".target"))
+        if explicit and not target.is_absolute():
+            target = workdir / target
+        if (not target.is_absolute() or target.anchor != "/" or ".." in target.parts
+                or not any(target.is_relative_to(p) and target != PurePosixPath(p)
+                           for p in ("/content", "/mnt", "/home", "/root"))):
+            raise ConfigError(f"{where}.target must be beneath /content, /mnt, /home or /root")
+        read_key = "readonly" if explicit else "read_only"
+        mount = {"source": source, "target": str(target),
+                 "read_only": boolean(entry.get(read_key, False), f"{where}.{read_key}")}
+        origin = entry.get("config", rclone.get("config"))
+        origin = local_path(origin, base, where + ".config") if origin is not None else None
+        if alternate and any(old == mount for old in mounts.values()) and origins.get(remote) == (origin, allow_full):
+            return None
         mount_env = name.upper().replace("-", "_")
         if mount_env in env_names:
             raise ConfigError(f"Mount {name!r} conflicts with another mount's environment variable")
         env_names.add(mount_env)
-        key = f"mounts.{name}"
-        table(entry, ("source", "target", "read_only", "config"), key)
-        source = string(entry.get("source"), key + ".source")
-        remote, separator, _ = source.partition(":")
-        if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", remote):
-            raise ConfigError(f"{key}.source must name a configured rclone remote")
-        target = PurePosixPath(string(entry.get("target"), key + ".target"))
-        if (not target.is_absolute() or target.anchor != "/" or ".." in target.parts
-                or not any(target.is_relative_to(p) and target != PurePosixPath(p)
-                           for p in ("/content", "/mnt", "/home", "/root"))):
-            raise ConfigError(f"{key}.target must be beneath /content, /mnt, /home or /root")
         if any(target.is_relative_to(p) or p.is_relative_to(target) for p in targets):
-            raise ConfigError(f"{key}.target overlaps another mount")
+            raise ConfigError(f"{where}.target overlaps another mount")
         targets.append(target)
-        origin = entry.get("config", rclone.get("config"))
-        origin = local_path(origin, base, key + ".config") if origin is not None else None
         if remote in origins and origins[remote][0] != origin:
             raise ConfigError(f"Remote {remote!r} refers to multiple configs; give the remotes distinct names")
         origins[remote] = (origin, allow_full)
-        mounts[key] = {"source": source, "target": str(target),
-                       "read_only": boolean(entry.get("read_only", False), key + ".read_only")}
+        mounts[key] = mount
+        return key
 
+    if not isinstance(root.get("mounts", {}), dict):
+        raise ConfigError("mounts must be a table")
+    for name, entry in root.get("mounts", {}).items():
+        add_mount(name, entry, f"mounts.{name}")
     setup = {}
     if not isinstance(root.get("setup", {}), dict):
         raise ConfigError("setup must be a table")
     for name, entry in root.get("setup", {}).items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ConfigError(f"Invalid setup step name: {name!r}")
-        table(entry, ("run", "script", "description", "depends"), f"setup.{name}")
-        if ("run" in entry) == ("script" in entry):
-            raise ConfigError(f"setup.{name} requires exactly one of run and script")
+        where = f"setup.{name}"
+        table(entry, ("run", "script", "description", "depends", "needs", "start", "ready",
+                      "teardown", "copy", "mount"), where)
+        if "needs" in entry and "depends" in entry:
+            raise ConfigError(f"{where}: specify needs or legacy depends, not both")
+        if len({"run", "script", "start", "mount"} & entry.keys()) > 1:
+            raise ConfigError(f"{where}: run, script, start and mount are mutually exclusive")
+        if "mount" in entry and "copy" in entry:
+            raise ConfigError(f"{where}: define copies and mounts as separate tasks")
+        if "ready" in entry and "start" not in entry:
+            raise ConfigError(f"{where}.ready requires start")
+        if not {"run", "script", "start", "copy", "mount"} & entry.keys():
+            raise ConfigError(f"{where}: expected run, script, start, copy or mount")
+        step = {"description": string(entry.get("description", name), f"{where}.description"),
+                "depends": strings(entry.get("needs", entry.get("depends", [])), f"{where}.needs")}
         if "script" in entry:
-            run = local_path(entry["script"], base, f"setup.{name}.script").read_text()
-        else:
-            run = entry["run"]
-        argv = (["bash", "-eo", "pipefail", "-c", string(run, f"setup.{name}.run")] if isinstance(run, str)
-                else strings(run, f"setup.{name}.run"))
-        if not argv:
-            raise ConfigError(f"setup.{name}.run cannot be empty")
-        setup[name] = {"description": string(entry.get("description", name), f"setup.{name}.description"),
-                       "argv": argv, "depends": strings(entry.get("depends", []), f"setup.{name}.depends")}
+            step["argv"] = argv(local_path(entry["script"], base, f"{where}.script").read_text(), f"{where}.run")
+        for field in ("run", "start", "ready", "teardown"):
+            if field in entry:
+                step["argv" if field == "run" else field] = argv(entry[field], f"{where}.{field}")
+        if "copy" in entry:
+            step["copies"] = task_copies(entry["copy"], base, f"{where}.copy")
+            if any(remote == "-" for _, remote, _ in step["copies"]) and not {"argv", "start"} & step.keys():
+                raise ConfigError(f"{where}.copy: target '-' requires run or start")
+        if "mount" in entry:
+            step["mount"] = add_mount(name, entry["mount"], f"{where}.mount", explicit=True)
+        setup[name] = step
+    for index, value in enumerate(cli_mounts, 1):
+        name = f"cli-{index}"
+        while name.upper().replace("-", "_") in env_names:
+            name = "cli-" + name
+        add_mount(name, mount_option(value), "--mount", explicit=True, alternate=True)
     if any(workdir.is_relative_to(target) for target in targets):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
     if copy_requested and "copy" in setup:
@@ -141,6 +259,8 @@ def plan(path, *, copy_requested=False):
         for dependency in step["depends"]:
             if dependency not in setup and dependency not in mounts and not (dependency == "copy" and copy_requested):
                 raise ConfigError(f"setup.{name}: unknown dependency {dependency!r}")
+            if any(step.get("mount") == dependency for step in setup.values()):
+                raise ConfigError(f"setup.{name}: refer to a setup mount by its task name, not {dependency!r}")
     try:
         order = graphlib.TopologicalSorter({name: step["depends"] for name, step in setup.items()}).static_order()
         setup = {name: setup[name] for name in order if name in setup}
@@ -151,6 +271,8 @@ def plan(path, *, copy_requested=False):
               "workdir": str(workdir), "env": env}
     if copies:
         config["copies"] = copies
+    if forwards:
+        config["ports"] = forwards
     return config, origins, known_hosts
 
 

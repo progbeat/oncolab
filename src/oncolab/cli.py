@@ -140,10 +140,11 @@ for directory, entries in json.load(sys.stdin).items():
 """
 
 
-def upload(ssh, target, result, sources, targets):
+def upload(ssh, target, result, sources, targets, modes=None):
     helper = files("oncolab").joinpath("copy.py").read_text()
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
-    command = shlex.join(["python3", "-c", helper, result, json.dumps(targets)])
+    command = shlex.join(["python3", "-c", helper, result, json.dumps(targets),
+                          *([json.dumps(modes)] if modes is not None else [])])
     try:
         with TemporaryFile() as diagnostic, sp.Popen(
             [*channel, command], stdin=sp.PIPE, stdout=sp.DEVNULL, stderr=diagnostic,
@@ -195,7 +196,103 @@ def call_with_upload(argv, transfer):
             process.wait()
 
 
-def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *, copies=()):
+REQUESTS = r"""import os, sys, time
+from pathlib import Path
+
+jobdir = Path(sys.argv[1])
+pending = set(sys.argv[2:])
+active = set()
+try:
+    (jobdir / "broker-pid").write_text(f"{os.getpid()}\n")
+except FileNotFoundError:
+    sys.exit(0)
+heartbeat = time.monotonic()
+while (pending or active) and jobdir.is_dir():
+    for name in sorted(pending):
+        if (jobdir / name / "requested").is_file():
+            print(name, flush=True)
+            pending.remove(name)
+            active.add(name)
+    for name in sorted(active):
+        try:
+            result = (jobdir / name / "copy-result").read_text()
+        except FileNotFoundError:
+            continue
+        if result in ("ok", "failed"):
+            active.remove(name)
+    if pending or active:
+        if time.monotonic() - heartbeat >= .5:
+            print(".", flush=True)
+            heartbeat = time.monotonic()
+        time.sleep(.05)
+"""
+
+
+def upload_tasks(ssh, target, jobdir, groups):
+    channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
+    command = shlex.join(["python3", "-c", REQUESTS, jobdir, *groups])
+    jobs, errors = [], []
+    with ThreadPoolExecutor(max_workers=4) as workers, TemporaryFile() as diagnostic, sp.Popen(
+        [*channel, command], stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=diagnostic, text=True,
+    ) as broker:
+        def wake_runner(job):
+            if job.exception() is not None or not job.result()[1]:
+                # Dropping only the broker wakes the remote copy waiters;
+                # leave the command SSH channel alive for resource teardown.
+                if broker.poll() is None:
+                    broker.terminate()
+
+        for line in broker.stdout:
+            key = line.rstrip("\n")
+            if key not in groups:
+                continue
+            sources, targets, modes = zip(*groups.pop(key))
+            job = workers.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result", sources, targets, modes)
+            jobs.append(job)
+            job.add_done_callback(wake_runner)
+        if broker.wait():
+            diagnostic.seek(0)
+            errors.append(diagnostic.read().decode(errors="replace").strip() or "task copy channel disconnected")
+        for job in jobs:
+            error, _ = job.result()
+            if error:
+                errors.append(error)
+    return errors
+
+
+def prepare_copies(config, specs, explicit):
+    mounts = [Path(mount["target"]) for mount in config["mounts"].values()]
+    workdir = config["workdir"]
+    legacy_input = [*config.pop("copies", ()), *explicit]
+    legacy = copy_plan(specs, workdir, mounts, explicit=legacy_input)
+    task_groups = {}
+    targets = [Path(target) for _, target in legacy]
+    for name, step in config.get("setup", {}).items():
+        entries = step.pop("copies", ())
+        group = []
+        for local, target, mode in entries:
+            if target == "-":
+                source = Path(local)
+                if source.is_symlink() or not source.is_file():
+                    raise ValueError(f"setup.{name}.copy: stdin source must be a regular file: {local}")
+                group.append((source.resolve(), "-", 0o600))
+                step["input"] = True
+                continue
+            [(source, destination)] = copy_plan([], workdir, mounts, explicit=[(local, target)])
+            dest = Path(destination)
+            if Path(workdir).is_relative_to(dest):
+                raise ValueError(f"setup.{name}.copy: destination cannot contain workdir: {destination}")
+            if any(dest.is_relative_to(other) or other.is_relative_to(dest) for other in targets):
+                raise ValueError(f"Overlapping --copy destination: {destination}")
+            targets.append(dest)
+            group.append((source, destination, mode))
+        if group:
+            task_groups[name] = group
+    return legacy, task_groups
+
+
+def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
+                copies=(), task_copies=None):
     proxy, identity, public = ssh_options(name)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
@@ -204,8 +301,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     result = jobdir + "/copy-result"
     config = dict(config)
     env = config.pop("env", {})
+    command_env = config.pop("command_env", {})
+    ports = config.pop("ports", ())
+    task_copies = task_copies or {}
+    groups = {}
+    config["setup"] = {name: dict(step) for name, step in config["setup"].items()}
+    markers = {"copy-result": "", "copy-ok": "ok", "copy-failed": "failed"}
     sources, targets = zip(*copies) if copies else ((), ())
-    if env or sources:
+    if env or command_env or sources or task_copies:
         config["jobdir"] = jobdir
     if sources:
         config["copy_result"] = result
@@ -213,20 +316,34 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     staging = {}
     if rclone_ini:
         staging[drive_stage] = {"rclone.conf": rclone_ini.decode()}
-    if env or sources:
-        staging[jobdir] = {"env.json": json.dumps(env)} if env else {}
+    if env or command_env or sources or task_copies:
+        staging[jobdir] = {"env.json": json.dumps([env, command_env])} if env or command_env else {}
     if sources:
-        staging[jobdir].update({"copy-result": "", "copy-ok": "ok", "copy-failed": "failed"})
+        staging[jobdir].update(markers)
+    for number, (task, entries) in enumerate(task_copies.items()):
+        key = f"task-{number}"
+        directory = f"{jobdir}/{key}"
+        staging[directory] = markers
+        config["setup"][task]["copy_result"] = f"{directory}/copy-result"
+        if config["setup"][task].pop("input", False):
+            config["setup"][task]["stdin"] = f"{directory}/stdin"
+        groups[key] = [(source, str(Path(directory) / "stdin") if target == "-" else target, mode)
+                       for source, target, mode in entries]
     # The bootstrap channel must never read the command's stdin.
     staged_input = json.dumps(staging).encode() if staging else b""
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
                           str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
-    with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(1) as transfers:
+    with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
+                           "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                            "-o", "ProxyCommand=" + shlex.join(proxy), *trust]
+        if ports:
+            connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
+            for local, remote_port in ports:
+                connect_options.extend(("-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}"))
         terminal_connect = False
         if terminal and public:
             keys = sp.run(["ssh-add", "-L"], capture_output=True).stdout.splitlines()
@@ -248,13 +365,24 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
             attempted.set()
             transfer = transfers.submit(upload, ssh, target, result, sources, targets) if sources else None
+            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups) if groups else None
             argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
+                sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
             if transfer:
-                if status and not transfer.done():
-                    sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
                 error, _ = transfer.result()
                 if error:
+                    print(f"oncolab: {error}", file=sys.stderr)
+                    status = status or 1
+            if task_upload:
+                try:
+                    transfer_errors = task_upload.result(timeout=3)
+                except TimeoutError:
+                    # The payload has exited; no remote teardown can still be waiting on this broker.
+                    sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                    transfer_errors = task_upload.result()
+                for error in transfer_errors:
                     print(f"oncolab: {error}", file=sys.stderr)
                     status = status or 1
             return status, False
@@ -269,6 +397,10 @@ def main():
                         help="Copy a file or directory to the VM before running; repeatable")
     parser.add_argument("--copy-to", action="append", nargs=2, default=[], metavar=("LOCAL", "REMOTE"),
                         help="Copy using separate literal paths; repeatable")
+    parser.add_argument("--mount", action="append", default=[], metavar="type=gdrive,source=PATH,target=PATH",
+                        help="Mount a Google Drive directory; repeatable")
+    parser.add_argument("-p", "--publish", action="append", default=[], metavar="LOCAL_PORT:REMOTE_PORT",
+                        help="Forward a local loopback TCP port to the VM; repeatable")
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
                         help="Set a value or forward a named local variable; repeatable")
     parser.add_argument("--config", type=Path, help="Use an explicit local TOML configuration")
@@ -285,11 +417,10 @@ def main():
     if not command:
         parser.error("a command is required")
     try:
-        config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to))
-        config["env"] |= parse_env(args.env)
-        copies = copy_plan(args.copy, config["workdir"],
-                           [Path(m["target"]) for m in config["mounts"].values()],
-                           explicit=[*config.pop("copies", ()), *args.copy_to])
+        config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to),
+                                            cli_mounts=args.mount, cli_ports=args.publish)
+        config["command_env"] = parse_env(args.env)
+        copies, task_groups = prepare_copies(config, args.copy, args.copy_to)
         ini = credentials(origins) if origins else b""
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
@@ -305,7 +436,8 @@ def main():
         if not name:
             return status
         status, fallback = run_session(name, config, ini, known_hosts, command,
-                                       args.forward_agent, terminal, color, attempted, copies=copies)
+                                       args.forward_agent, terminal, color, attempted, copies=copies,
+                                       **({"task_copies": task_groups} if task_groups else {}))
         if fallback:
             release(name, terminal, color)
         if attempted.is_set() and (status == 255 or status < 0):

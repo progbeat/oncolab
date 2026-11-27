@@ -39,11 +39,12 @@ MODE = "train"
 Put `workdir` before any table header. It must be an absolute path on the VM
 filesystem. It is created if needed and is the starting directory for setup
 and the command, before any `cd` in the entrypoint. The `[env]` table sets
-literal string values for the entrypoint and command, not for setup. Use
+literal string values for setup, teardown, the entrypoint, and the command. Use
 `-e NAME=VALUE` (or `--env NAME=VALUE`) to set an explicit value. With
 `-e NAME`, `oncolab` takes the value from the exported local environment;
 if it is absent locally, the variable is unset for the command even if the
-profile or VM supplied it. `-e NAME=` sets an empty value. Repeat the option
+profile or VM supplied it. CLI overrides apply to the entrypoint and command,
+not to setup. `-e NAME=` sets an empty value. Repeat the option
 as needed; the last occurrence wins. Forward only values you intend to
 expose to the remote command. Avoid putting secrets in command-line values
 or plaintext profiles.
@@ -87,24 +88,50 @@ rejected rather than followed. Copy only trusted local paths and keep the
 source tree unchanged during upload. Changes on the VM are not copied back.
 
 Copy streams over the same SSH connection while independent setup runs.
-If a setup step uses a copied file, add `depends = ["copy"]` to wait for
+If a setup step uses these globally copied files, add `needs = ["copy"]` to wait for
 all uploads. If a copy supplies the working directory or one of its parents,
 setup commands also wait for it so they start in the configured working
 directory. The final command starts only after copy and setup succeed.
 
-### Setup steps
+### Setup tasks
 
-Under `[setup.<name>]`, set exactly one of:
+Name each task under `[setup.<name>]`. The optional `description` is displayed
+during setup. `needs` lists task names. Dependencies gate the whole task,
+including any file copy; independent tasks run concurrently and declaration
+order is irrelevant. Unknown dependencies and cycles are rejected before
+allocation.
 
-- `run = ["command", "arg"]` to pass exact arguments.
-- `run = 'command | other_command'` to run Bash with `-e -o pipefail`.
-- `script = "./setup.sh"` to run the contents of a local file with those Bash
-  options. Relative paths are resolved beside the profile.
+Use `run` for a command that must exit successfully, or `start` for a process
+managed through the end of the session. An optional `ready` probe on a
+started process is retried until it succeeds or times out. Dependencies and
+the main command wait for readiness; the probe is not a continuous health
+check. Use a foreground process with `start`.
 
-`description` is optional and appears during setup. `depends` lists setup names
-or `mounts.<name>` prerequisites, or `"copy"` when using profile or CLI copies. Independent steps run in parallel; unknown
-dependencies and cycles fail before a VM is allocated. Shell exports in setup
-do not carry into the final command; use `entrypoint` for that.
+For `run`, `start`, `ready`, and `teardown`, a string runs in Bash with
+`-e -o pipefail`; an array passes exact executable arguments without a
+shell. Shell exports in one command do not carry to another.
+
+```toml
+[setup.install]
+copy = "install.sh:-"
+run = ["bash", "-e", "-o", "pipefail", "-s"]
+
+[setup.input]
+needs = ["install"]
+copy = { source = "input.txt", target = "data/input.txt", chmod = 0o644 }
+```
+
+Task-local `copy` accepts the same short path form as `--copy`, a table with
+`source`, optional `target` and optional `chmod`, or a list of these. Sources
+are relative to the profile; relative VM targets use `workdir`. A task can
+only copy, or copy before its `run` or `start`. The special target `-`
+feeds one file into that task's stdin instead of copying to its destination
+filesystem. It does not consume the main command's input.
+
+An optional `teardown` runs for a task that began execution, even if its
+setup stopped partway through. It runs before releasing direct or transitive
+dependencies. If teardown fails, its dependencies and the VM stay running.
+Legacy profiles can still use `depends`, `script` and `mounts.<name>`.
 
 ### Google Drive mounts
 
@@ -116,10 +143,19 @@ do not carry into the final command; use `entrypoint` for that.
    set `allow_full_drive = true` under `[rclone]`.
 2. Copy [the one-folder profile](../examples/work.toml) to `work.toml`, substitute
    your remote and folder, and run `oncolab --config work.toml -- ls /mnt/work`.
-3. To write through a mount, use `read_only = false` (the default) **and** a remote
+3. To write through a mount, use `readonly = false` (the default) **and** a remote
    whose OAuth grant permits writing to the intended files.
 
-Each `[mounts.<name>]` has `source` and `target`. Targets must be empty,
+Declare `mount` as a named setup task so other tasks can wait for it with
+`needs`. For a one-off mount, set `[rclone].remote` in your profile and use:
+
+```sh
+oncolab --mount type=gdrive,source=work,target=/content/work -- ls /content/work
+```
+
+`source` is a Google Drive path within that remote, not a local path.
+Mounts declared with the legacy `[mounts.<name>]` syntax use a qualified
+`remote:path` source and `read_only`. Targets must be empty,
 non-overlapping directories below `/content`, `/mnt`, `/home`, or `/root`.
 The tool exports `ONCOLAB_MOUNT_<NAME>` to setup and the command (uppercased, with
 hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
@@ -129,6 +165,15 @@ it with its own `config`. Use distinct remote names for different configs.
 The tool supports plaintext configs and direct Google Drive OAuth remotes;
 it does not forward service-account credentials. VFS cache settings use
 rclone defaults.
+
+### Local access to VM ports
+
+Use repeatable `-p LOCAL_PORT:REMOTE_PORT` (or `--publish`) or set a
+top-level `ports = ["8080:8765"]` before any table headers. The mapping in
+that example makes a service listening on the VM's `127.0.0.1:8765`
+available at `127.0.0.1:8080` on the local machine. Ports are TCP, bind to
+local loopback only, and are released when the session ends. This is not a
+public URL.
 
 ### Entrypoint
 
@@ -155,6 +200,7 @@ change the UID.
 | [drive.toml](../examples/drive.toml) | Mounts two folders with distinct read/write settings. |
 | [git-on.toml](../examples/git-on.toml) | Prepares Git and Git-on alongside a Drive mount, as in the demo. Adapt the mount and review the install commands before use. |
 | [home.toml](../examples/home.toml) | Creates a directory and sets `HOME` for your command. |
+| [showcase.toml](../examples/showcase.toml) | Demonstrates the configuration format, including per-task copies, a managed process, readiness, and teardown. The input files are illustrative and not bundled. |
 
 ## Security and cleanup
 

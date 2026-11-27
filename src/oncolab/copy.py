@@ -5,6 +5,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 
 
@@ -81,32 +82,45 @@ def send_archive(stream, sources):
         archive.addfile(tarfile.TarInfo("complete"))
 
 
-def publish(source, target, directory_modes):
+def publish(source, target, directory_modes, mode=None):
     if source.is_dir():
         target.mkdir(mode=0o700)
         for entry in source.iterdir():
             publish(entry, target / entry.name, directory_modes)
-        target.chmod(directory_modes.get(source, 0o700))
+        target.chmod(directory_modes.get(source, 0o700) if mode is None else mode)
     else:
-        try:
-            os.link(source, target)
-        except OSError as exc:
-            if exc.errno != errno.EXDEV:
-                raise
-            with source.open("rb") as reader:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                try:
-                    with os.fdopen(fd, "wb") as writer:
-                        shutil.copyfileobj(reader, writer)
-                    shutil.copystat(source, target)
-                except BaseException:
-                    target.unlink(missing_ok=True)
+        if mode is None:
+            try:
+                os.link(source, target)
+                return
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
                     raise
+        with source.open("rb") as reader:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as writer:
+                    shutil.copyfileobj(reader, writer)
+                    writer.flush()
+                    if mode is not None:
+                        timestamps = source.stat()
+                        os.utime(target, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
+                        os.fchmod(writer.fileno(), mode)
+                    else:
+                        shutil.copystat(source, target)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
 
 
-def receive_archive(stream, targets):
-    with tempfile.TemporaryDirectory(prefix="oncolab-copy-") as staging:
-        root = Path(staging)
+def receive_archive(stream, targets, modes=None, private_input=None):
+    with ExitStack() as stack:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="oncolab-copy-")))
+        staged = {}
+        if private_input in targets:
+            index = targets.index(private_input)
+            staged[str(index)] = Path(stack.enter_context(tempfile.TemporaryDirectory(
+                dir=Path(private_input).parent, prefix="stdin-")))
         names = {str(i) for i in range(len(targets))}
         seen = set()
         directory_modes = {}
@@ -122,11 +136,14 @@ def receive_archive(stream, targets):
                 if path in seen:
                     raise ValueError("Duplicate path in copy stream")
                 seen.add(path)
+                location = staged.get(path.parts[0], root)
+                if location != root and (not member.isreg() or len(path.parts) != 1):
+                    raise ValueError("Task stdin must be a regular file")
                 if member.isdir():
                     # The data filter ignores directory modes during extraction.
                     # Restore safe access only after all children are published.
-                    directory_modes[root / path] = (member.mode & 0o755) | 0o700
-                archive.extract(member, root, filter="data")
+                    directory_modes[location / path] = (member.mode & 0o755) | 0o700
+                archive.extract(member, location, filter="data")
         while stream.read(1024 * 1024):
             pass
         if not complete or not all(PurePosixPath(str(i)) in seen for i in range(len(targets))):
@@ -139,7 +156,12 @@ def receive_archive(stream, targets):
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.resolve() != target:
                 raise ValueError(f"--copy destination contains a symlink: {target}")
-            publish(root / str(i), target, directory_modes)
+            source = staged.get(str(i), root) / str(i)
+            mode = modes[i] if modes else None
+            if mode is None:
+                publish(source, target, directory_modes)
+            else:
+                publish(source, target, directory_modes, mode)
 
 
 COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.
@@ -166,11 +188,15 @@ def notify_failure(result):
         # The runner already left setup and cleaned its private staging directory.
 
 
-def copy_receiver(result, targets):
+def copy_receiver(result, targets, modes=None):
     Path(result).with_name("copy-pid").write_text(f"{os.getpid()}\n")
     status = "failed"
     try:
-        receive_archive(sys.stdin.buffer, targets)
+        if modes is None:
+            receive_archive(sys.stdin.buffer, targets)
+        else:
+            private_input = str(Path(result).with_name("stdin"))
+            receive_archive(sys.stdin.buffer, targets, modes, private_input=private_input)
         status = "ok"
     except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print(exc, file=sys.stderr)
@@ -184,4 +210,5 @@ if __name__ == "__main__":
     if sys.argv[2] == "--failed":
         notify_failure(sys.argv[1])
     else:
-        raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2])))
+        raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2]),
+                                       json.loads(sys.argv[3]) if len(sys.argv) > 3 else None))
