@@ -267,6 +267,8 @@ def main():
     parser.add_argument("--version", action="version", version=f"oncolab {version('oncolab')}")
     parser.add_argument("--copy", action="append", default=[], metavar="LOCAL[:REMOTE]",
                         help="Copy a file or directory to the VM before running; repeatable")
+    parser.add_argument("--copy-to", action="append", nargs=2, default=[], metavar=("LOCAL", "REMOTE"),
+                        help="Copy using separate literal paths; repeatable")
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
                         help="Set a value or forward a named local variable; repeatable")
     parser.add_argument("--config", type=Path, help="Use an explicit local TOML configuration")
@@ -283,10 +285,10 @@ def main():
     if not command:
         parser.error("a command is required")
     try:
-        config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy))
+        config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to))
         config["env"] |= parse_env(args.env)
         copies = copy_plan(args.copy, config["workdir"],
-                           [Path(m["target"]) for m in config["mounts"].values()])
+                           [Path(m["target"]) for m in config["mounts"].values()], explicit=args.copy_to)
         ini = credentials(origins) if origins else b""
     except (ValueError, OSError) as exc:
         parser.error(str(exc))

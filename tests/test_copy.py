@@ -50,27 +50,23 @@ class Copy(unittest.TestCase):
             literal.touch()
             with self.assertRaisesRegex(ValueError, "Ambiguous"):
                 copy_plan([str(literal)], "/content", [])
-            escaped = str(literal).replace(":", r"\:")
-            self.assertEqual(copy_plan([escaped, f"{escaped}:other:file"], "/content", []),
-                             [(literal, "/content/train:today"), (literal, "/content/other:file")])
+            self.assertEqual(copy_plan([], "/content", [], explicit=[
+                (str(literal), "./"), (str(literal), "other:file"),
+            ]), [(literal, "/content/train:today"), (literal, "/content/other:file")])
             literal.unlink()
             literal.symlink_to(root / "missing")
             with self.assertRaisesRegex(ValueError, "Ambiguous"):
                 copy_plan([str(literal)], "/content", [])
             with self.assertRaisesRegex(ValueError, "regular file or directory"):
-                copy_plan([escaped], "/content", [])
+                copy_plan([], "/content", [], explicit=[(str(literal), "./")])
 
     def test_copy_preserves_literal_backslashes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            literal, decoded = root / r"two\\slashes", root / r"two\slashes"
+            literal, other = root / r"two\\slashes", root / r"two\slashes"
             literal.touch()
+            other.touch()
             self.assertEqual(copy_plan([str(literal)], "/content", [])[0][0], literal)
-            decoded.touch()
-            with self.assertRaisesRegex(ValueError, "Ambiguous"):
-                copy_plan([str(literal)], "/content", [])
-            doubled = str(literal).replace("\\", "\\\\")
-            self.assertEqual(copy_plan([doubled], "/content", [])[0][0], literal)
 
     def test_copy_accepts_two_long_but_valid_path_components(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,20 +8,6 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 
-def split_copy_spec(spec):
-    local = []
-    i = 0
-    while i < len(spec):
-        char = spec[i]
-        if char == ":":
-            return "".join(local), spec[:i], spec[i + 1:]
-        if char == "\\" and spec[i + 1:i + 2] in (":", "\\"):
-            i += 1
-        local.append(spec[i])
-        i += 1
-    return "".join(local), spec, None
-
-
 def literal_exists(path):
     try:
         Path(path).expanduser().lstat()
@@ -35,27 +21,26 @@ def literal_exists(path):
         return False
 
 
-def copy_plan(specs, workdir, mounts):
-    sources, targets = [], []
+def copy_plan(specs, workdir, mounts, *, explicit=()):
+    pairs = []
     for spec in specs:
-        local, raw_local, remote = split_copy_spec(spec)
-        if raw_local != local and literal_exists(raw_local):
-            if literal_exists(local):
-                raise ValueError(r"Ambiguous --copy path: escape each literal backslash as \\")
-            local = raw_local
-        if remote is not None and literal_exists(spec):
-            raise ValueError(r"Ambiguous --copy path: escape literal local colons as \:")
-        sep = remote is not None
-        if not local or sep and not remote:
-            raise ValueError("--copy expects LOCAL or LOCAL:REMOTE")
+        local, sep, remote = spec.partition(":")
+        if sep and literal_exists(spec):
+            raise ValueError("Ambiguous --copy path: use --copy-to LOCAL REMOTE for literal names")
+        pairs.append((local, remote if sep else None))
+
+    sources, targets = [], []
+    for local, remote in [*pairs, *explicit]:
+        if not local or remote == "":
+            raise ValueError("--copy expects LOCAL or LOCAL:REMOTE; --copy-to expects two paths")
         source = Path(local).expanduser().absolute()
         if source.is_symlink() or not (source.is_file() or source.is_dir()):
             raise ValueError(f"--copy source must be a regular file or directory: {local}")
         source = source.resolve()
         if not source.name:
             raise ValueError("--copy cannot upload the local filesystem root")
-        target = PurePosixPath(remote) if sep else PurePosixPath(source.name)
-        if sep and remote.endswith("/"):
+        target = PurePosixPath(remote) if remote is not None else PurePosixPath(source.name)
+        if remote is not None and remote.endswith("/"):
             target /= source.name
         target = PurePosixPath(workdir) / target
         if target.anchor != "/" or target == PurePosixPath("/") or ".." in target.parts:
