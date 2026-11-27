@@ -659,16 +659,24 @@ def main():
             for name, mount in plan["mounts"].items():
                 var = name.removeprefix("mounts.").upper().replace("-", "_")
                 os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
-        if not plan.get("copy_supplies_workdir"):
-            enter_workdir(plan)
         if jobdir:
             st = jobdir.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Job staging directory is not private")
-            env_path = jobdir / "env.json"
-            if env_path.exists():
-                setup_env, command_env = json.loads(env_path.read_text())
-                env_path.unlink()
+            if plan.get("has_env"):
+                claimed = jobdir / "active-env.json"
+                try:
+                    (jobdir / "env.json").rename(claimed)
+                except FileNotFoundError:
+                    raise RuntimeError("Staged environment is missing; refusing to run without it") from None
+                try:
+                    with claimed.open() as file:
+                        claimed.unlink()
+                        setup_env, command_env = json.load(file)
+                finally:
+                    claimed.unlink(missing_ok=True)
+        if not plan.get("copy_supplies_workdir"):
+            enter_workdir(plan)
         work = plan["mounts"].get("mounts.work")
         if work:
             os.environ["COLAB_DRIVE"] = work["target"]

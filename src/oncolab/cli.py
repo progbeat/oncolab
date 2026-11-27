@@ -327,6 +327,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     sources, targets = zip(*copies) if copies else ((), ())
     if env or command_env or sources or task_copies:
         config["jobdir"] = jobdir
+    if env or command_env:
+        config["has_env"] = True
     if sources:
         config["copy_result"] = result
         config["copy_supplies_workdir"] = any(Path(config["workdir"]).is_relative_to(path) for path in targets)
@@ -380,7 +382,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             keys = sp.run(["ssh-add", "-L"], capture_output=True).stdout.splitlines()
             advertised = public.read_bytes().split()[:2]
             terminal_connect = any(key.split()[:2] == advertised for key in keys)
-        recover_pending = rclone_ini is not None
+        pending = [f"{directory}/{file}" for directory, file in
+                   ((drive_stage, "rclone.conf"), (jobdir, "env.json")) if file in staging.get(directory, {})]
         master_closed = False
 
         def close_master():
@@ -389,10 +392,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 return
             master_closed = True
             try:
-                if recover_pending:
-                    # The runner claims the pending file by rename. Never
-                    # remove active credentials or disturb a running mount.
-                    command = shlex.join(["rm", "-f", "--", f"{drive_stage}/rclone.conf"])
+                if pending:
+                    # The runner claims these names by rename; never remove active files.
+                    command = shlex.join(["rm", "-f", "--", *pending])
                     try:
                         cleanup = sp.run(
                             [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target, command],
@@ -402,7 +404,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     except (OSError, sp.TimeoutExpired):
                         confirmed = False
                     if not confirmed:
-                        print(f"oncolab: could not confirm cleanup of unclaimed rclone config for {name!r}",
+                        print(f"oncolab: could not confirm cleanup of unclaimed credentials for {name!r}",
                               file=sys.stderr)
             finally:
                 sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
@@ -427,7 +429,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status == 0:
-                recover_pending = False
+                pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
                 close_master()
             if transfer:

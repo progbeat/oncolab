@@ -162,9 +162,10 @@ hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
 
 All mounts in the session share one rclone config. If `[rclone].config` is
 set, use that file; relative paths resolve beside the TOML profile. Otherwise
-use the local rclone default: `RCLONE_CONFIG`, or the first existing config
-beside the rclone executable, under `$XDG_CONFIG_HOME/rclone`,
-`~/.config/rclone/rclone.conf`, or `~/.rclone.conf`. Once the config exists,
+use the local rclone default. oncolab honors `RCLONE_CONFIG` first, then
+asks the installed `rclone config file` for its path. If rclone is not
+installed locally, it checks `$XDG_CONFIG_HOME/rclone/rclone.conf`,
+`~/.config/rclone/rclone.conf`, and `~/.rclone.conf` in order. Once the config exists,
 you do not need a local rclone executable to run oncolab. oncolab installs
 rclone and FUSE on the VM if needed. No mounts means no rclone config is
 read. The selected file is sent in full, without section filtering.

@@ -85,14 +85,13 @@ mount = { source = "gdrive:b", target = "/mnt/b" }
             profile = root / "profile.toml"
             mount = '[setup.work]\nmount = { source = "test:work", target = "/mnt/work" }\n'
             profile.write_text(mount)
-            executable = root / "bin/rclone"
-            paths = [executable.with_name("rclone.conf"), root / "xdg/rclone/rclone.conf",
+            paths = [root / "xdg/rclone/rclone.conf",
                      root / ".config/rclone/rclone.conf", root / ".rclone.conf"]
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
             with (patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": str(root / "xdg")}, clear=True),
-                  patch("oncolab.config.which", return_value=str(executable))):
+                  patch("oncolab.config.which", return_value=None)):
                 for expected in paths:
                     self.assertEqual(plan(profile)[1], expected)
                     expected.unlink()
@@ -100,6 +99,24 @@ mount = { source = "gdrive:b", target = "/mnt/b" }
                     self.assertEqual(plan(profile)[1], root / "custom.conf")
                     profile.write_text(mount + '[rclone]\nconfig = "override.conf"\n')
                     self.assertEqual(plan(profile)[1], root / "override.conf")
+
+    def test_wrapped_rclone_reports_its_actual_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "rclone"
+            selected = root / "portable config.conf"
+            wrapper.write_text('#!/bin/sh\n[ "$*" = "config file" ] || exit 2\n'
+                               + f"printf 'Configuration file is stored at:\\n%s\\n' {shlex.quote(str(selected))}\n")
+            wrapper.chmod(0o700)
+            selected.touch()
+            (root / ".rclone.conf").touch()
+            mount = '[setup.work]\nmount = { source = "test:work", target = "/mnt/work" }\n'
+            with (patch.dict(os.environ, {"HOME": tmp, "PATH": tmp}, clear=True),
+                  patch("oncolab.config.which", return_value=str(wrapper))):
+                self.assertEqual(self.parse(mount)[1], selected)
+                wrapper.write_text("#!/bin/sh\nexit 1\n")
+                with self.assertRaisesRegex(ConfigError, "Could not query"):
+                    self.parse(mount)
 
     def test_no_mount_does_not_resolve_the_default_rclone_config(self):
         with (patch.dict(os.environ, {"RCLONE_CONFIG": ""}),
@@ -151,6 +168,23 @@ class Teardown(unittest.TestCase):
                 self.assertEqual(remote.main(), 1)
             self.assertFalse(stage.exists())
             unassign.assert_called_once_with()
+
+
+    def test_missing_staged_environment_never_starts_a_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / "job"
+            job.mkdir(mode=0o700)
+            plan = {"mounts": {}, "jobdir": str(job), "has_env": True}
+            argv = ["remote.py", str(Path(tmp) / "drive"), "0", json.dumps(plan), "unused"]
+            with (patch("sys.argv", argv), patch.dict(os.environ),
+                  patch.object(remote, "enter_workdir") as enter,
+                  patch.object(remote, "progress", create=True) as progress, patch.object(remote, "unassign") as release,
+                  patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                self.assertEqual(remote.main(), 1)
+                self.assertIn("Staged environment is missing", stderr.getvalue())
+            enter.assert_not_called()
+            progress.assert_not_called()
+            release.assert_called_once_with()
 
 
 class CommandHelp(unittest.TestCase):
@@ -295,13 +329,15 @@ target = "/mnt/work"
 
                 def run(argv, **kwargs):
                     if kwargs.get("input"):
-                        [(stage, files)] = json.loads(kwargs["input"]).items()
-                        self.assertEqual(list(files), ["rclone.conf"])
-                        operations.append(stage)
+                        staged = json.loads(kwargs["input"])
+                        self.assertEqual(sorted(file for files in staged.values() for file in files),
+                                         ["env.json", "rclone.conf"])
+                        operations.append([f"{directory}/{file}" for directory, files in staged.items()
+                                           for file in files])
                     elif "-O" in argv:
                         operations.append("close")
                     else:
-                        self.assertEqual(shlex.split(argv[-1]), ["rm", "-f", "--", operations[0] + "/rclone.conf"])
+                        self.assertEqual(shlex.split(argv[-1]), ["rm", "-f", "--", *operations[0]])
                         self.assertIn("ProxyCommand=false", argv)
                         self.assertEqual(kwargs["timeout"], 5)
                         operations.append("recover")
@@ -311,7 +347,8 @@ target = "/mnt/work"
                 with (patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
                       patch.object(cli.sp, "run", side_effect=run), patch.object(cli.sp, "call", return_value=255),
                       patch("sys.stderr", new_callable=io.StringIO) as stderr):
-                    result = cli.run_session("failed-session", {"setup": {}}, b"private", None,
+                    result = cli.run_session("failed-session", {"setup": {}, "env": {"TEST_SECRET": "fixture"}},
+                                             b"private", None,
                                              ["true"], False, False, False, Event())
                 self.assertEqual(result, (255, False))
                 self.assertEqual(operations[1:], ["recover", "close"])

@@ -49,11 +49,11 @@ class Showcase(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="oc-e2e-", dir="/tmp") as directory:
             root = Path(directory).resolve()
             if streamed:
-                with socket.socket(socket.AF_UNIX) as probe:
-                    try:
+                try:
+                    with socket.socket(socket.AF_UNIX) as probe:
                         probe.bind(str(root / "probe"))
-                    except PermissionError:
-                        self.skipTest("sandbox does not allow binding Unix sockets")
+                except PermissionError:
+                    self.skipTest("sandbox does not allow Unix sockets")
             work, fake_ram = root / "vm", root / "ram"
             fake_ram.mkdir()
             colab, ssh = root / "colab", root / "ssh"
@@ -84,7 +84,7 @@ teardown = 'test "$VALUE" = shared; printf teardown > done'
             env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "FAKE_RAM": str(fake_ram),
                    "XDG_CONFIG_HOME": str(root), "NO_COLOR": "1"}
             result = subprocess.run([executable, "--config", str(profile), "-e", "VALUE=override", "--",
-                                     "sh", "-ec", 'test "$VALUE" = override; test "$SHARED" = profile; cat'],
+                                     "sh", "-ec", 'test "$VALUE" = override; test "$SHARED" = profile; test -z "$(find "$FAKE_RAM" -name "*env.json")"; cat'],
                                     env=env, input="main stdin\n", text=True, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "main stdin\n")
