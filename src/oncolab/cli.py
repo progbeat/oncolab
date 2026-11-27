@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
 from .config import credentials, plan
-from .copy import COPY_FAILED, copy_plan, send_archive
+from .copy import COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
 from .progress import progress, run_step
 
@@ -140,18 +140,23 @@ for directory, entries in json.load(sys.stdin).items():
 """
 
 
-def upload(ssh, target, result, sources, targets, modes=None):
+def upload(ssh, target, result, sources=(), targets=(), modes=None, *, input_source=None):
     helper = files("oncolab").joinpath("copy.py").read_text()
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
-    command = shlex.join(["python3", "-c", helper, result, json.dumps(targets),
-                          *([json.dumps(modes)] if modes is not None else [])])
+    args = ["--stdin"] if input_source is not None else [json.dumps(targets)]
+    if input_source is None and modes is not None:
+        args.append(json.dumps(modes))
+    command = shlex.join(["python3", "-c", helper, result, *args])
     try:
         with TemporaryFile() as diagnostic, sp.Popen(
             [*channel, command], stdin=sp.PIPE, stdout=sp.DEVNULL, stderr=diagnostic,
         ) as process:
             try:
                 with process.stdin:
-                    send_archive(process.stdin, sources)
+                    if input_source is None:
+                        send_archive(process.stdin, sources)
+                    else:
+                        send_input(process.stdin, input_source)
             except (OSError, ValueError) as exc:
                 local_error = exc
             else:
@@ -161,11 +166,13 @@ def upload(ssh, target, result, sources, targets, modes=None):
             detail = diagnostic.read().decode(errors="replace").strip()
         if not status and not local_error:
             return None, True
+        if status == INPUT_CLOSED and (local_error is None or isinstance(local_error, BrokenPipeError)):
+            return None, True
         # A closed pipe is usually a symptom of the receiver's error.
         if isinstance(local_error, BrokenPipeError) and detail:
             local_error = None
         error = (str(local_error) if local_error is not None else detail) or f"copy channel exited with status {status}"
-        if status in (0, COPY_FAILED):
+        if status in (0, COPY_FAILED, INPUT_CLOSED):
             return error, True
     except OSError as exc:
         error = str(exc)
@@ -218,7 +225,7 @@ while (pending or active) and jobdir.is_dir():
             result = (jobdir / name / "copy-result").read_text()
         except FileNotFoundError:
             continue
-        if result in ("ok", "failed"):
+        if result in ("ok", "failed", "short"):
             active.remove(name)
     if pending or active:
         if time.monotonic() - heartbeat >= .5:
@@ -246,8 +253,10 @@ def upload_tasks(ssh, target, jobdir, groups):
             key = line.rstrip("\n")
             if key not in groups:
                 continue
-            sources, targets, modes = zip(*groups.pop(key))
-            job = workers.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result", sources, targets, modes)
+            entries, input_source = groups.pop(key)
+            sources, targets, modes = zip(*entries) if entries else ((), (), ())
+            job = workers.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result",
+                                 sources, targets, modes, input_source=input_source)
             jobs.append(job)
             job.add_done_callback(wake_runner)
         if broker.wait():
@@ -322,13 +331,20 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         staging[jobdir].update(markers)
     for number, (task, entries) in enumerate(task_copies.items()):
         key = f"task-{number}"
-        directory = f"{jobdir}/{key}"
-        staging[directory] = markers
-        config["setup"][task]["copy_result"] = f"{directory}/copy-result"
-        if config["setup"][task].pop("input", False):
-            config["setup"][task]["stdin"] = f"{directory}/stdin"
-        groups[key] = [(source, str(Path(directory) / "stdin") if target == "-" else target, mode)
-                       for source, target, mode in entries]
+        copies_in_task = [entry for entry in entries if entry[1] != "-"]
+        if copies_in_task:
+            directory = f"{jobdir}/{key}"
+            staging[directory] = markers
+            config["setup"][task]["copy_result"] = f"{directory}/copy-result"
+            groups[key] = (copies_in_task, None)
+        source = next((source for source, destination, _ in entries if destination == "-"), None)
+        config["setup"][task].pop("input", None)
+        if source is not None:
+            key += "-input"
+            directory = f"{jobdir}/{key}"
+            staging[directory] = {**markers, "copy-short": "short"}
+            config["setup"][task]["stdin_result"] = f"{directory}/copy-result"
+            groups[key] = ((), source)
     # The bootstrap channel must never read the command's stdin.
     staged_input = json.dumps(staging).encode() if staging else b""
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,

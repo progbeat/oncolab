@@ -1,11 +1,11 @@
 """One-way file staging over a separate SSH channel."""
 import errno
 import os
+import select
 import shutil
 import sys
 import tarfile
 import tempfile
-from contextlib import ExitStack
 from pathlib import Path, PurePosixPath
 
 
@@ -113,14 +113,9 @@ def publish(source, target, directory_modes, mode=None):
                 raise
 
 
-def receive_archive(stream, targets, modes=None, private_input=None):
-    with ExitStack() as stack:
-        root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="oncolab-copy-")))
-        staged = {}
-        if private_input in targets:
-            index = targets.index(private_input)
-            staged[str(index)] = Path(stack.enter_context(tempfile.TemporaryDirectory(
-                dir=Path(private_input).parent, prefix="stdin-")))
+def receive_archive(stream, targets, modes=None):
+    with tempfile.TemporaryDirectory(prefix="oncolab-copy-") as staging:
+        root = Path(staging)
         names = {str(i) for i in range(len(targets))}
         seen = set()
         directory_modes = {}
@@ -136,14 +131,11 @@ def receive_archive(stream, targets, modes=None, private_input=None):
                 if path in seen:
                     raise ValueError("Duplicate path in copy stream")
                 seen.add(path)
-                location = staged.get(path.parts[0], root)
-                if location != root and (not member.isreg() or len(path.parts) != 1):
-                    raise ValueError("Task stdin must be a regular file")
                 if member.isdir():
                     # The data filter ignores directory modes during extraction.
                     # Restore safe access only after all children are published.
-                    directory_modes[location / path] = (member.mode & 0o755) | 0o700
-                archive.extract(member, location, filter="data")
+                    directory_modes[root / path] = (member.mode & 0o755) | 0o700
+                archive.extract(member, root, filter="data")
         while stream.read(1024 * 1024):
             pass
         if not complete or not all(PurePosixPath(str(i)) in seen for i in range(len(targets))):
@@ -156,7 +148,7 @@ def receive_archive(stream, targets, modes=None, private_input=None):
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.resolve() != target:
                 raise ValueError(f"--copy destination contains a symlink: {target}")
-            source = staged.get(str(i), root) / str(i)
+            source = root / str(i)
             mode = modes[i] if modes else None
             if mode is None:
                 publish(source, target, directory_modes)
@@ -165,6 +157,7 @@ def receive_archive(stream, targets, modes=None, private_input=None):
 
 
 COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.
+INPUT_CLOSED = 43  # The consumer exited or closed stdin without reading to EOF.
 
 
 def publish_result(result, status):
@@ -176,7 +169,7 @@ def publish_result(result, status):
 def notify_failure(result):
     result = Path(result)
     try:
-        if result.read_text() in ("ok", "failed"):
+        if result.read_text() in ("ok", "failed", "short"):
             return
     except FileNotFoundError:
         pass
@@ -195,8 +188,7 @@ def copy_receiver(result, targets, modes=None):
         if modes is None:
             receive_archive(sys.stdin.buffer, targets)
         else:
-            private_input = str(Path(result).with_name("stdin"))
-            receive_archive(sys.stdin.buffer, targets, modes, private_input=private_input)
+            receive_archive(sys.stdin.buffer, targets, modes)
         status = "ok"
     except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print(exc, file=sys.stderr)
@@ -204,11 +196,93 @@ def copy_receiver(result, targets, modes=None):
     return COPY_FAILED if status == "failed" else 0
 
 
+INPUT_CHUNK = 64 * 1024
+
+
+def send_input(stream, source):
+    # A zero-length frame means successful EOF. A short read, closed channel,
+    # or local source error cannot be mistaken for a complete input stream.
+    with source.open("rb") as reader:
+        while chunk := reader.read(INPUT_CHUNK):
+            stream.write(len(chunk).to_bytes(4, "big"))
+            stream.write(chunk)
+            stream.flush()
+    stream.write(b"\0" * 4)
+
+
+def input_receiver(result):
+    result = Path(result)
+    try:
+        result.with_name("copy-pid").write_text(f"{os.getpid()}\n")
+    except FileNotFoundError:
+        return INPUT_CLOSED  # Session cleanup beat a queued producer.
+    cancelled = result.with_name("cancelled")
+    fifo = result.with_name("stdin")
+    status = "failed"
+    stdin = sys.stdin.fileno()
+    writer = None
+
+    def check_cancelled():
+        if cancelled.exists() or not result.parent.is_dir():
+            raise BrokenPipeError("Task stopped before its stdin stream completed")
+
+    def read_exact(count):
+        data = bytearray()
+        while len(data) < count:
+            check_cancelled()
+            if not select.select([stdin], [], [], .1)[0]:
+                continue
+            chunk = os.read(stdin, count - len(data))
+            if not chunk:
+                raise ValueError("Incomplete task stdin stream")
+            data.extend(chunk)
+        return data
+
+    try:
+        check_cancelled()
+        writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        fifo.unlink()
+        result.with_name("writer-ready").touch()
+        while size := int.from_bytes(read_exact(4), "big"):
+            if size > INPUT_CHUNK:
+                raise ValueError("Invalid task stdin frame size")
+            data = memoryview(read_exact(size))
+            while data:
+                check_cancelled()
+                if not select.select([], [writer], [], .1)[1]:
+                    continue
+                try:
+                    data = data[os.write(writer, data):]
+                except BlockingIOError:
+                    continue
+        status = "ok"
+    except OSError as exc:
+        if (isinstance(exc, BrokenPipeError) or exc.errno == errno.ENXIO
+                or (exc.errno == errno.ENOENT and (cancelled.exists() or not result.parent.is_dir()))):
+            status = "short"
+        else:
+            print(exc, file=sys.stderr)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+    finally:
+        if writer is not None:
+            os.close(writer)
+    if result.parent.is_dir():
+        try:
+            publish_result(result, status)
+        except FileNotFoundError:
+            if result.parent.is_dir():
+                raise
+    return {"failed": COPY_FAILED, "short": INPUT_CLOSED, "ok": 0}[status]
+
+
 if __name__ == "__main__":
     import json
 
     if sys.argv[2] == "--failed":
         notify_failure(sys.argv[1])
+    elif sys.argv[2] == "--stdin":
+        raise SystemExit(input_receiver(sys.argv[1]))
     else:
         raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2]),
                                        json.loads(sys.argv[3]) if len(sys.argv) > 3 else None))

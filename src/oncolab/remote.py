@@ -5,7 +5,6 @@ import shutil
 import stat
 import subprocess as sp
 import sys
-from contextlib import ExitStack
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
@@ -152,7 +151,7 @@ class DriveMounts:
         return True
 
 
-async def wait_copy(result, *, start_timeout=30, broker=None):
+async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
     path = Path(result)
     pid_path = path.with_name("copy-pid")
     loop = asyncio.get_running_loop()
@@ -164,10 +163,15 @@ async def wait_copy(result, *, start_timeout=30, broker=None):
         except FileNotFoundError:
             return ""
 
+    statuses = ("ok", "failed", "short") if input_pipe else ("ok", "failed")
     while True:
+        if input_pipe and path.with_name("writer-ready").exists():
+            input_pipe.release("keeper")
         status = read(path)
-        if status in ("ok", "failed"):
-            return sp.CompletedProcess([], int(status != "ok"), None, None)
+        if status in statuses:
+            if input_pipe:
+                input_pipe.release("keeper")
+            return sp.CompletedProcess([], int(status == "failed"), None, None)
 
         pid_text = read(pid_path)
         try:
@@ -179,7 +183,7 @@ async def wait_copy(result, *, start_timeout=30, broker=None):
             elif not broker_text and loop.time() >= deadline:
                 raise ProcessLookupError
         except ProcessLookupError:
-            if read(path) in ("ok", "failed"):
+            if read(path) in statuses:
                 continue  # Receiver may have published just before exiting.
             return sp.CompletedProcess([], 1, None, b"oncolab: copy receiver exited or did not start\n")
         await asyncio.sleep(.10)
@@ -216,13 +220,15 @@ def stop_process(proc):
     return True
 
 
-async def command_result(argv, env, stdin=sp.DEVNULL, *, timeout=None):
+async def command_result(argv, env, stdin=sp.DEVNULL, *, timeout=None, on_start=None):
     proc = await asyncio.create_subprocess_exec(
         *argv, env=env, stdin=stdin, stdout=sp.PIPE, stderr=sp.PIPE, start_new_session=True,
     )
     try:
+        if on_start:
+            on_start()
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-    except (asyncio.CancelledError, TimeoutError):
+    except (asyncio.CancelledError, OSError):
         for number in (SIGTERM, SIGKILL):
             try:
                 os.killpg(proc.pid, number)
@@ -233,6 +239,68 @@ async def command_result(argv, env, stdin=sp.DEVNULL, *, timeout=None):
         await proc.communicate()
         raise
     return sp.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+class TaskInput:
+    """One producer, one task, and no access to the session's command stdin."""
+
+    def __init__(self, result, broker):
+        self.result = Path(result)
+        self.broker = broker
+        self.fifo = self.result.with_name("stdin")
+        self.reader = self.keeper = None
+
+    def release(self, name):
+        fd = getattr(self, name)
+        if fd is not None:
+            setattr(self, name, None)
+            os.close(fd)
+
+    def launched(self):
+        # The child now owns stdin. Keep only a writer until the remote
+        # sender joins the FIFO, so the child cannot see premature EOF.
+        self.release("reader")
+        self.result.with_name("requested").touch()
+
+    async def run(self, command, *, service):
+        process = delivery = None
+        self.fifo.parent.mkdir(mode=0o700, exist_ok=True)
+        os.mkfifo(self.fifo, 0o600)
+        try:
+            self.reader = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+            self.keeper = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.set_blocking(self.reader, True)
+            process = asyncio.create_task(command(self.reader, self.launched))
+            delivery = asyncio.create_task(wait_copy(self.result, broker=self.broker, input_pipe=self))
+            await asyncio.wait((process, delivery), return_when=asyncio.FIRST_COMPLETED)
+            if process.done():
+                result = process.result()
+                if result is not None and result.returncode:
+                    return result
+                if not service and not delivery.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(delivery), 3)
+                    except TimeoutError:
+                        # A successful finite command can intentionally stop
+                        # reading before its writer has even started.
+                        return result
+            transferred = await delivery
+            if transferred.returncode:
+                return transferred
+            return await process
+        finally:
+            try:
+                if delivery is None or not delivery.done():
+                    self.result.with_name("cancelled").touch()
+            finally:
+                self.release("reader")
+                self.release("keeper")
+                self.fifo.unlink(missing_ok=True)
+                tasks = [task for task in (process, delivery) if task is not None]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class Lifecycle:
@@ -266,11 +334,13 @@ class Lifecycle:
         finally:
             self.setup = None
 
-    async def start(self, name, step, stdin):
+    async def start(self, name, step, stdin, on_start=None):
         argv = step["start"]
         service = sp.Popen(argv, env=self.environment, stdin=stdin,
                            stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True)
         self.services[name] = service
+        if on_start:
+            on_start()
         probe = step.get("ready")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 30
@@ -282,13 +352,23 @@ class Lifecycle:
                 raise RuntimeError(f"{step['description']} timed out waiting for readiness")
             if not probe:
                 return
+            attempt = asyncio.create_task(command_result(probe, self.environment, timeout=remaining))
             try:
-                result = await command_result(probe, self.environment, timeout=min(remaining, 2))
-            except TimeoutError:
-                pass
-            else:
-                if not result.returncode and service.poll() is None:
-                    return
+                while service.poll() is None and not attempt.done():
+                    await asyncio.wait((attempt,), timeout=.05)
+                if service.poll() is not None:
+                    break
+                try:
+                    result = attempt.result()
+                except TimeoutError:
+                    pass
+                else:
+                    if not result.returncode:
+                        return
+            finally:
+                if not attempt.done():
+                    attempt.cancel()
+                await asyncio.gather(attempt, return_exceptions=True)
             await asyncio.sleep(min(.1, max(deadline - loop.time(), 0)))
         raise RuntimeError(f"{step['description']} exited before readiness (exit {service.returncode})")
 
@@ -403,24 +483,26 @@ async def setup_all(run, plan, drive, lifecycle=None):
             dependencies.append("rcd")
             drive_tasks.append(key)
             step = {**step, "mount_target": mount["target"]}
-        elif lifecycle.environment is not None or "copy_result" in step or "start" in step:
+        elif lifecycle.environment is not None or {"copy_result", "stdin_result", "start"} & step.keys():
             async def command(step=step, key=key):
-                with ExitStack() as stack:
-                    stdin = sp.DEVNULL
-                    if result_path := step.get("copy_result"):
-                        Path(result_path).with_name("requested").touch()
-                        result = await wait_copy(result_path, broker=Path(plan["jobdir"]) / "broker-pid")
-                        if result.returncode:
-                            return result
-                    if path := step.get("stdin"):
-                        stdin = stack.enter_context(open(path, "rb"))
-                        Path(path).unlink()
+                broker = Path(plan.get("jobdir", "/dev/null")) / "broker-pid"
+                if result_path := step.get("copy_result"):
+                    Path(result_path).with_name("requested").touch()
+                    result = await wait_copy(result_path, broker=broker)
+                    if result.returncode:
+                        return result
+
+                async def launch(stdin=sp.DEVNULL, on_start=None):
                     if "start" in step:
-                        await lifecycle.start(key, step, stdin)
+                        await lifecycle.start(key, step, stdin, on_start)
                         return None
                     if argv := step.get("argv"):
-                        return await command_result(argv, lifecycle.environment, stdin)
+                        return await command_result(argv, lifecycle.environment, stdin, on_start=on_start)
                     return None
+
+                if input_result := step.get("stdin_result"):
+                    return await TaskInput(input_result, broker).run(launch, service="start" in step)
+                return await launch()
         else:
             command = step.get("argv", lambda: None)
         submit(key, step["description"], command, *dependencies, step=step)
@@ -513,6 +595,7 @@ def main():
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
         print(f"oncolab: {exc}", file=sys.stderr)
+        status = status or 1
     finally:
         lifecycle.command = None
         try:

@@ -50,14 +50,16 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
       - run: uv build --no-sources
-      - name: Verify the wheel and prepare checksums
+      - name: Smoke-test both release distributions and prepare checksums
         env:
           VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
-          wheel="$PWD/dist/oncolab-$VERSION-py3-none-any.whl"
-          export UV_TOOL_DIR="$RUNNER_TEMP/oncolab-tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/oncolab-bin"
-          uv tool install "$wheel"
-          test "$("$UV_TOOL_BIN_DIR/oncolab" --version)" = "oncolab $VERSION"
+          for distribution in "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz"; do
+            temp=$(mktemp -d "$RUNNER_TEMP/oncolab-smoke.XXXXXX")
+            export UV_TOOL_DIR="$temp/tools" UV_TOOL_BIN_DIR="$temp/bin"
+            uv --no-config tool install "$PWD/dist/$distribution"
+            test "$("$UV_TOOL_BIN_DIR/oncolab" --version)" = "oncolab $VERSION"
+          done
           cd dist
           sha256sum -- "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz" > sha256.sum
       - name: Publish this tested version
@@ -80,24 +82,18 @@ jobs:
       group: oncolab-pypi-${{ needs.release-policy.outputs.version }}
       cancel-in-progress: false
     steps:
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: false
       - name: Download and verify the immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.release-policy.outputs.version }}
-        run: |
-          set -euo pipefail
-          tag="v$VERSION"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$GITHUB_SHA"
-          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isImmutable --jq '.isImmutable and (.isDraft | not)')" = true
-          mkdir dist
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dist \
-            --pattern "oncolab-$VERSION-py3-none-any.whl" \
-            --pattern "oncolab-$VERSION.tar.gz" --pattern sha256.sum
-          cd dist
-          sha256sum -- "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz" | cmp - sha256.sum
+        run: bash scripts/verify_pypi_release.sh "$VERSION"
       - name: Publish distributions to PyPI
         env:
           VERSION: ${{ needs.release-policy.outputs.version }}

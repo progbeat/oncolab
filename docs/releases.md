@@ -19,7 +19,8 @@ Merge one version bump at a time. Before merging another package PR, update it
 against current `master` and wait for a fresh `release-policy` check. Require that
 up-to-date check in branch protection if more than one maintainer merges releases.
 After merge, the same workflow publishes only after both supported Python
-versions pass CI and the built wheel passes an installation smoke test. It
+versions pass CI and both release distributions pass fresh installation
+smoke tests. It
 creates the new version tag at the tested commit and attaches the wheel,
 source distribution and SHA-256 checksums to a draft before publishing.
 After verifying that release is immutable, a separate job downloads and
