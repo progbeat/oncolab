@@ -95,10 +95,19 @@ mount = { source = "gdrive:b", target = "/mnt/b" }
                 for expected in paths:
                     self.assertEqual(plan(profile)[1], expected)
                     expected.unlink()
-                with patch.dict(os.environ, {"RCLONE_CONFIG": "~/custom.conf"}):
+                with patch.dict(os.environ, {"RCLONE_CONFIG": str(root / "custom.conf")}):
                     self.assertEqual(plan(profile)[1], root / "custom.conf")
                     profile.write_text(mount + '[rclone]\nconfig = "override.conf"\n')
                     self.assertEqual(plan(profile)[1], root / "override.conf")
+
+    def test_rclone_config_env_uses_literal_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (patch.dict(os.environ, {"HOME": str(root / "home"),
+                                          "RCLONE_CONFIG": "config/../~/portable.conf"}),
+                  patch("oncolab.config.os.getcwd", return_value=tmp)):
+                self.assertEqual(self.parse('[setup.work]\nmount = { source = "test:work", '
+                                            'target = "/mnt/work" }\n')[1], root / "~/portable.conf")
 
     def test_wrapped_rclone_reports_its_actual_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,7 +371,7 @@ target = "/mnt/work"
                 ("", {}, "No local rclone config found"),
                 ("", {"RCLONE_CONFIG": ""}, "RCLONE_CONFIG disables the local config"),
                 ("", {"RCLONE_CONFIG": "~oncolab-no-such-user-8391/rclone.conf"},
-                 "RCLONE_CONFIG: could not expand home directory"),
+                 "config file not found"),
                 ('[rclone]\nconfig = "missing.conf"\n', {}, "config file not found"),
                 ("", {"RCLONE_CONFIG": str(root / "missing.conf")}, "config file not found"),
             ):

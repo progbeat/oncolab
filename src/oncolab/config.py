@@ -243,7 +243,8 @@ def default_rclone_config():
         path = os.environ["RCLONE_CONFIG"]
         if not path or path == os.devnull or Path(path).name == "notfound":
             raise ConfigError("RCLONE_CONFIG disables the local config; set [rclone].config for mounts")
-        return local_path(path, Path.cwd(), "RCLONE_CONFIG")
+        # rclone uses lexical filepath.Abs for this setting, not shell/home expansion.
+        return Path(os.path.abspath(path))
 
     if executable := which("rclone"):
         try:

@@ -164,10 +164,13 @@ The tool exports `ONCOLAB_MOUNT_<NAME>` to setup and the command (uppercased, wi
 hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
 
 All mounts in the session share one rclone config. If `[rclone].config` is
-set, use that file; relative paths resolve beside the TOML profile. Otherwise
-use the local rclone default. oncolab honors `RCLONE_CONFIG` first, then
-asks the installed `rclone config file` for its path. If rclone is not
-installed locally, it checks `$XDG_CONFIG_HOME/rclone/rclone.conf`,
+set, use that file; `~` is expanded and relative paths resolve beside the
+TOML profile. Otherwise use the local rclone default. oncolab honors
+`RCLONE_CONFIG` first, using rclone's literal path interpretation: relative
+paths are relative to the invocation directory, and a quoted `~` is not
+expanded. If the variable is unset, oncolab asks the installed
+`rclone config file` for its path. If rclone is not installed locally,
+oncolab checks `$XDG_CONFIG_HOME/rclone/rclone.conf`,
 `~/.config/rclone/rclone.conf`, and `~/.rclone.conf` in order. Once the config exists,
 you do not need a local rclone executable to run oncolab. oncolab installs
 rclone and FUSE on the VM if needed. No mounts means no rclone config is
