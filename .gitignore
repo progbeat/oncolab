@@ -2,3 +2,6 @@
 __pycache__/
 dist/
 *.py[cod]
+
+# Local rclone credentials used by the mount examples.
+rclone-colab.conf
