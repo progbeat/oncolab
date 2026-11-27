@@ -1,0 +1,6 @@
+# Replace gdrive:work with your own Google Drive OAuth remote and folder.
+# oncolab --config examples/work.toml -- ls /mnt/work
+[mounts.work]
+source = "gdrive:work"
+target = "/mnt/work"
+read_only = true

@@ -1,118 +1,74 @@
 # oncolab
 
+[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
 [![CI: GitHub Actions](https://img.shields.io/badge/CI-GitHub_Actions-0969da)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://github.com/progbeat/oncolab/blob/main/pyproject.toml)
 
-Run a terminal command on a fresh Google Colab VM. `oncolab` provisions the VM, sets up your environment, and releases the VM when the command exits. It runs ordinary commands, scripts already on the VM, or an interactive shell. You do not need to write a notebook or wrap your command in Python.
+Run a terminal command on a fresh Google Colab VM, without writing a notebook.
+`oncolab` creates the VM, runs your command, and normally releases the VM when it exits. A profile can
+install tools and mount Google Drive before the command starts.
 
-[Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Security](#security-and-cleanup)
+[Quick start](#quick-start) · [Run a command](#run-a-command) · [Configure the VM](#configure-the-vm) · [Troubleshooting](#troubleshooting)
 
-![A live oncolab command from a Mac: echo Hello, world!](/../demo-media/demo.webp)
+![Live T4 run: oncolab prepares Git, FUSE, and rclone in parallel, then nvidia-smi reports a Tesla T4.](/../demo-media/demo.webp)
 
 [Open the terminal demo](https://github.com/progbeat/oncolab/blob/demo-media/demo.webp)
 
-## Installation
+## Quick start
 
-You need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab account, and read access to this private repository through GitHub SSH.
+On macOS or Linux, you need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab
+account, and SSH access to this private GitHub repository.
 
-**Colab CLI is a separate prerequisite.** `oncolab` calls the official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) executable `colab` from your PATH. If it is not installed, use:
+1. If you don't already have the official Colab CLI, install it:
+   `uv tool install google-colab-cli`.
+2. If you're not signed in to Colab, run `colab sessions` and complete the Google
+   sign-in. For the **Colab** connection you need a supported local SSH key, such
+   as `~/.ssh/id_ed25519` with its matching `.pub`. This is separate from GitHub
+   authentication. [SSH setup and key selection](docs/configuration.md#ssh).
+3. Install `oncolab` and run your first command:
 
-```sh
-uv tool install google-colab-cli
-colab version
-colab sessions
-```
+   ```sh
+   uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
+   oncolab echo hello
+   ```
 
-`oncolab` was tested with Colab CLI 0.8.0; it does not pin that version. If you already have Colab CLI installed, skip its installation. Complete any Google sign-in prompt in `colab sessions` and set up a Colab-compatible key using the [Colab CLI SSH guide](https://github.com/googlecolab/google-colab-cli/blob/main/docs/06_ssh_access.md). Then install `oncolab`:
+Expect `hello`. No config or Drive mount is needed.
 
-```sh
-uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
-oncolab --version
-```
-
-If the tools aren't on your PATH, run `uv tool update-shell` and reopen your terminal. Install [rclone](https://rclone.org/install/) locally only if you want Drive mounts.
-
-## Usage
-
-```sh
-oncolab echo hello                      # smoke test on a fresh CPU VM
-oncolab bash                            # interactive shell; exit to release the VM
-oncolab --gpu T4 python3                 # interactive Python on a T4, if available
-oncolab -- bash -c 'uname -m && pwd'      # a shell expression, evaluated on the VM
-printf 'print(123)\n' | oncolab python3   # piped stdin; stdout is command output
-```
-
-Commands start in `/content`. A terminal is allocated when both stdin and stdout are terminals. Put `oncolab` options before your command; everything after the command name is passed to it. Use `--` to mark the boundary explicitly. `-A` opts in to SSH agent forwarding; use it only when you trust the VM and its setup. Run `oncolab --help` for accelerator and memory options.
-
-## Configuration
-
-No config is required. `oncolab` reads `$XDG_CONFIG_HOME/oncolab/config.toml` (normally `~/.config/oncolab/config.toml`) or the exact path passed to `--config`. It never discovers setup from the current project. Configs are trusted local executable configuration, not files to accept from strangers.
-
-```toml
-[rclone]
-config = "~/.config/rclone/rclone.conf"  # optional; default is rclone's path
-allow_full_drive = false
-
-[mounts.work]
-source = "gdrive:work"
-target = "/content/work"
-read_only = false
-
-[mounts.reference]
-source = "reference:archive"
-target = "/mnt/reference"
-read_only = true
-
-[setup.packages]
-description = "Installing Polars…"
-run = ["uv", "pip", "install", "--system", "polars"]
-
-[setup.inputs]
-description = "Checking inputs…"
-run = 'test -d "$ONCOLAB_MOUNT_WORK/datasets"'
-depends = ["mounts.work"]
-```
-
-Each mount can override `config`. Use distinct remote names if two config files define different remotes. Only direct Google Drive OAuth remotes are supported in v0.1. Targets must be empty directories under `/content`, `/mnt`, `/home`, or `/root` and cannot overlap. Each mount exports `ONCOLAB_MOUNT_<NAME>` (uppercase, hyphens converted to underscores); the mount named `work` also exports `COLAB_DRIVE`. The VFS cache stays at the rclone default.
-
-Use an argv array for an exact command, a string for Bash with `-e -o pipefail`, or `script = "./setup.sh"` to run the contents of a local file with those Bash options. Relative local paths resolve beside the TOML. `depends` lists setup names or `mounts.<name>`. Independent steps run in parallel. Unknown dependencies and cycles fail **before** allocation. Setup exports do not reach other steps or the final command.
-
-Try an example without changing your default config (run these from a checkout):
+## Run a command
 
 ```sh
-oncolab --config examples/setup.toml -- cat /tmp/oncolab-sample/value
-oncolab --config examples/home.toml -- printenv HOME
+oncolab bash                              # interactive shell; exit when done
+oncolab --gpu T4 nvidia-smi                # request a GPU, subject to availability
+oncolab -- bash -c 'uname -m && pwd'       # evaluate the shell expression on Colab
+oncolab python3 - < train.py              # send a standalone local script over stdin
 ```
 
-For Drive, first create your own direct OAuth remotes with `rclone config`. Copy [the two-mount example](examples/drive.toml), edit the remote names and paths, and select it with `--config`. See [the Git-on profile](examples/git-on.toml) if you want Colab to prepare Git and Git-on. Leave those setup steps out if you don't need them.
+Commands start in `/content` on the VM. Your local working directory and files
+aren't copied. Use setup or a Drive mount for a project; save outputs to
+persistent storage before the VM is released. Put `oncolab` flags before the
+command. See `oncolab --help` for accelerator and memory options.
 
-### Entrypoint
+## Configure the VM
 
-Like [Docker’s exec-form ENTRYPOINT](https://docs.docker.com/reference/dockerfile/#entrypoint), the optional top-level `entrypoint` is an argv prefix. Put it before the first TOML table header. With `oncolab -- python3 -i`, this config runs `env HOME=/content/my-home python3 -i`:
+Pass `--config path/to/profile.toml`, or save your default profile as
+`~/.config/oncolab/config.toml`. Start with the example that matches your task:
 
-```toml
-entrypoint = ["env", "HOME=/content/my-home"]
+- [Install or prepare something before your command](examples/setup.toml): no Drive required.
+- [Mount one Google Drive folder](examples/work.toml): install rclone locally,
+  [configure the OAuth remote](docs/configuration.md#google-drive-mounts),
+  and edit the source path.
+- [Advanced profiles](docs/configuration.md#examples): multiple mounts with
+  separate read/write settings, Git-on, or a wrapper that changes `HOME`.
 
-[setup.home]
-run = ["mkdir", "-p", "/content/my-home"]
-```
+[Configuration reference](docs/configuration.md) ·
+[Drive permissions and safety](docs/configuration.md#security-and-cleanup)
 
-For a wrapper script installed by setup, use `entrypoint = ["/path/to/runner"]` and finish the wrapper with `exec "$@"`. To inline a shell wrapper, use `entrypoint = ["sh", "-c", 'export MY_VAR=value; exec "$@"', "oncolab"]`; the last element is the shell's `$0`, not part of the user command. A wrapper can use `runuser` to change UID, but root-owned FUSE mounts remain owner-only by default. Use HOME-only changes if that process needs those mounts; `oncolab` does not enable cross-user mount access.
+## Troubleshooting
 
-## Security and cleanup
+- **Command not found:** run `uv tool update-shell` and reopen your terminal.
+- **SSH fails:** check [key selection](docs/configuration.md#ssh); `oncolab`
+  doesn't read `~/.ssh/config` for the Colab connection.
+- **VM cleanup wasn't confirmed:** check `colab sessions`. If the VM is still
+  there, use `colab stop -s <session>` only once you know no writes are pending.
 
-- Only selected rclone sections travel over SSH stdin. They are staged in a private RAM-backed directory; after mounting, the daemon switches to an in-memory path and the entire staging directory is removed. Encrypted configs and FIFO loading are not part of v0.1. Never embed credentials in setup, CLI arguments, or the TOML.
-- The rclone management interface is a Unix socket inside that private directory, with no TCP listener. Its pathname is removed after the mount phase, **before the entrypoint or user command**. That blocks new connections by pathname, not connections already open. Setup and the VM itself must be trusted. The daemon stays alive to serve FUSE.
-- `read_only` controls access through that mount, not the OAuth grant. Use a separately authorized least-privilege remote if the credential itself must be read-only. The configured scope is checked, but that value is not proof of what an existing OAuth token was granted.
-- SSH normally trusts the authenticated Colab bridge, as the official CLI does. For independently verified host keys, set `[ssh]` with `known_hosts = "/path/to/known_hosts"` containing the trusted key for `colab-runtime`. Do not trust a key copied from an unverified connection.
-- If unmount fails, the VM remains running to avoid interrupting writes. An ambiguous disconnect after the remote command is attempted does not force-stop the VM. Use `colab sessions` to verify its status.
-- This is an unofficial project and is not affiliated with Google.
-
-## Development
-
-```sh
-uv --no-config sync --locked
-uv --no-config run --locked python -m unittest discover -s tests -v
-uv build
-```
+[Development](docs/configuration.md#development) · Unofficial; not affiliated with Google.
