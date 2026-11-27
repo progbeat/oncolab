@@ -239,9 +239,16 @@ def upload_tasks(ssh, target, jobdir, groups):
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
     command = shlex.join(["python3", "-c", REQUESTS, jobdir, *groups])
     jobs, errors = [], []
-    with ThreadPoolExecutor(max_workers=4) as workers, TemporaryFile() as diagnostic, sp.Popen(
-        [*channel, command], stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=diagnostic, text=True,
-    ) as broker:
+    # Long-lived service input can backpressure indefinitely. Keep archive
+    # capacity available, while staying below the default SSH MaxSessions
+    # limit even with the broker, payload, and a legacy copy in flight.
+    with (
+        ThreadPoolExecutor(max_workers=2) as archives,
+        ThreadPoolExecutor(max_workers=4) as streams,
+        TemporaryFile() as diagnostic,
+        sp.Popen([*channel, command], stdin=sp.DEVNULL, stdout=sp.PIPE,
+                 stderr=diagnostic, text=True) as broker,
+    ):
         def wake_runner(job):
             if job.exception() is not None or not job.result()[1]:
                 # Dropping only the broker wakes the remote copy waiters;
@@ -255,6 +262,7 @@ def upload_tasks(ssh, target, jobdir, groups):
                 continue
             entries, input_source = groups.pop(key)
             sources, targets, modes = zip(*entries) if entries else ((), (), ())
+            workers = streams if input_source is not None else archives
             job = workers.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result",
                                  sources, targets, modes, input_source=input_source)
             jobs.append(job)

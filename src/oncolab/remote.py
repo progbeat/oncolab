@@ -166,7 +166,7 @@ async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
     statuses = ("ok", "failed", "short") if input_pipe else ("ok", "failed")
     while True:
         if input_pipe and path.with_name("writer-ready").exists():
-            input_pipe.release("keeper")
+            input_pipe.writer_attached()
         status = read(path)
         if status in statuses:
             if input_pipe:
@@ -180,7 +180,7 @@ async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
                 os.kill(int(broker_text), 0)
             if pid_text.endswith("\n"):
                 os.kill(int(pid_text), 0)
-            elif not broker_text and loop.time() >= deadline:
+            elif loop.time() >= deadline:
                 raise ProcessLookupError
         except ProcessLookupError:
             if read(path) in statuses:
@@ -249,6 +249,7 @@ class TaskInput:
         self.broker = broker
         self.fifo = self.result.with_name("stdin")
         self.reader = self.keeper = None
+        self.attached = asyncio.Event()
 
     def release(self, name):
         fd = getattr(self, name)
@@ -262,8 +263,13 @@ class TaskInput:
         self.release("reader")
         self.result.with_name("requested").touch()
 
+    def writer_attached(self):
+        self.release("keeper")
+        self.attached.set()
+
     async def run(self, command, *, service):
-        process = delivery = None
+        process = delivery = attachment = None
+        detached = False
         self.fifo.parent.mkdir(mode=0o700, exist_ok=True)
         os.mkfifo(self.fifo, 0o600)
         try:
@@ -277,26 +283,36 @@ class TaskInput:
                 result = process.result()
                 if result is not None and result.returncode:
                     return result
-                if not service and not delivery.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(delivery), 3)
-                    except TimeoutError:
-                        # A successful finite command can intentionally stop
-                        # reading before its writer has even started.
-                        return result
+                if not delivery.done():
+                    if service:
+                        attachment = asyncio.create_task(self.attached.wait())
+                        await asyncio.wait((delivery, attachment), return_when=asyncio.FIRST_COMPLETED)
+                        if not delivery.done():
+                            # A ready service may consume input only once the main
+                            # command connects. The SSH helper now owns the
+                            # unnamed pipe's writer; do not wait for it to see EOF.
+                            detached = True
+                            return result
+                    else:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(delivery), 3)
+                        except TimeoutError:
+                            # A successful finite command can intentionally stop
+                            # reading before its writer has even started.
+                            return result
             transferred = await delivery
             if transferred.returncode:
                 return transferred
             return await process
         finally:
             try:
-                if delivery is None or not delivery.done():
+                if not detached and (delivery is None or not delivery.done()):
                     self.result.with_name("cancelled").touch()
             finally:
                 self.release("reader")
                 self.release("keeper")
                 self.fifo.unlink(missing_ok=True)
-                tasks = [task for task in (process, delivery) if task is not None]
+                tasks = [task for task in (process, delivery, attachment) if task is not None]
                 for task in tasks:
                     if not task.done():
                         task.cancel()
@@ -501,7 +517,11 @@ async def setup_all(run, plan, drive, lifecycle=None):
                     return None
 
                 if input_result := step.get("stdin_result"):
-                    return await TaskInput(input_result, broker).run(launch, service="start" in step)
+                    service = "start" in step
+                    result = await TaskInput(input_result, broker).run(launch, service=service)
+                    if service and result is None and lifecycle.services[key].poll() is not None:
+                        raise RuntimeError(f"{step['description']} exited while opening task input")
+                    return result
                 return await launch()
         else:
             command = step.get("argv", lambda: None)

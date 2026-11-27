@@ -34,6 +34,8 @@ Colab account.
 
 Expect `hello`. No config or Drive mount is needed.
 To update later, run `uv tool upgrade oncolab`.
+If you previously installed from a pinned Git URL, switch to PyPI once with
+`uv tool uninstall oncolab` followed by `uv tool install oncolab`.
 
 ## Run a command
 

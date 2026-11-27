@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from signal import SIGINT
+from threading import Event
 from unittest.mock import Mock, patch
 
 from oncolab import cli, remote
@@ -76,6 +77,38 @@ run = ["echo", ""]
             config, _, _ = plan(None, cli_mounts=["type=gdrive,source=work,target=work,readonly"])
             self.assertEqual(config["mounts"]["mounts.cli-1"],
                              {"source": "gdrive:work", "target": "/content/work", "read_only": True})
+
+
+class Transfers(unittest.TestCase):
+    def test_four_blocked_input_streams_do_not_starve_an_archive(self):
+        groups = {f"stream-{i}": ((), Path(f"source-{i}")) for i in range(4)}
+        groups["archive"] = ([(Path("data.txt"), "/content/data.txt", None)], None)
+        archived = Event()
+        blockers = [Event() for _ in range(4)]
+
+        class Broker:
+            stdout = iter(tuple(f"{name}\n" for name in groups))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def wait(self):
+                return 0
+
+        def transfer(_ssh, _target, _result, _sources, _targets, _modes, *, input_source):
+            if input_source is None:
+                if not all(started.wait(1) for started in blockers):
+                    return "input streams did not start", True
+                archived.set()
+                return None, True
+            blockers[int(input_source.name[-1])].set()
+            return (None if archived.wait(2) else "archive starved by stdin streams"), True
+
+        with patch.object(cli.sp, "Popen", return_value=Broker()), patch.object(cli, "upload", transfer):
+            self.assertEqual(cli.upload_tasks([], "the-peer", "/job", groups), [])
 
 
 async def run(_, command):
@@ -334,6 +367,88 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
                 result = await asyncio.wait_for(remote.wait_copy(path / "copy-result",
                     broker=path / "broker-pid"), 1)
             self.assertEqual(result.returncode, 1)
+
+    async def test_broker_alive_does_not_remove_receiver_start_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            broker, result = root / "broker-pid", root / "copy-result"
+            pid = f"{os.getpid()}\n"
+            broker.write_text(pid)
+            expired = await asyncio.wait_for(remote.wait_copy(result, broker=broker, start_timeout=.02), 1)
+            self.assertEqual(expired.returncode, 1)
+
+            async def active_transfer():
+                result.with_name("copy-pid").write_text(pid)
+                await asyncio.sleep(.25)
+                result.write_text("ok")
+
+            _, finished = await asyncio.wait_for(asyncio.gather(active_transfer(),
+                remote.wait_copy(result, broker=broker, start_timeout=.02)), 1)
+            self.assertEqual(finished.returncode, 0)
+
+    async def test_ready_service_can_read_stdin_only_after_the_main_command_triggers_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ready, trigger, received = (root / name for name in ("ready", "trigger", "received"))
+            result, broker = root / "copy-result", root / "broker-pid"
+            broker.write_text(f"{os.getpid()}\n")
+            for status in ("ok", "failed", "short"):
+                result.with_name(f"copy-{status}").write_text(status)
+            server = """
+import sys, time
+from pathlib import Path
+ready, trigger, received = map(Path, sys.argv[1:])
+ready.touch()
+while not trigger.exists():
+    time.sleep(.01)
+received.write_bytes(sys.stdin.buffer.read())
+time.sleep(30)
+"""
+            graph = {"listener": {"description": "listener", "depends": [],
+                                  "start": [sys.executable, "-c", server, *map(str, (ready, trigger, received))],
+                                  "ready": ["test", "-f", str(ready)], "stdin_result": str(result)}}
+            lifecycle = remote.Lifecycle()
+            lifecycle.environment = os.environ.copy()
+
+            async def open_sender():
+                while not result.with_name("requested").exists():
+                    await asyncio.sleep(.01)
+                return await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", "import sys; from oncolab.copy import input_receiver;"
+                    "raise SystemExit(input_receiver(sys.argv[1]))", str(result),
+                    stdin=asyncio.subprocess.PIPE,
+                )
+
+            connecting = asyncio.create_task(open_sender())
+            sender = None
+            try:
+                status = await asyncio.wait_for(lifecycle.prepare(run, {"setup": graph, "jobdir": tmp}, None), 5)
+                self.assertEqual(status, 0)
+                sender = await asyncio.wait_for(connecting, 5)
+                self.assertFalse(result.exists(), "startup waited for the input source to finish")
+                self.assertFalse(result.with_name("stdin").exists())
+                self.assertFalse(result.with_name("cancelled").exists())
+                # The ready service has not read from stdin yet. Only the main
+                # command's trigger allows it to drain and then see EOF.
+                trigger.touch()
+                await asyncio.wait_for(sender.communicate(b"\0\0\0\x05hello" + b"\0" * 4), 5)
+                self.assertEqual(sender.returncode, 0)
+
+                async def wait_for_read():
+                    while not received.exists() or received.stat().st_size < 5:
+                        await asyncio.sleep(.01)
+                await asyncio.wait_for(wait_for_read(), 5)
+                self.assertEqual(received.read_bytes(), b"hello")
+            finally:
+                if connecting.done() and not connecting.cancelled():
+                    sender = connecting.result()
+                else:
+                    connecting.cancel()
+                    await asyncio.gather(connecting, return_exceptions=True)
+                if sender is not None and sender.returncode is None:
+                    sender.kill()
+                    await sender.communicate()
+                self.assertTrue(lifecycle.cleanup(None))
 
     def test_drive_hook_failure_preserves_mount_and_daemon(self):
         lifecycle = remote.Lifecycle()
