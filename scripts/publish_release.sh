@@ -5,7 +5,6 @@ version=$1
 tag=v$version
 repo=$GITHUB_REPOSITORY
 sha=$GITHUB_SHA
-: "${IMMUTABLE_RELEASES_READ_TOKEN:?Set the IMMUTABLE_RELEASES_READ_TOKEN Actions secret (repository Administration: read)}"
 assets=("dist/oncolab-$version-py3-none-any.whl" "dist/oncolab-$version.tar.gz" dist/sha256.sum)
 for asset in "${assets[@]}"; do test -s "$asset"; done
 notes=$(mktemp)
@@ -42,13 +41,10 @@ verify_assets() {
 if [[ $(gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft) == true ]]; then
     gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber
     verify_assets
-    # The normal Actions token can publish, but cannot read repository administration.
-    if ! enabled=$(GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \
-        "repos/$repo/immutable-releases" --jq .enabled) || [[ "$enabled" != true ]]; then
-        echo "Could not verify Immutable Releases is enabled for $repo; leaving $tag as a draft" >&2
-        exit 1
-    fi
     gh release edit "$tag" --repo "$repo" --draft=false
 fi
-test "$(gh release view "$tag" --repo "$repo" --json isImmutable --jq .isImmutable)" = true
+if [[ "$(gh release view "$tag" --repo "$repo" --json isImmutable --jq .isImmutable)" != true ]]; then
+    echo "GitHub did not confirm $tag is immutable after publication; check the repository’s Immutable Releases setting" >&2
+    exit 1
+fi
 verify_assets

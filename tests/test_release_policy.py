@@ -58,20 +58,14 @@ printf '%s\\n' "$*" >> commands
 case "$1 $2" in
   'api repos/progbeat/oncolab/git/ref/tags/v0.2.0') cat tag ;;
   'api --method') echo "$GITHUB_SHA" > tag ;;
-  'api repos/progbeat/oncolab/immutable-releases')
-    test "$GH_TOKEN" = read-token || exit 1
-    case $(cat immutable) in
-      unavailable) exit 1 ;;
-      *) cat immutable ;;
-    esac ;;
   'release create') echo true > draft ;;
   'release upload') test "$(cat draft)" = true ;;
-  'release edit') test "$GH_TOKEN" = publish-token && echo false > draft ;;
+  'release edit') echo false > draft ;;
   'release view')
     test -f draft || exit 1
     case "$*" in
       *'--json isDraft --jq'*) cat draft ;;
-      *'--json isImmutable --jq'*) test "$(cat draft)" = false && echo true ;;
+      *'--json isImmutable --jq'*) test "$(cat draft)" = false && { if test -f mutable; then echo false; else echo true; fi; } ;;
       *'--json assets --jq'*) echo oncolab-0.2.0-py3-none-any.whl; echo oncolab-0.2.0.tar.gz; echo sha256.sum; if test -f extra; then echo unexpected.bin; fi ;;
     esac ;;
   *) exit 1 ;;
@@ -79,28 +73,14 @@ esac
 """)
             gh.chmod(0o755)
             env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", GITHUB_REPOSITORY="progbeat/oncolab",
-                       GITHUB_SHA="a" * 40, GH_TOKEN="publish-token", IMMUTABLE_RELEASES_READ_TOKEN="read-token")
+                       GITHUB_SHA="a" * 40)
             command = ["bash", str(ROOT / "scripts/publish_release.sh"), "0.2.0"]
-            failed = subprocess.run(command, cwd=tmp, env=dict(env, IMMUTABLE_RELEASES_READ_TOKEN=""),
-                                    capture_output=True)
-            self.assertNotEqual(failed.returncode, 0)
-            self.assertIn(b"IMMUTABLE_RELEASES_READ_TOKEN", failed.stderr)
-            self.assertFalse((tmp / "commands").exists())
-            for setting in ("false", "unavailable"):
-                with self.subTest(immutable_releases=setting):
-                    (tmp / "immutable").write_text(setting)
-                    failed = subprocess.run(command, cwd=tmp, env=env, capture_output=True)
-                    self.assertNotEqual(failed.returncode, 0)
-                    self.assertIn(b"leaving v0.2.0 as a draft", failed.stderr)
-                    self.assertEqual((tmp / "draft").read_text().strip(), "true")
-                    self.assertNotIn("release edit", (tmp / "commands").read_text())
-            (tmp / "immutable").write_text("true")
             subprocess.run(command, cwd=tmp, env=env, check=True, capture_output=True)
             subprocess.run(command, cwd=tmp, env=env, check=True, capture_output=True)
             trace = (tmp / "commands").read_text()
             self.assertEqual(trace.count("api --method POST"), 1)
             self.assertEqual(trace.count("release create"), 1)
-            self.assertEqual(trace.count("release upload"), 3)
+            self.assertEqual(trace.count("release upload"), 1)
             self.assertEqual(trace.count("release edit"), 1)
             (tmp / "draft").write_text("true")
             (tmp / "extra").touch()
@@ -109,6 +89,12 @@ esac
             self.assertIn(b"does not contain exactly the expected assets", failed.stderr)
             self.assertEqual((tmp / "draft").read_text(), "true")
             self.assertEqual((tmp / "commands").read_text().count("release edit"), 1)
+            (tmp / "extra").unlink()
+            (tmp / "mutable").touch()
+            failed = subprocess.run(command, cwd=tmp, env=env, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(b"did not confirm v0.2.0 is immutable after publication", failed.stderr)
+            self.assertEqual((tmp / "draft").read_text().strip(), "false")
             (tmp / "tag").write_text("b" * 40)
             failed = subprocess.run(command, cwd=tmp, env=env, capture_output=True)
             self.assertNotEqual(failed.returncode, 0)

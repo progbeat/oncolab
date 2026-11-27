@@ -22,15 +22,13 @@ After merge, the same workflow publishes only after both supported Python
 versions pass CI and the built wheel passes an installation smoke test. It
 creates the new version tag at the tested commit and attaches the wheel,
 source distribution and SHA-256 checksums to a draft before publishing.
-No manual tag, separate release PR or PyPI upload is needed.
+No manual tag, separate release PR, PyPI upload or additional credential is
+needed.
 
-Keep GitHub Immutable Releases enabled. Set the `IMMUTABLE_RELEASES_READ_TOKEN`
-repository Actions secret to a fine-grained token scoped only to this repository
-with **Administration: read**. The workflow uses that token only to verify
-the setting immediately before publishing the draft. If verification fails,
-the release stays a draft. The built-in Actions token still handles publication.
-
-If a run fails, rerun it at the same
-commit: a pre-existing tag is accepted only if it still points to that exact
+Keep GitHub Immutable Releases enabled and protect version tags from changes.
+GitHub applies immutability at publication. The workflow verifies the result
+after publishing; if the setting is off, this check alerts you but does not
+prevent publication. If a run fails, inspect the release before rerunning it
+at the same commit: a pre-existing tag is accepted only if it still points to that exact
 commit. Never delete or move a published version tag. Published release notes
 are preserved in GitHub Releases; `RELEASES.md` is just the current draft.
