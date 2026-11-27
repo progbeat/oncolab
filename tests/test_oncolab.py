@@ -150,7 +150,11 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
                     await cmd()
                 return None
             lifecycle = remote.Lifecycle()
-            lifecycle.environment = {"PATH": "/profile/bin:/usr/bin", "MODE": "shared"}
+            lifecycle.environment = {"HOME": "/profile/home", "PATH": "/usr/bin:/bin", "MODE": "shared",
+                                     "RCLONE_RC_BASEURL": "/alt", "RCLONE_LOOPBACK": "true",
+                                     "RCLONE_URL": "https://example.invalid/", "RCLONE_DRIVE_SCOPE": "drive.readonly"}
+            expected = {"HOME": "/profile/home", "PATH": "/profile/home/.local/bin:/usr/bin:/bin",
+                        "MODE": "shared", "RCLONE_DRIVE_SCOPE": "drive.readonly"}
             with patch.object(remote, "command_result", new_callable=AsyncMock) as install:
                 install.return_value = subprocess.CompletedProcess([], 0)
                 status = await remote.setup_all(run, {"mounts": mounts, "setup": {}}, drive, lifecycle)
@@ -158,8 +162,10 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
             self.assertCountEqual([call.args[0][-1] for call in install.await_args_list],
                                   [remote.FUSE, remote.RCLONE])
             for call in install.await_args_list:
-                self.assertIs(call.args[1], lifecycle.environment)
-            self.assertIs(drive.environment, lifecycle.environment)
+                self.assertIs(call.args[1], drive.environment)
+            self.assertEqual(drive.environment, expected)
+            self.assertEqual(lifecycle.environment["PATH"], "/usr/bin:/bin")
+            self.assertEqual(lifecycle.environment["RCLONE_RC_BASEURL"], "/alt")
             sent = {call.kwargs["fs"]: call.kwargs["vfsOpt"]["ReadOnly"] for call in drive.rc.await_args_list if call.args == ("mount/mount",)}
             self.assertEqual(sent, {"demo:work": False, "demo:ref": True})
             self.assertEqual(drive.rc.await_args.args, ("config/setpath",))

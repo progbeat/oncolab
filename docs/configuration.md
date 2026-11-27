@@ -40,7 +40,10 @@ Put `workdir` before any table header. It must be an absolute path on the VM
 filesystem. It is created if needed and is the starting directory for setup
 and the command, before any `cd` in the entrypoint. The `[env]` table sets
 literal string values for setup (including Drive preparation and rclone), task
-teardown, the entrypoint, and the command. Use
+teardown, the entrypoint, and the command. Drive helpers also search their
+installation directory (`$HOME/.local/bin`) first, without changing the
+profile’s `PATH` for its own commands. oncolab reserves rclone’s private
+control transport settings; backend options still reach rclone. Use
 `-e NAME=VALUE` (or `--env NAME=VALUE`) to set an explicit value. With
 `-e NAME`, `oncolab` takes the value from the exported local environment;
 if it is absent locally, the variable is unset for the command even if the

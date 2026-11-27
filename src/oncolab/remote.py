@@ -67,6 +67,18 @@ unzip -p "$tmp/rclone.zip" "$archive/rclone" > "$tmp/rclone"
 install -D -m 755 "$tmp/rclone" "$HOME/.local/bin/rclone"
 '''
 
+def drive_environment(profile):
+    # Backend settings are useful, but the control socket belongs to the runner.
+    client_options = {"RCLONE_LOOPBACK", "RCLONE_URL", "RCLONE_USER", "RCLONE_PASS",
+                      "RCLONE_UNIX_SOCKET", "RCLONE_JSON"}
+    env = {key: value for key, value in profile.items()
+           if not (key == "RCLONE_RC" or key.startswith("RCLONE_RC_") or key in client_options)}
+    managed = f"{env.get('HOME', str(Path.home()))}/.local/bin"
+    paths = env.get("PATH", os.defpath).split(os.pathsep)
+    env["PATH"] = os.pathsep.join([managed, *(path for path in paths if path != managed)])
+    return env
+
+
 class DriveMounts:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -531,11 +543,11 @@ async def setup_all(run, plan, drive, lifecycle=None):
     drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
     if drive:
-        drive.environment = lifecycle.environment
+        drive.environment = drive_environment(lifecycle.environment if lifecycle.environment is not None else os.environ)
         workdir_ready = ("copy",) if copy_supplies_workdir else ()
 
         def install(script):
-            return partial(command_result, [*bash, script], lifecycle.environment)
+            return partial(command_result, [*bash, script], drive.environment)
 
         submit("fuse", "Preparing FUSE…", install(FUSE), *workdir_ready)
         submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
