@@ -66,7 +66,7 @@ case "$1 $2" in
     case "$*" in
       *'--json isDraft --jq'*) cat draft ;;
       *'--json isImmutable --jq'*) test "$(cat draft)" = false && echo true ;;
-      *'--json assets --jq'*) echo oncolab-0.2.0-py3-none-any.whl; echo oncolab-0.2.0.tar.gz; echo sha256.sum ;;
+      *'--json assets --jq'*) echo oncolab-0.2.0-py3-none-any.whl; echo oncolab-0.2.0.tar.gz; echo sha256.sum; if test -f extra; then echo unexpected.bin; fi ;;
     esac ;;
   *) exit 1 ;;
 esac
@@ -82,6 +82,13 @@ esac
             self.assertEqual(trace.count("release create"), 1)
             self.assertEqual(trace.count("release upload"), 1)
             self.assertEqual(trace.count("release edit"), 1)
+            (tmp / "draft").write_text("true")
+            (tmp / "extra").touch()
+            failed = subprocess.run(command, cwd=tmp, env=env, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(b"does not contain exactly the expected assets", failed.stderr)
+            self.assertEqual((tmp / "draft").read_text(), "true")
+            self.assertEqual((tmp / "commands").read_text().count("release edit"), 1)
             (tmp / "tag").write_text("b" * 40)
             failed = subprocess.run(command, cwd=tmp, env=env, capture_output=True)
             self.assertNotEqual(failed.returncode, 0)

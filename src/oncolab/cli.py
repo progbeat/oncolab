@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
 from .config import credentials, plan
-from .copy import copy_plan, send_archive
+from .copy import COPY_FAILED, copy_plan, send_archive
 from .env import parse_env
 from .progress import progress, run_step
 
@@ -161,10 +161,12 @@ def upload(ssh, target, result, sources, targets):
         if not status and not local_error:
             return None, True
         error = local_error or detail or f"copy channel exited with status {status}"
+        if status in (0, COPY_FAILED):
+            return error, True
     except OSError as exc:
         error = str(exc)
     # If the receiver never launched, wake the remote runner as a failure.
-    mark = f"test -f {shlex.quote(result)} || printf failed > {shlex.quote(result)}"
+    mark = shlex.join(["python3", "-c", helper, result, "--failed"])
     notified = sp.run([*channel, mark], stdin=sp.DEVNULL, stdout=sp.DEVNULL,
                       stderr=sp.DEVNULL).returncode == 0
     return error, notified
@@ -204,11 +206,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         config["jobdir"] = jobdir
     if sources:
         config["copy_result"] = result
+        config["copy_supplies_workdir"] = any(Path(config["workdir"]).is_relative_to(path) for path in targets)
     staging = {}
     if rclone_ini:
         staging[workdir] = {"rclone.conf": rclone_ini.decode()}
     if env or sources:
         staging[jobdir] = {"env.json": json.dumps(env)} if env else {}
+    if sources:
+        staging[jobdir].update({"copy-result": "", "copy-ok": "ok", "copy-failed": "failed"})
     staged_input = json.dumps(staging).encode() if staging else None
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, workdir,
                           str(int(color)), json.dumps(config), *command])

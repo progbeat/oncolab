@@ -129,9 +129,15 @@ async def wait_copy(result):
             status = path.read_text()
         except FileNotFoundError:
             status = ""
-        if status:
+        if status in ("ok", "failed"):
             return sp.CompletedProcess([], int(status != "ok"), None, None)
         await asyncio.sleep(.10)
+
+
+def enter_workdir(plan):
+    workdir = Path(plan.get("workdir", "/content"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    os.chdir(workdir)
 
 
 async def setup_all(run, plan, drive):
@@ -161,6 +167,13 @@ async def setup_all(run, plan, drive):
     else:
         copy_result = None
 
+    workdir_dependencies = ()
+    if plan.get("copy_supplies_workdir"):
+        async def prepare_workdir():
+            enter_workdir(plan)
+        submit("workdir", "Preparing working directory…", prepare_workdir, "copy")
+        workdir_dependencies = ("workdir",)
+
     drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
     if drive:
@@ -176,7 +189,7 @@ async def setup_all(run, plan, drive):
 
     for name, step in plan["setup"].items():
         submit(f"setup:{name}", step["description"], step["argv"],
-               *(dep if dep.startswith("mounts.") or (copy_result and dep == "copy")
+               *workdir_dependencies, *(dep if dep.startswith("mounts.") or (copy_result and dep == "copy")
                  else f"setup:{dep}" for dep in step["depends"]))
 
     if drive:
@@ -211,9 +224,8 @@ def main():
     status = 1
     signal(SIGINT, lambda *_: None)
     try:
-        workdir = Path(plan.get("workdir", "/content"))
-        workdir.mkdir(parents=True, exist_ok=True)
-        os.chdir(workdir)
+        if not plan.get("copy_supplies_workdir"):
+            enter_workdir(plan)
         if jobdir:
             st = jobdir.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:

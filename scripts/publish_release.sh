@@ -28,11 +28,20 @@ fi
 if ! gh release view "$tag" --repo "$repo" --json isDraft,isImmutable >/dev/null 2>&1; then
     gh release create "$tag" --repo "$repo" --verify-tag --draft --title "$tag" --notes-file "$notes"
 fi
+expected=$(printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort)
+verify_assets() {
+    local actual
+    actual=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' | LC_ALL=C sort)
+    if [[ "$actual" != "$expected" ]]; then
+        echo "$tag does not contain exactly the expected assets" >&2
+        return 1
+    fi
+}
+
 if [[ $(gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft) == true ]]; then
     gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber
+    verify_assets
     gh release edit "$tag" --repo "$repo" --draft=false
 fi
 test "$(gh release view "$tag" --repo "$repo" --json isImmutable --jq .isImmutable)" = true
-expected=$(printf '%s\n' "${assets[@]##*/}" | sort)
-actual=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' | sort)
-test "$actual" = "$expected"
+verify_assets

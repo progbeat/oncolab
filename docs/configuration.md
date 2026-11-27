@@ -69,7 +69,9 @@ contains sensitive files. Changes on the VM are not copied back.
 
 Copy streams over the same SSH connection while independent setup runs.
 If a setup step uses a copied file, add `depends = ["copy"]` to wait for
-all uploads. The final command starts only after copy and setup succeed.
+all uploads. If a copy supplies the working directory or one of its parents,
+setup commands also wait for it so they start in the configured working
+directory. The final command starts only after copy and setup succeed.
 
 ### Setup steps
 

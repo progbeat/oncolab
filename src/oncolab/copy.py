@@ -39,8 +39,15 @@ def regular(member):
     return member
 
 
+class CopyTar(tarfile.TarFile):
+    def gettarinfo(self, *args, **kwargs):
+        # Treat each directory entry as a separate file without dereferencing symlinks.
+        self.inodes.clear()
+        return super().gettarinfo(*args, **kwargs)
+
+
 def send_archive(stream, sources):
-    with tarfile.open(fileobj=stream, mode="w|") as archive:
+    with CopyTar.open(fileobj=stream, mode="w|") as archive:
         for i, source in enumerate(sources):
             archive.add(source, arcname=str(i), filter=regular)
         # Distinguish a complete archive from a stream truncated between members.
@@ -97,19 +104,45 @@ def receive_archive(stream, targets):
             publish(root / str(i), target)
 
 
+COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.
+
+
+def publish_result(result, status):
+    # The complete markers are reserved before transfer, so reporting needs no data writes.
+    result = Path(result)
+    result.with_name("copy-" + status).replace(result)
+
+
+def notify_failure(result):
+    result = Path(result)
+    try:
+        if result.read_text() in ("ok", "failed"):
+            return
+    except FileNotFoundError:
+        pass
+    try:
+        publish_result(result, "failed")
+    except FileNotFoundError:
+        if result.parent.exists():
+            raise
+        # The runner already left setup and cleaned its private staging directory.
+
+
 def copy_receiver(result, targets):
     status = "failed"
     try:
         receive_archive(sys.stdin.buffer, targets)
         status = "ok"
-    except (OSError, ValueError, tarfile.TarError) as exc:
+    except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print(exc, file=sys.stderr)
-    finally:
-        Path(result).write_text(status)
-    return int(status != "ok")
+    publish_result(result, status)
+    return COPY_FAILED if status == "failed" else 0
 
 
 if __name__ == "__main__":
     import json
 
-    raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2])))
+    if sys.argv[2] == "--failed":
+        notify_failure(sys.argv[1])
+    else:
+        raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2])))
