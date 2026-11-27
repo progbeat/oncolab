@@ -36,6 +36,19 @@ class Copy(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     copy_plan(specs, "/content", mounts)
 
+    def test_local_filename_with_colon_cannot_select_another_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            plain = root / "train"
+            literal = root / "train:today"
+            plain.touch()
+            literal.touch()
+            with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                copy_plan([str(literal)], "/content", [])
+            escaped = str(literal).replace(":", r"\:")
+            self.assertEqual(copy_plan([escaped, f"{escaped}:other:file"], "/content", []),
+                             [(literal, "/content/train:today"), (literal, "/content/other:file")])
+
     def test_round_trip_and_never_replaces_existing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

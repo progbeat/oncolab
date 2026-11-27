@@ -8,10 +8,27 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 
+def split_copy_spec(spec):
+    local = []
+    i = 0
+    while i < len(spec):
+        char = spec[i]
+        if char == ":":
+            return "".join(local), spec[i + 1:]
+        if char == "\\" and spec[i + 1:i + 2] in (":", "\\"):
+            i += 1
+        local.append(spec[i])
+        i += 1
+    return "".join(local), None
+
+
 def copy_plan(specs, workdir, mounts):
     sources, targets = [], []
     for spec in specs:
-        local, sep, remote = spec.partition(":")
+        local, remote = split_copy_spec(spec)
+        if remote is not None and spec == f"{local}:{remote}" and Path(spec).expanduser().exists():
+            raise ValueError(r"Ambiguous --copy path: escape literal local colons as \:")
+        sep = remote is not None
         if not local or sep and not remote:
             raise ValueError("--copy expects LOCAL or LOCAL:REMOTE")
         source = Path(local).expanduser().absolute()

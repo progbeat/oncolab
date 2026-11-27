@@ -62,7 +62,9 @@ Local relative paths resolve from the current local directory. Without a
 destination, copy under the source basename into the VM working directory.
 A relative destination is resolved against the same VM directory. A trailing
 slash sets a containing directory; otherwise the destination is the exact new
-file or directory path. Destinations must not exist or overlap a Drive mount.
+file or directory path. To copy a local name with a literal colon, escape it
+inside shell quotes, for example `--copy 'train\:today.py'`. Destinations must
+not exist or overlap a Drive mount.
 Directories include hidden files; symlinks and other special entries are
 rejected rather than followed. Choose narrow sources if a project directory
 contains sensitive files. Changes on the VM are not copied back.
