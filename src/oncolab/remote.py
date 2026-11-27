@@ -10,7 +10,7 @@ from signal import SIGINT, signal
 
 
 def unassign():
-    sp.Popen([sys.executable, "-c", r'''
+    sp.Popen([sys.executable, "-P", "-c", r'''
 import os
 from time import sleep
 from google.colab import runtime
@@ -22,7 +22,7 @@ if key not in os.environb:
     )
 sleep(1)
 runtime.unassign()
-'''], start_new_session=True, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+'''], cwd="/", start_new_session=True, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
 # On Ubuntu 24.04 x86-64, rclone only needs the mount helper, not an apt upgrade.
 FUSE = r'''

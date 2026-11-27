@@ -63,5 +63,6 @@ jobs:
       - name: Publish this tested version
         env:
           GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
           VERSION: ${{ needs.release-policy.outputs.version }}
         run: bash scripts/publish_release.sh "$VERSION"

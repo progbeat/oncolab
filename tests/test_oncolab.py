@@ -85,6 +85,15 @@ target = "/mnt/b"
                 credentials({"demo": (None, False)})
 
 
+class Teardown(unittest.TestCase):
+    def test_unassign_does_not_import_from_the_project(self):
+        with patch.object(remote.sp, "Popen") as launch:
+            remote.unassign()
+        argv, options = launch.call_args
+        self.assertEqual(options["cwd"], "/")
+        self.assertEqual(argv[0][1:3], ["-P", "-c"])
+
+
 class RemoteMounts(unittest.IsolatedAsyncioTestCase):
     async def test_mount_modes_and_sealing_before_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
