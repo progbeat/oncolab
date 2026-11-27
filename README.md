@@ -1,6 +1,6 @@
 # oncolab
 
-[![Tests](https://github.com/progbeat/oncolab/actions/workflows/tests.yml/badge.svg)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
+[![CI: GitHub Actions](https://img.shields.io/badge/CI-GitHub_Actions-0969da)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
 [![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://github.com/progbeat/oncolab/blob/main/pyproject.toml)
 
@@ -8,7 +8,9 @@ Run a terminal command on a fresh Google Colab VM. `oncolab` provisions the VM, 
 
 [Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Security](#security-and-cleanup)
 
-![A live oncolab command from a Mac: echo Hello, world!](https://github.com/progbeat/oncolab/blob/99a0792072239bc1f8c0f8942b9cde2374abdf02/demo.webp?raw=true)
+![A live oncolab command from a Mac: echo Hello, world!](/../demo-media/demo.webp)
+
+[Open the terminal demo](https://github.com/progbeat/oncolab/blob/demo-media/demo.webp)
 
 ## Installation
 
