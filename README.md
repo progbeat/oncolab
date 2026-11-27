@@ -1,7 +1,7 @@
 # oncolab
 
 [![CI: passing](https://img.shields.io/github/actions/workflow/status/progbeat/oncolab/tests.yml?branch=main&event=push&label=CI)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
-[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
+[![Release v0.2.0](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.2.0)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
 
 Run a terminal command on a fresh Google Colab VM, without writing a notebook.
@@ -28,7 +28,7 @@ Colab account.
 3. Install `oncolab` and run your first command:
 
    ```sh
-   uv tool install 'git+https://github.com/progbeat/oncolab.git@v0.1.0'
+   uv tool install 'git+https://github.com/progbeat/oncolab.git@v0.2.0'
    oncolab echo hello
    ```
 
@@ -46,7 +46,7 @@ oncolab python3 - < train.py              # send a standalone local script over 
 Commands start in `/content`. Local files aren't copied automatically. Save
 outputs to persistent storage before the VM is released.
 
-**On the development branch:** set `workdir` in your profile to change the VM
+Set `workdir` in your profile to change the VM
 working directory, use `--copy` to stage files for the run, or use
 `-e NAME=VALUE` to set variables for the command (`-e NAME` forwards an
 exported local variable):
