@@ -168,7 +168,9 @@ beside the rclone executable, under `$XDG_CONFIG_HOME/rclone`,
 you do not need a local rclone executable to run oncolab. oncolab installs
 rclone and FUSE on the VM if needed. No mounts means no rclone config is
 read. The selected file is sent in full, without section filtering.
-VFS cache settings use rclone defaults.
+Use an unencrypted config unless rclone can unlock it noninteractively on the
+VM. Local password helpers do not follow the config, and `-e RCLONE_CONFIG_PASS`
+only affects the main command, not the mount. VFS cache settings use rclone defaults.
 
 If you're upgrading a profile with `[mounts.<name>]`:
 
@@ -213,8 +215,8 @@ change the UID.
 | --- | --- |
 | [setup.toml](../examples/setup.toml) | Runs two ordered steps without Drive. Try `oncolab --config examples/setup.toml -- cat /tmp/oncolab-sample/value` from the checkout. |
 | [work.toml](../examples/work.toml) | Mounts one Drive folder read-only. |
-| [drive.toml](../examples/drive.toml) | Mounts two folders with distinct read/write settings. |
-| [git-on.toml](../examples/git-on.toml) | Prepares Git and Git-on alongside a Drive mount, as in the demo. Adapt the mount and review the install commands before use. |
+| [drive.toml](../examples/drive.toml) | Mounts two folders with distinct read/write settings. Create `rclone-colab.conf` beside the profile or set `[rclone].config` to an existing file. |
+| [git-on.toml](../examples/git-on.toml) | Prepares Git and Git-on alongside a Drive mount, as in the demo. Set `[rclone].config` as in the two-folder example, adapt the mount, and review the install commands before use. |
 | [home.toml](../examples/home.toml) | Creates a directory and sets `HOME` for your command. |
 | [showcase.toml](../examples/showcase.toml) | Demonstrates the configuration format, including per-task copies, a managed process, readiness, and teardown. The input files are illustrative and not bundled. The comment about `-v` describes future work. |
 

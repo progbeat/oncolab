@@ -1,3 +1,6 @@
+# Create rclone-colab.conf beside this profile (cd to this directory and run
+# rclone --config ./rclone-colab.conf config), or set config below to an existing
+# file. Relative paths are relative to this profile, not the current directory.
 # Replace these remote names and paths with those in your own rclone config.
 # oncolab --config examples/drive.toml -- ls /content/work /mnt/reference
 

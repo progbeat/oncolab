@@ -324,6 +324,8 @@ target = "/mnt/work"
             for text, override, error in (
                 ("", {}, "No local rclone config found"),
                 ("", {"RCLONE_CONFIG": ""}, "RCLONE_CONFIG disables the local config"),
+                ("", {"RCLONE_CONFIG": "~oncolab-no-such-user-8391/rclone.conf"},
+                 "RCLONE_CONFIG: could not expand home directory"),
                 ('[rclone]\nconfig = "missing.conf"\n', {}, "config file not found"),
                 ("", {"RCLONE_CONFIG": str(root / "missing.conf")}, "config file not found"),
             ):
@@ -340,6 +342,7 @@ target = "/mnt/work"
                         cli.main()
                     self.assertEqual(exit_status.exception.code, 2)
                     self.assertIn(error, stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
                     allocate.assert_not_called()
 
     def test_whole_default_rclone_config_uses_only_private_bootstrap_stdin(self):
