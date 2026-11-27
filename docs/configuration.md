@@ -51,22 +51,7 @@ or plaintext profiles.
 
 ### Copy local files
 
-Use `[[copy]]` for files or directories needed on every run of a profile:
-
-```toml
-workdir = "/content/project"
-
-[[copy]]
-local = "train.py"
-
-[[copy]]
-local = "data.csv"
-remote = "inputs/"
-```
-
-Profile sources are relative to the TOML file. Omit `remote` to copy into
-`workdir` under the source basename. CLI copies add to profile copies: they
-do not replace them, and overlapping destinations are rejected.
+For recurring copies, set `copy` in a [named setup task](#setup-tasks).
 
 For one-off copies, repeat `--copy` as needed:
 
@@ -87,11 +72,11 @@ Directories include hidden files; symlinks and other special entries are
 rejected rather than followed. Copy only trusted local paths and keep the
 source tree unchanged during upload. Changes on the VM are not copied back.
 
-Copy streams over the same SSH connection while independent setup runs.
-If a setup step uses these globally copied files, add `needs = ["copy"]` to wait for
-all uploads. If a copy supplies the working directory or one of its parents,
-setup commands also wait for it so they start in the configured working
-directory. The final command starts only after copy and setup succeed.
+CLI copies stream over the same SSH connection while independent setup runs.
+If a setup task needs a file, put its copy in that task or in another named
+setup task and reference it with `needs`. If a CLI copy supplies the working
+directory or one of its parents, setup also waits for it to establish the
+working directory. The final command starts only after copy and setup succeed.
 
 ### Setup tasks
 
@@ -212,7 +197,7 @@ change the UID.
 | [drive.toml](../examples/drive.toml) | Mounts two folders with distinct read/write settings. |
 | [git-on.toml](../examples/git-on.toml) | Prepares Git and Git-on alongside a Drive mount, as in the demo. Adapt the mount and review the install commands before use. |
 | [home.toml](../examples/home.toml) | Creates a directory and sets `HOME` for your command. |
-| [showcase.toml](../examples/showcase.toml) | Demonstrates the configuration format, including per-task copies, a managed process, readiness, and teardown. The input files are illustrative and not bundled. |
+| [showcase.toml](../examples/showcase.toml) | Demonstrates the configuration format, including per-task copies, a managed process, readiness, and teardown. The input files are illustrative and not bundled. The comment about `-v` describes future work. |
 
 ## Security and cleanup
 

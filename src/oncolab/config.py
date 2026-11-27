@@ -42,19 +42,6 @@ def local_path(value, base, where):
         raise ConfigError(f"{where}: could not expand home directory") from None
 
 
-def profile_copies(value, base):
-    if not isinstance(value, list):
-        raise ConfigError("copy must be an array of tables ([[copy]])")
-    copies = []
-    for index, entry in enumerate(value, 1):
-        where = f"copy entry {index}"
-        table(entry, ("local", "remote"), where)
-        local = str(local_path(entry.get("local"), base, f"{where}.local"))
-        remote = string(entry["remote"], f"{where}.remote") if "remote" in entry else None
-        copies.append((local, remote))
-    return copies
-
-
 def argv(value, where):
     if isinstance(value, str):
         return ["bash", "-eo", "pipefail", "-c", string(value, where)]
@@ -131,7 +118,7 @@ def task_copies(value, base, where):
     return copies
 
 
-def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
+def plan(path, *, cli_mounts=(), cli_ports=()):
     from .env import parse_config_env
     if path is None:
         path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "oncolab/config.toml"
@@ -144,7 +131,9 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         with path.open("rb") as file:
             root = tomllib.load(file)
         base = path.absolute().parent
-    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "copy", "ports"), str(path))
+    if "copy" in root:
+        raise ConfigError("Top-level copy is not supported; use copy in a named [setup.<name>] task")
+    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "ports"), str(path))
     if not isinstance(root.get("mounts", {}), dict):
         raise ConfigError("mounts must be a table")
     if root.get("mounts"):
@@ -154,8 +143,6 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
     if workdir.anchor != "/" or ".." in workdir.parts:
         raise ConfigError("workdir must be an absolute VM path without '..'")
     env = parse_config_env(root.get("env", {}))
-    copies = profile_copies(root.get("copy", []), base)
-    copy_requested = copy_requested or bool(copies)
     rclone = table(root.get("rclone", {}), ("config",), "rclone")
     forwards = ports([*strings(root.get("ports", []), "ports"), *cli_ports])
     ssh = table(root.get("ssh", {}), ("known_hosts",), "ssh")
@@ -234,11 +221,9 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         add_mount(name, mount_option(value), "--mount", alternate=True)
     if any(workdir.is_relative_to(target) for target in targets):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
-    if copy_requested and "copy" in setup:
-        raise ConfigError("setup.copy conflicts with the copy dependency")
     for name, step in setup.items():
         for dependency in step["depends"]:
-            if dependency not in setup and dependency not in mounts and not (dependency == "copy" and copy_requested):
+            if dependency not in setup and dependency not in mounts:
                 raise ConfigError(f"setup.{name}: unknown dependency {dependency!r}")
             if any(step.get("mount") == dependency for step in setup.values()):
                 raise ConfigError(f"setup.{name}: refer to a setup mount by its task name, not {dependency!r}")
@@ -250,8 +235,6 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
     entrypoint = strings(root.get("entrypoint", []), "entrypoint")
     config = {"mounts": mounts, "setup": setup, "entrypoint": entrypoint,
               "workdir": str(workdir), "env": env}
-    if copies:
-        config["copies"] = copies
     if forwards:
         config["ports"] = forwards
     rclone_path = None

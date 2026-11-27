@@ -305,11 +305,11 @@ target = "/mnt/work"
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
 
-    def test_profile_copy_and_cli_files_share_a_plan(self):
+    def test_named_copy_and_cli_copy_reject_overlapping_destinations(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             config = root / "profile.toml"
-            config.write_text('workdir = "/content/job"\n[[copy]]\nlocal = "train:today.py"\n')
+            config.write_text('workdir = "/content/job"\n[setup.copy]\ncopy = { source = "train:today.py" }\n')
             profile_source = root / "train:today.py"
             cli_source = root / "extra.txt"
             profile_source.touch()
@@ -321,9 +321,10 @@ target = "/mnt/work"
                     self.assertEqual(cli.main(), 0)
                 self.assertEqual(session.call_args.kwargs["copies"], [
                     (cli_source, "/content/job/extra.txt"),
-                    (profile_source, "/content/job/train:today.py"),
                 ])
-                self.assertNotIn("copies", session.call_args.args[1])
+                self.assertEqual(session.call_args.kwargs["task_copies"], {
+                    "copy": [(profile_source, "/content/job/train:today.py", None)],
+                })
                 allocate.reset_mock()
                 with patch("sys.argv", [*command, "--copy-to", str(cli_source), "train:today.py", "--", "true"]), \
                         patch("sys.stderr", new_callable=io.StringIO) as stderr:

@@ -281,10 +281,9 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
 def prepare_copies(config, specs, explicit):
     mounts = [Path(mount["target"]) for mount in config["mounts"].values()]
     workdir = config["workdir"]
-    legacy_input = [*config.pop("copies", ()), *explicit]
-    legacy = copy_plan(specs, workdir, mounts, explicit=legacy_input)
+    cli_copies = copy_plan(specs, workdir, mounts, explicit=explicit)
     task_groups = {}
-    targets = [Path(target) for _, target in legacy]
+    targets = [Path(target) for _, target in cli_copies]
     for name, step in config.get("setup", {}).items():
         entries = step.pop("copies", ())
         group = []
@@ -306,7 +305,7 @@ def prepare_copies(config, specs, explicit):
             group.append((source, destination, mode))
         if group:
             task_groups[name] = group
-    return legacy, task_groups
+    return cli_copies, task_groups
 
 
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
@@ -478,8 +477,7 @@ def main():
     if not command:
         parser.error("a command is required")
     try:
-        config, rclone_path, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to),
-                                            cli_mounts=args.mount, cli_ports=args.publish)
+        config, rclone_path, known_hosts = plan(args.config, cli_mounts=args.mount, cli_ports=args.publish)
         config["command_env"] = parse_env(args.env)
         copies, task_groups = prepare_copies(config, args.copy, args.copy_to)
         ini = read_rclone_config(rclone_path) if rclone_path is not None else None

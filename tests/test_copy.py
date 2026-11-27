@@ -208,30 +208,21 @@ class Copy(unittest.TestCase):
         future.set_result(("transfer failed", False))
         self.assertEqual(call_with_upload([sys.executable, "-c", "import time; time.sleep(30)"], future), 255)
 
-    def test_profile_and_copy_dependency(self):
+    def test_copy_dependencies_name_setup_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.toml"
-            config.write_text('workdir = "/app"\n[env]\nMODE = "test"\n'
-                              '[setup.task]\nrun = "true"\ndepends = ["copy"]\n'
-                              '[rclone]\nconfig = "rclone.conf"\n'
-                              '[setup.work]\nmount = { source = "gdrive:work", target = "/content/work" }\n')
-            with self.assertRaises(ConfigError):
+            task = '[setup.use]\nrun = "true"\nneeds = ["copy"]\n'
+            config.write_text(task)
+            with self.assertRaisesRegex(ConfigError, "unknown dependency"):
                 plan(config)
-            parsed, _, _ = plan(config, copy_requested=True)
-            self.assertEqual(parsed["workdir"], "/app")
-            self.assertEqual(parsed["env"], {"MODE": "test"})
-            with config.open("a") as file:
-                file.write('\n[[copy]]\nlocal = "train:today.py"\n'
-                           '[[copy]]\nlocal = "data.csv"\nremote = "inputs/"\n')
+            config.write_text(task + '[setup.copy]\ncopy = { source = "train:today.py" }\n')
             parsed, _, _ = plan(config)
-            self.assertEqual(parsed["copies"], [(str(config.parent / "train:today.py"), None),
-                                                (str(config.parent / "data.csv"), "inputs/")])
-            self.assertEqual(parsed["setup"]["task"]["depends"], ["copy"])
-            for value in ('copy = "file"', 'copy = [{}]', 'copy = [{local = "file", remote = ""}]',
-                          'copy = [{local = "file", target = "file"}]'):
-                config.write_text(value)
-                with self.subTest(value=value), self.assertRaises(ConfigError):
-                    plan(config)
+            self.assertEqual(parsed["setup"]["use"]["depends"], ["copy"])
+            self.assertEqual(parsed["setup"]["copy"]["copies"],
+                             [(str(config.parent / "train:today.py"), None, None)])
+            config.write_text(task + '[[copy]]\nlocal = "train:today.py"\n')
+            with self.assertRaisesRegex(ConfigError, "Top-level copy is not supported"):
+                plan(config)
 
 
 class CopySetup(unittest.IsolatedAsyncioTestCase):
@@ -246,12 +237,11 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                 result = await wait_copy(marker)
             self.assertEqual(result.returncode, 1)
 
-    async def test_independent_setup_overlaps_copy_and_dependent_setup_waits(self):
+    async def test_independent_setup_overlaps_cli_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "result"
             steps = {
                 "independent": {"description": "independent", "argv": ["true"], "depends": []},
-                "dependent": {"description": "dependent", "argv": ["true"], "depends": ["copy"]},
             }
             seen = []
             copy_running = asyncio.Event()
@@ -265,17 +255,14 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                     await copy_running.wait()
                     self.assertFalse(marker.exists())
                     marker.write_text("ok")
-                if label == "dependent":
-                    self.assertEqual(marker.read_text(), "ok")
                 return subprocess.CompletedProcess([], 0)
 
             self.assertEqual(await asyncio.wait_for(
                 setup_all(run, {"setup": steps, "copy_result": str(marker)}, None), 2), 0)
-            self.assertEqual(seen, ["Copying files…", "independent", "dependent"])
+            self.assertEqual(seen, ["Copying files…", "independent"])
             marker.write_text("failed")
 
             async def failed(label, command):
-                self.assertNotEqual(label, "dependent")
                 if label == "Copying files…":
                     return await command()
                 return subprocess.CompletedProcess([], 0)
