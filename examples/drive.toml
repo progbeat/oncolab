@@ -2,20 +2,15 @@
 # oncolab --config examples/drive.toml -- ls /content/work /mnt/reference
 
 [rclone]
-# config = "~/.config/rclone/rclone.conf"
-allow_full_drive = false
+config = "./rclone-colab.conf"
 
-[mounts.work]
-source = "gdrive:work"
-target = "/content/work"
-read_only = false
+[setup.work]
+mount = { source = "gdrive:work", target = "/content/work", readonly = false }
 
-[mounts.reference]
-source = "reference:archive"
-target = "/mnt/reference"
-read_only = true
+[setup.reference]
+mount = { source = "reference:archive", target = "/mnt/reference", readonly = true }
 
 [setup.check-reference]
 description = "Checking the reference mount…"
 run = 'test -r "$ONCOLAB_MOUNT_REFERENCE"'
-depends = ["mounts.reference"]
+needs = ["reference"]

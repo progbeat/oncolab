@@ -69,8 +69,8 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 `~/.config/oncolab/config.toml`. Start with the example that matches your task:
 
 - [Install or prepare something before your command](examples/setup.toml): no Drive required.
-- [Mount one Google Drive folder](examples/work.toml): install rclone locally,
-  [configure the OAuth remote](docs/configuration.md#google-drive-mounts),
+- [Mount one Google Drive folder](examples/work.toml): create a
+  [dedicated rclone config](docs/configuration.md#google-drive-mounts)
   and edit the source path.
 - [Advanced profiles](docs/configuration.md#examples): multiple mounts with
   separate read/write settings, Git-on, or a wrapper that changes `HOME`.

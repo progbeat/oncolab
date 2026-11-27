@@ -1,7 +1,7 @@
-# Replace the remote and source with your own Google Drive remote and folder.
+# Create a dedicated rclone config, then set your Google Drive remote and folder.
 # oncolab --config examples/work.toml -- ls /mnt/work
 [rclone]
-remote = "gdrive"
+config = "./rclone-colab.conf"
 
 [setup.work]
-mount = { type = "gdrive", source = "work", target = "/mnt/work", readonly = true }
+mount = { source = "gdrive:work", target = "/mnt/work", readonly = true }

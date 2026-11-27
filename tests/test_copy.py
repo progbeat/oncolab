@@ -213,7 +213,8 @@ class Copy(unittest.TestCase):
             config = Path(tmp) / "config.toml"
             config.write_text('workdir = "/app"\n[env]\nMODE = "test"\n'
                               '[setup.task]\nrun = "true"\ndepends = ["copy"]\n'
-                              '[mounts.work]\nsource = "gdrive:work"\ntarget = "/content/work"\n')
+                              '[rclone]\nconfig = "rclone.conf"\n'
+                              '[setup.work]\nmount = { source = "gdrive:work", target = "/content/work" }\n')
             with self.assertRaises(ConfigError):
                 plan(config)
             parsed, _, _ = plan(config, copy_requested=True)

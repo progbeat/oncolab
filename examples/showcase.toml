@@ -23,16 +23,16 @@ COLAB_DRIVE = "/content/work"
 
 [rclone]
 config = "./rclone-colab.conf"
-remote = "gdrive"
 
 # -v / --volume LOCAL:TARGET[:ro|rw] is for local bind mounts only.
-# Google Drive is always explicit:
-# oncolab --mount type=gdrive,source=work,target=/content/work -- bash
+# Mount sources use rclone's remote:path syntax:
+# oncolab --mount source=gdrive:work,target=/content/work -- bash
 #
-# If a Google Drive mount is requested, oncolab automatically adds
-# setup tasks to install FUSE and rclone if needed, transfer the
-# rclone configuration to private RAM-backed storage, and start
-# a managed daemon.
+# If a mount is requested, oncolab automatically adds setup tasks to
+# install FUSE and rclone if needed, transfer the entire file explicitly
+# selected by rclone.config to private RAM-backed storage, and start a
+# managed daemon. Use a dedicated config with only credentials intended
+# for this VM; oncolab does not select sections or load a default file.
 #
 # Before the main command starts, oncolab redirects rclone's config
 # writes to /dev/null and removes the staged config and control socket.
@@ -41,7 +41,7 @@ remote = "gdrive"
 
 [setup.work]
 description = "Mounting Google Drive…"
-mount = { type = "gdrive", source = "work", target = "/content/work", readonly = false }
+mount = { source = "gdrive:work", target = "/content/work", readonly = false }
 
 [setup.git]
 description = "Preparing Git…"

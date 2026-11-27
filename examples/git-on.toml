@@ -1,16 +1,12 @@
 [rclone]
-config = "~/.config/rclone/rclone.conf"
+config = "./rclone-colab.conf"
 
-[mounts.work]
-source = "gdrive:work"
-target = "/content/work"
-read_only = false
+[setup.work]
+mount = { source = "gdrive:work", target = "/content/work", readonly = false }
 
 # Optional second mount; configure its remote before enabling it.
-# [mounts.reference]
-# source = "reference:archive"
-# target = "/mnt/reference"
-# read_only = true
+# [setup.reference]
+# mount = { source = "reference:archive", target = "/mnt/reference", readonly = true }
 
 [setup.git]
 description = "Preparing Git…"

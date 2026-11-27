@@ -1,4 +1,5 @@
 import argparse
+import base64
 import inspect
 import json
 import os
@@ -18,7 +19,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
-from .config import credentials, plan
+from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
 from .progress import progress, run_step
@@ -129,15 +130,15 @@ def ssh_options(name):
 
 
 # File contents and runtime environment values travel via SSH stdin, not argv.
-STAGE = """import json, os, sys
+STAGE = """import base64, json, os, sys
 from pathlib import Path
 os.umask(0o077)
 for directory, entries in json.load(sys.stdin).items():
     path = Path(directory)
     path.mkdir(mode=0o700)
-    for name, text in entries.items():
-        with (path / name).open("x") as file:
-            file.write(text)
+    for name, encoded in entries.items():
+        with (path / name).open("xb") as file:
+            file.write(base64.b64decode(encoded))
 """
 
 
@@ -331,8 +332,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         config["copy_result"] = result
         config["copy_supplies_workdir"] = any(Path(config["workdir"]).is_relative_to(path) for path in targets)
     staging = {}
-    if rclone_ini:
-        staging[drive_stage] = {"rclone.conf": rclone_ini.decode()}
+    if rclone_ini is not None:
+        staging[drive_stage] = {"rclone.conf": rclone_ini}
     if env or command_env or sources or task_copies:
         staging[jobdir] = {"env.json": json.dumps([env, command_env])} if env or command_env else {}
     if sources:
@@ -354,7 +355,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             config["setup"][task]["stdin_result"] = f"{directory}/copy-result"
             groups[key] = ((), source)
     # The bootstrap channel must never read the command's stdin.
-    staged_input = json.dumps(staging).encode() if staging else b""
+    staged_input = json.dumps({
+        directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
+                    for name, value in entries.items()}
+        for directory, entries in staging.items()
+    }).encode() if staging else b""
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
                           str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
@@ -424,8 +429,8 @@ def main():
                         help="Copy a file or directory to the VM before running; repeatable")
     parser.add_argument("--copy-to", action="append", nargs=2, default=[], metavar=("LOCAL", "REMOTE"),
                         help="Copy using separate literal paths; repeatable")
-    parser.add_argument("--mount", action="append", default=[], metavar="type=gdrive,source=PATH,target=PATH",
-                        help="Mount a Google Drive directory; repeatable")
+    parser.add_argument("--mount", action="append", default=[], metavar="source=REMOTE:PATH,target=PATH",
+                        help="Mount an rclone remote path; repeatable")
     parser.add_argument("-p", "--publish", action="append", default=[], metavar="LOCAL_PORT:REMOTE_PORT",
                         help="Forward a local loopback TCP port to the VM; repeatable")
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
@@ -444,11 +449,11 @@ def main():
     if not command:
         parser.error("a command is required")
     try:
-        config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to),
+        config, rclone_path, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to),
                                             cli_mounts=args.mount, cli_ports=args.publish)
         config["command_env"] = parse_env(args.env)
         copies, task_groups = prepare_copies(config, args.copy, args.copy_to)
-        ini = credentials(origins) if origins else b""
+        ini = read_rclone_config(rclone_path) if rclone_path is not None else None
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     flags = ["--gpu", args.gpu] if args.gpu else ["--tpu", args.tpu] if args.tpu else []

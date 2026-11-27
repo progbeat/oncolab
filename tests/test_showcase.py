@@ -19,8 +19,8 @@ from oncolab.config import ConfigError, plan
 class ShowcaseConfig(unittest.TestCase):
     def test_showcase_normalizes_shared_drive_services_and_copies(self):
         profile = Path(__file__).resolve().parents[1] / "examples" / "showcase.toml"
-        config, origins, _ = plan(
-            profile, cli_mounts=["type=gdrive,source=work,target=/content/work"],
+        config, rclone_path, _ = plan(
+            profile, cli_mounts=["source=gdrive:work,target=/content/work"],
             cli_ports=["8080:8765", "9000:90"],
         )
         own = config["setup"]
@@ -29,7 +29,7 @@ class ShowcaseConfig(unittest.TestCase):
         self.assertEqual(own["work"]["mount"], "mounts.work")
         self.assertEqual(config["mounts"]["mounts.work"]["source"], "gdrive:work")
         self.assertEqual(len(config["mounts"]), 1)
-        self.assertEqual(origins, {"gdrive": (profile.parent / "rclone-colab.conf", False)})
+        self.assertEqual(rclone_path, (profile.parent / "rclone-colab.conf").resolve())
         self.assertEqual(own["git"]["copies"], [(str(profile.parent / "install-git.sh"), "-", None)])
         self.assertEqual(own["git-on"]["depends"], ["git"])
         self.assertEqual(own["preview"]["start"][:3], ["python3", "-m", "http.server"])
@@ -68,18 +68,22 @@ run = ["echo", ""]
                     with self.assertRaises(ConfigError):
                         plan(profile)
 
-    def test_explicit_cli_drive_mount_and_ports_no_implicit_bind(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
-            bad = ["type=bind,source=work,target=/content/work",
-                   "source=work,target=/content/work"]
-            for spec in bad:
-                with self.assertRaisesRegex(ConfigError, "type=gdrive"):
-                    plan(None, cli_mounts=[spec])
+    def test_explicit_cli_rclone_mount_and_ports_no_implicit_bind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "profile.toml"
+            profile.write_text('[rclone]\nconfig = "drive.conf"\n')
+            for spec, message in (
+                ("type=gdrive,source=gdrive:work,target=/content/work", "unknown key"),
+                ("source=work,target=/content/work", "REMOTE:PATH"),
+                ("source=/tmp/local:work,target=/content/work", "REMOTE:PATH"),
+            ):
+                with self.assertRaisesRegex(ConfigError, message):
+                    plan(profile, cli_mounts=[spec])
             with self.assertRaisesRegex(ConfigError, "Conflicting remote ports"):
-                plan(None, cli_ports=["8080:80", "8080:90"])
-            config, _, _ = plan(None, cli_mounts=["type=gdrive,source=work,target=work,readonly"])
+                plan(profile, cli_ports=["8080:80", "8080:90"])
+            config, _, _ = plan(profile, cli_mounts=["source=Other Remote:path:more,target=work,readonly"])
             self.assertEqual(config["mounts"]["mounts.cli-1"],
-                             {"source": "gdrive:work", "target": "/content/work", "read_only": True})
+                             {"source": "Other Remote:path:more", "target": "/content/work", "read_only": True})
 
 
 class Transfers(unittest.TestCase):

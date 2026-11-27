@@ -131,40 +131,43 @@ filesystem. It does not consume the main command's input.
 An optional `teardown` runs for a task that began execution, even if its
 setup stopped partway through. It runs before releasing direct or transitive
 dependencies. If teardown fails, its dependencies and the VM stay running.
-Legacy profiles can still use `depends`, `script` and `mounts.<name>`.
+Legacy setup commands can still use `depends` and `script`.
 
 ### Google Drive mounts
 
-1. Install [rclone](https://rclone.org/install/) locally and create a direct
-   Google Drive OAuth remote with `rclone config`. For reading existing files,
-   select the `drive.readonly` scope. `drive.file` is limited to files the app
-   can access; it isn't a way to list any existing folder. Full Drive scope is
-   rejected by default. To use an existing full-scope remote deliberately,
-   set `allow_full_drive = true` under `[rclone]`.
+1. Create a dedicated config, for example with
+   `rclone --config ./rclone-colab.conf config`, and add the Google Drive
+   remotes you want to use on the VM. Choose OAuth scopes that grant only the
+   access you need. `drive.file` is limited to files the app can access; use
+   `drive.readonly` for read-only access to existing files.
 2. Copy [the one-folder profile](../examples/work.toml) to `work.toml`, substitute
    your remote and folder, and run `oncolab --config work.toml -- ls /mnt/work`.
 3. To write through a mount, use `readonly = false` (the default) **and** a remote
    whose OAuth grant permits writing to the intended files.
 
 Declare `mount` as a named setup task so other tasks can wait for it with
-`needs`. For a one-off mount, set `[rclone].remote` in your profile and use:
+`needs`. For a one-off mount, keep `[rclone].config` in your profile and use:
 
 ```sh
-oncolab --mount type=gdrive,source=work,target=/content/work -- ls /content/work
+oncolab --mount source=gdrive:work,target=/content/work -- ls /content/work
 ```
 
-`source` is a Google Drive path within that remote, not a local path.
-Mounts declared with the legacy `[mounts.<name>]` syntax use a qualified
-`remote:path` source and `read_only`. Targets must be empty,
+`source` uses rclone's `remote:path` notation. The part before the colon
+names a section in the selected rclone config. One session can mount paths
+from several named remotes in that file. Targets must be empty,
 non-overlapping directories below `/content`, `/mnt`, `/home`, or `/root`.
 The tool exports `ONCOLAB_MOUNT_<NAME>` to setup and the command (uppercased, with
 hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
 
-`[rclone].config` overrides the local rclone config path, and a mount can override
-it with its own `config`. Use distinct remote names for different configs.
-The tool supports plaintext configs and direct Google Drive OAuth remotes;
-it does not forward service-account credentials. VFS cache settings use
-rclone defaults.
+`[rclone].config` explicitly selects the file to send. Relative paths are
+resolved beside the TOML profile. All mounts in the session share a single
+config. There is no default rclone config lookup or section filtering.
+VFS cache settings use rclone defaults.
+
+If you're upgrading a profile with `[mounts.<name>]`, move each mount to
+`[setup.<name>].mount`, use `readonly` instead of `read_only`, and refer to
+its task by name in `needs`. Review the dedicated config before selecting
+it: the previous version sent only the selected sections.
 
 ### Local access to VM ports
 
@@ -204,13 +207,14 @@ change the UID.
 
 ## Security and cleanup
 
-- A read-only mount limits filesystem operations, not the OAuth token.
-  Use a separately authorized read-only remote if the credential itself must
-  be read-only. A config's scope string is not proof of a token's actual grant.
-  Use a trusted VM and trusted setup; avoid credentials in TOML, arguments or
-  setup commands.
-- Only selected rclone sections travel over SSH stdin. They are staged in a
-  private RAM-backed directory. After mounting, rclone's config save path is
+- A read-only mount limits filesystem operations, not the credential.
+  Use a separately authorized read-only remote if the credential must be
+  read-only. Use a trusted VM and trusted setup; avoid credentials in TOML,
+  command arguments, or setup commands.
+- The entire selected config travels byte for byte over SSH stdin and is
+  staged in a private RAM-backed directory. Use a dedicated config and do
+  not include credentials that should not be sent to the VM. After mounting,
+  rclone's config save path is
   set to `/dev/null`, and the staging directory is removed before the
   entrypoint or command. The daemon stays alive to serve FUSE. Removing the
   Unix socket blocks new pathname connections, not already open ones.

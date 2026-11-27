@@ -1,9 +1,6 @@
-import configparser
 import graphlib
-import io
 import os
 import re
-import subprocess
 import tomllib
 from pathlib import Path, PurePosixPath
 
@@ -90,7 +87,7 @@ def mount_option(value):
     for option in value.split(","):
         key, sep, val = option.partition("=")
         if key in options or (not sep and key != "readonly"):
-            raise ConfigError("--mount requires type=gdrive,source=PATH,target=PATH[,readonly]")
+            raise ConfigError("--mount requires source=REMOTE:PATH,target=PATH[,readonly]")
         if key == "readonly":
             if sep and val not in ("true", "false"):
                 raise ConfigError("--mount readonly must be true or false")
@@ -148,53 +145,45 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
             root = tomllib.load(file)
         base = path.absolute().parent
     table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "copy", "ports"), str(path))
+    if not isinstance(root.get("mounts", {}), dict):
+        raise ConfigError("mounts must be a table")
+    if root.get("mounts"):
+        raise ConfigError("Legacy [mounts.*] entries must be migrated to [setup.<name>].mount. "
+                          "Select a dedicated [rclone].config: oncolab transfers the whole file.")
     workdir = PurePosixPath(string(root.get("workdir", "/content"), "workdir"))
     if workdir.anchor != "/" or ".." in workdir.parts:
         raise ConfigError("workdir must be an absolute VM path without '..'")
     env = parse_config_env(root.get("env", {}))
     copies = profile_copies(root.get("copy", []), base)
     copy_requested = copy_requested or bool(copies)
-    rclone = table(root.get("rclone", {}), ("config", "allow_full_drive", "remote"), "rclone")
-    default_remote = string(rclone.get("remote", "gdrive"), "rclone.remote")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", default_remote):
-        raise ConfigError("rclone.remote must name a configured rclone remote")
+    rclone = table(root.get("rclone", {}), ("config",), "rclone")
+    rclone_path = local_path(rclone["config"], base, "rclone.config").resolve() if "config" in rclone else None
     forwards = ports([*strings(root.get("ports", []), "ports"), *cli_ports])
-    allow_full = boolean(rclone.get("allow_full_drive", False), "rclone.allow_full_drive")
     ssh = table(root.get("ssh", {}), ("known_hosts",), "ssh")
     known_hosts = local_path(ssh["known_hosts"], base, "ssh.known_hosts") if "known_hosts" in ssh else None
     if known_hosts is not None and not known_hosts.is_file():
         raise ConfigError(f"Known hosts file not found: {known_hosts}")
 
-    mounts, origins, targets, env_names = {}, {}, [], set()
-    def add_mount(name, entry, where, *, explicit=False, alternate=None):
+    mounts, targets, env_names = {}, [], set()
+    def add_mount(name, entry, where, *, alternate=False):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ConfigError(f"Invalid mount name: {name!r}")
         key = f"mounts.{name}"
-        if explicit:
-            table(entry, ("type", "source", "target", "readonly"), where)
-            if entry.get("type") != "gdrive":
-                raise ConfigError(f"{where} requires type=gdrive (local binds are not supported)")
-        else:
-            table(entry, ("source", "target", "read_only", "config"), where)
+        table(entry, ("source", "target", "readonly"), where)
         source = string(entry.get("source"), where + ".source")
-        if explicit:
-            source = f"{default_remote}:{source}"
         remote, separator, _ = source.partition(":")
-        if not separator or not re.fullmatch(r"[A-Za-z0-9_-]+", remote):
-            raise ConfigError(f"{where}.source must name a configured rclone remote")
+        if not separator or not re.fullmatch(r"[\w. -]+", remote) or not remote.strip():
+            raise ConfigError(f"{where}.source must be REMOTE:PATH")
         target = PurePosixPath(string(entry.get("target"), where + ".target"))
-        if explicit and not target.is_absolute():
+        if not target.is_absolute():
             target = workdir / target
         if (not target.is_absolute() or target.anchor != "/" or ".." in target.parts
                 or not any(target.is_relative_to(p) and target != PurePosixPath(p)
                            for p in ("/content", "/mnt", "/home", "/root"))):
             raise ConfigError(f"{where}.target must be beneath /content, /mnt, /home or /root")
-        read_key = "readonly" if explicit else "read_only"
         mount = {"source": source, "target": str(target),
-                 "read_only": boolean(entry.get(read_key, False), f"{where}.{read_key}")}
-        origin = entry.get("config", rclone.get("config"))
-        origin = local_path(origin, base, where + ".config") if origin is not None else None
-        if alternate and any(old == mount for old in mounts.values()) and origins.get(remote) == (origin, allow_full):
+                 "read_only": boolean(entry.get("readonly", False), f"{where}.readonly")}
+        if alternate and any(old == mount for old in mounts.values()):
             return None
         mount_env = name.upper().replace("-", "_")
         if mount_env in env_names:
@@ -203,16 +192,9 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         if any(target.is_relative_to(p) or p.is_relative_to(target) for p in targets):
             raise ConfigError(f"{where}.target overlaps another mount")
         targets.append(target)
-        if remote in origins and origins[remote][0] != origin:
-            raise ConfigError(f"Remote {remote!r} refers to multiple configs; give the remotes distinct names")
-        origins[remote] = (origin, allow_full)
         mounts[key] = mount
         return key
 
-    if not isinstance(root.get("mounts", {}), dict):
-        raise ConfigError("mounts must be a table")
-    for name, entry in root.get("mounts", {}).items():
-        add_mount(name, entry, f"mounts.{name}")
     setup = {}
     if not isinstance(root.get("setup", {}), dict):
         raise ConfigError("setup must be a table")
@@ -244,13 +226,13 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
             if any(remote == "-" for _, remote, _ in step["copies"]) and not {"argv", "start"} & step.keys():
                 raise ConfigError(f"{where}.copy: target '-' requires run or start")
         if "mount" in entry:
-            step["mount"] = add_mount(name, entry["mount"], f"{where}.mount", explicit=True)
+            step["mount"] = add_mount(name, entry["mount"], f"{where}.mount")
         setup[name] = step
     for index, value in enumerate(cli_mounts, 1):
         name = f"cli-{index}"
         while name.upper().replace("-", "_") in env_names:
             name = "cli-" + name
-        add_mount(name, mount_option(value), "--mount", explicit=True, alternate=True)
+        add_mount(name, mount_option(value), "--mount", alternate=True)
     if any(workdir.is_relative_to(target) for target in targets):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
     if copy_requested and "copy" in setup:
@@ -273,32 +255,12 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         config["copies"] = copies
     if forwards:
         config["ports"] = forwards
-    return config, origins, known_hosts
+    if mounts and rclone_path is None:
+        raise ConfigError("Mounts require an explicit [rclone].config file")
+    return config, rclone_path if mounts else None, known_hosts
 
 
-def credentials(origins):
-    out = configparser.ConfigParser(interpolation=None, default_section="\0")
-    for remote, (path, allow_full) in origins.items():
-        flags = ["--config", str(path)] if path is not None else []
-        result = subprocess.run(["rclone", *flags, "--ask-password=false", "config", "show", remote],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        if result.returncode:
-            raise ConfigError(f"Could not read rclone remote {remote!r}")
-        try:
-            section = configparser.ConfigParser(interpolation=None, default_section="\0")
-            section.read_string(result.stdout.decode())
-        except (ValueError, configparser.Error):
-            raise ConfigError(f"Invalid rclone config for {remote!r}") from None
-        if section.sections() != [remote] or section.get(remote, "type", fallback="") != "drive":
-            raise ConfigError(f"{remote!r}: expected a direct Google Drive remote")
-        if section.has_option(remote, "service_account_file") or section.has_option(remote, "service_account_credentials"):
-            raise ConfigError(f"{remote!r}: use OAuth; service-account credentials are not forwarded")
-        scope = section.get(remote, "scope", fallback="")
-        if not allow_full and not {part.strip() for part in scope.split(",")} <= {
-            "drive.file", "drive.readonly", "drive.metadata.readonly",
-        }:
-            raise ConfigError(f"{remote!r}: configure a restricted Drive scope, or opt in to allow_full_drive")
-        out[remote] = dict(section[remote])
-    stream = io.StringIO()
-    out.write(stream)
-    return stream.getvalue().encode()
+def read_rclone_config(path):
+    if not path.is_file():
+        raise ConfigError(f"Rclone config file not found or not a regular file: {path}")
+    return path.read_bytes()
