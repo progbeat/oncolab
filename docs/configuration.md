@@ -50,7 +50,24 @@ or plaintext profiles.
 
 ### Copy local files
 
-Examples (repeat `--copy` for more than one source):
+Use `[[copy]]` for files or directories needed on every run of a profile:
+
+```toml
+workdir = "/content/project"
+
+[[copy]]
+local = "train.py"
+
+[[copy]]
+local = "data.csv"
+remote = "inputs/"
+```
+
+Profile sources are relative to the TOML file. Omit `remote` to copy into
+`workdir` under the source basename. CLI copies add to profile copies: they
+do not replace them, and overlapping destinations are rejected.
+
+For one-off copies, repeat `--copy` as needed:
 
 ```sh
 oncolab --copy train.py -- python3 train.py
@@ -58,7 +75,7 @@ oncolab --copy ./project:code -- ls code
 oncolab --copy data.csv:/tmp/input.csv -- wc -l /tmp/input.csv
 ```
 
-Local relative paths resolve from the current local directory. Without a
+Relative CLI sources resolve from the current local directory. Without a
 destination, copy under the source basename into the VM working directory.
 A relative destination is resolved against the same VM directory. A trailing
 slash sets a containing directory; otherwise the destination is the exact new
@@ -85,7 +102,7 @@ Under `[setup.<name>]`, set exactly one of:
   options. Relative paths are resolved beside the profile.
 
 `description` is optional and appears during setup. `depends` lists setup names
-or `mounts.<name>` prerequisites, or `"copy"` when using `--copy`. Independent steps run in parallel; unknown
+or `mounts.<name>` prerequisites, or `"copy"` when using profile or CLI copies. Independent steps run in parallel; unknown
 dependencies and cycles fail before a VM is allocated. Shell exports in setup
 do not carry into the final command; use `entrypoint` for that.
 

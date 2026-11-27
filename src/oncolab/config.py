@@ -39,8 +39,23 @@ def boolean(value, where):
 
 
 def local_path(value, base, where):
-    path = Path(string(value, where)).expanduser()
-    return base / path
+    try:
+        return base / Path(string(value, where)).expanduser()
+    except RuntimeError:
+        raise ConfigError(f"{where}: could not expand home directory") from None
+
+
+def profile_copies(value, base):
+    if not isinstance(value, list):
+        raise ConfigError("copy must be an array of tables ([[copy]])")
+    copies = []
+    for index, entry in enumerate(value, 1):
+        where = f"copy entry {index}"
+        table(entry, ("local", "remote"), where)
+        local = str(local_path(entry.get("local"), base, f"{where}.local"))
+        remote = string(entry["remote"], f"{where}.remote") if "remote" in entry else None
+        copies.append((local, remote))
+    return copies
 
 
 def plan(path, *, copy_requested=False):
@@ -52,12 +67,14 @@ def plan(path, *, copy_requested=False):
     path = path.expanduser()
     with path.open("rb") as file:
         root = tomllib.load(file)
-    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env"), str(path))
+    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "copy"), str(path))
     workdir = PurePosixPath(string(root.get("workdir", "/content"), "workdir"))
     if workdir.anchor != "/" or ".." in workdir.parts:
         raise ConfigError("workdir must be an absolute VM path without '..'")
     env = parse_config_env(root.get("env", {}))
     base = path.absolute().parent
+    copies = profile_copies(root.get("copy", []), base)
+    copy_requested = copy_requested or bool(copies)
     rclone = table(root.get("rclone", {}), ("config", "allow_full_drive"), "rclone")
     allow_full = boolean(rclone.get("allow_full_drive", False), "rclone.allow_full_drive")
     ssh = table(root.get("ssh", {}), ("known_hosts",), "ssh")
@@ -119,7 +136,7 @@ def plan(path, *, copy_requested=False):
     if any(workdir.is_relative_to(target) for target in targets):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
     if copy_requested and "copy" in setup:
-        raise ConfigError("setup.copy conflicts with the --copy dependency")
+        raise ConfigError("setup.copy conflicts with the copy dependency")
     for name, step in setup.items():
         for dependency in step["depends"]:
             if dependency not in setup and dependency not in mounts and not (dependency == "copy" and copy_requested):
@@ -130,8 +147,11 @@ def plan(path, *, copy_requested=False):
     except graphlib.CycleError as exc:
         raise ConfigError("Setup dependencies contain a cycle") from exc
     entrypoint = strings(root.get("entrypoint", []), "entrypoint")
-    return {"mounts": mounts, "setup": setup, "entrypoint": entrypoint,
-            "workdir": str(workdir), "env": env}, origins, known_hosts
+    config = {"mounts": mounts, "setup": setup, "entrypoint": entrypoint,
+              "workdir": str(workdir), "env": env}
+    if copies:
+        config["copies"] = copies
+    return config, origins, known_hosts
 
 
 def credentials(origins):

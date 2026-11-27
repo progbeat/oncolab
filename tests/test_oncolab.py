@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import subprocess
 import tempfile
@@ -147,6 +148,34 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
 
 
 class CLI(unittest.TestCase):
+    def test_profile_copy_and_cli_files_share_a_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config = root / "profile.toml"
+            config.write_text('workdir = "/content/job"\n[[copy]]\nlocal = "train:today.py"\n')
+            profile_source = root / "train:today.py"
+            cli_source = root / "extra.txt"
+            profile_source.touch()
+            cli_source.touch()
+            command = ["oncolab", "--config", str(config), "--copy", str(cli_source)]
+            with patch.object(cli, "allocate", return_value=("session", 0)) as allocate, \
+                    patch.object(cli, "run_session", return_value=(0, False)) as session:
+                with patch("sys.argv", [*command, "--", "true"]):
+                    self.assertEqual(cli.main(), 0)
+                self.assertEqual(session.call_args.kwargs["copies"], [
+                    (cli_source, "/content/job/extra.txt"),
+                    (profile_source, "/content/job/train:today.py"),
+                ])
+                self.assertNotIn("copies", session.call_args.args[1])
+                allocate.reset_mock()
+                with patch("sys.argv", [*command, "--copy-to", str(cli_source), "train:today.py", "--", "true"]), \
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as result:
+                        cli.main()
+                    self.assertEqual(result.exception.code, 2)
+                    self.assertIn("Overlapping --copy destination", stderr.getvalue())
+                allocate.assert_not_called()
+
     def test_no_forced_stop_after_ambiguous_disconnect(self):
         with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, {}, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \

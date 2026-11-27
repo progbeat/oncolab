@@ -288,7 +288,8 @@ def main():
         config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy or args.copy_to))
         config["env"] |= parse_env(args.env)
         copies = copy_plan(args.copy, config["workdir"],
-                           [Path(m["target"]) for m in config["mounts"].values()], explicit=args.copy_to)
+                           [Path(m["target"]) for m in config["mounts"].values()],
+                           explicit=[*config.pop("copies", ()), *args.copy_to])
         ini = credentials(origins) if origins else b""
     except (ValueError, OSError) as exc:
         parser.error(str(exc))

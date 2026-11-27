@@ -219,6 +219,18 @@ class Copy(unittest.TestCase):
             parsed, _, _ = plan(config, copy_requested=True)
             self.assertEqual(parsed["workdir"], "/app")
             self.assertEqual(parsed["env"], {"MODE": "test"})
+            with config.open("a") as file:
+                file.write('\n[[copy]]\nlocal = "train:today.py"\n'
+                           '[[copy]]\nlocal = "data.csv"\nremote = "inputs/"\n')
+            parsed, _, _ = plan(config)
+            self.assertEqual(parsed["copies"], [(str(config.parent / "train:today.py"), None),
+                                                (str(config.parent / "data.csv"), "inputs/")])
+            self.assertEqual(parsed["setup"]["task"]["depends"], ["copy"])
+            for value in ('copy = "file"', 'copy = [{}]', 'copy = [{local = "file", remote = ""}]',
+                          'copy = [{local = "file", target = "file"}]'):
+                config.write_text(value)
+                with self.subTest(value=value), self.assertRaises(ConfigError):
+                    plan(config)
 
 
 class CopySetup(unittest.IsolatedAsyncioTestCase):
