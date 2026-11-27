@@ -1,16 +1,16 @@
+# Create rclone-colab.conf beside this profile (cd to this directory and run
+# rclone --config ./rclone-colab.conf config), or set config below to an existing
+# file. Relative paths are relative to this profile, not the current directory.
+# Set the mount source to your own remote and folder.
 [rclone]
-config = "~/.config/rclone/rclone.conf"
+config = "./rclone-colab.conf"
 
-[mounts.work]
-source = "gdrive:work"
-target = "/content/work"
-read_only = false
+[setup.work]
+mount = { source = "gdrive:work", target = "/content/work", readonly = false }
 
 # Optional second mount; configure its remote before enabling it.
-# [mounts.reference]
-# source = "reference:archive"
-# target = "/mnt/reference"
-# read_only = true
+# [setup.reference]
+# mount = { source = "reference:archive", target = "/mnt/reference", readonly = true }
 
 [setup.git]
 description = "Preparing Git…"

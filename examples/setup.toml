@@ -8,4 +8,4 @@ run = ["mkdir", "-p", "/tmp/oncolab-sample"]
 [setup.sample]
 description = "Writing sample file…"
 run = "printf '%s\\n' ready > /tmp/oncolab-sample/value"
-depends = ["directory"]
+needs = ["directory"]

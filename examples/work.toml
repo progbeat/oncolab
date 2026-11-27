@@ -1,6 +1,4 @@
-# Replace gdrive:work with your own Google Drive OAuth remote and folder.
+# Set your Google Drive remote and folder. This example uses the local rclone default.
 # oncolab --config examples/work.toml -- ls /mnt/work
-[mounts.work]
-source = "gdrive:work"
-target = "/mnt/work"
-read_only = true
+[setup.work]
+mount = { source = "gdrive:work", target = "/mnt/work", readonly = true }

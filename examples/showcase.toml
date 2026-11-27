@@ -1,0 +1,103 @@
+# Feature showcase for the proposed oncolab configuration format.
+# The local files referenced here are example fixtures, not bundled inputs.
+#
+# Setup tasks run concurrently unless ordered by needs.
+# Declaration order has no effect on execution.
+# Within a task, copy completes before run or start,
+# except for files streamed into stdin.
+#
+# Commands specified as strings are executed through Bash (-e -o pipefail).
+# Arrays specify exact executable arguments without shell interpretation.
+# This applies to run, start, ready and teardown.
+
+# Relative VM paths and setup commands use workdir. Local copy sources
+# are relative to this profile; local CLI sources are relative to the caller.
+workdir = "/content"
+# LOCAL_PORT:REMOTE_PORT over SSH; binds to local loopback only.
+# Same as: oncolab -p 8080:8765 -- bash
+ports = ["8080:8765"]
+
+# Shared by setup and the command passed to oncolab.
+[env]
+COLAB_DRIVE = "/content/work"
+
+[rclone]
+config = "./rclone-colab.conf"
+
+# -v / --volume LOCAL:TARGET[:ro|rw] is for local bind mounts only.
+# Mount sources use rclone's remote:path syntax:
+# oncolab --mount source=gdrive:work,target=/content/work -- bash
+#
+# If a mount is requested, oncolab automatically adds setup tasks to
+# install FUSE and rclone if needed, transfer the entire rclone config
+# to private RAM-backed storage, and start a managed daemon.
+# Omit rclone.config to use the local rclone default. Use a dedicated
+# file if the default contains credentials you do not want on the VM.
+#
+# Before the main command starts, oncolab redirects rclone's config
+# writes to /dev/null and removes the staged config and control socket.
+# During teardown, mounts are unmounted before stopping the daemon.
+# Failed unmount leaves the daemon and VM running.
+
+[setup.work]
+description = "Mounting Google Drive…"
+mount = { source = "gdrive:work", target = "/content/work", readonly = false }
+
+[setup.git]
+description = "Preparing Git…"
+# Target "-" streams the local file into the command's stdin.
+copy = "install-git.sh:-"
+run = ["bash", "-e", "-o", "pipefail", "-s"]
+
+[setup.git-on]
+description = "Installing git on…"
+needs = ["git"]
+run = "curl -fsSL https://sh.progbeat.dev/git-on | sh"
+
+[setup.runtime]
+description = "Preparing the renderer…"
+copy = [
+    "requirements.txt:.oncolab-example/requirements.txt",
+    { source = "prepare.py", target = ".oncolab-example/prepare.py", chmod = 0o644 },
+]
+run = '''
+python3 -m pip install -r .oncolab-example/requirements.txt
+mkdir -- .oncolab-example/public
+'''
+
+[setup.render]
+description = "Rendering the document…"
+# Dependencies gate the entire task, including copy.
+needs = ["work", "runtime"]
+copy = "source.md:.oncolab-example/source.md"
+run = '''
+python3 .oncolab-example/prepare.py
+test -s .oncolab-example/public/index.html
+mkdir -p "$COLAB_DRIVE/oncolab-example"
+cp -- .oncolab-example/public/index.html "$COLAB_DRIVE/oncolab-example/index.html"
+'''
+
+[setup.preview]
+description = "Starting the preview server…"
+needs = ["render"]
+# oncolab manages the process until session teardown.
+# ready is retried until it succeeds or times out; it is not an ongoing health check.
+# Dependent tasks and the main command wait for readiness.
+start = [
+    "python3", "-m", "http.server", "8765",
+    "--bind", "127.0.0.1",
+    "--directory", ".oncolab-example/public",
+]
+ready = [
+    "curl", "-fsS", "-o", "/dev/null",
+    "http://127.0.0.1:8765/index.html",
+]
+# Teardown runs for every task that began execution, including partially
+# completed tasks, before releasing any direct or transitive dependencies.
+# If teardown fails, its dependencies and the VM remain running.
+teardown = '''
+artifact="$COLAB_DRIVE/oncolab-example/index.html"
+if [ -s "$artifact" ]; then
+    printf 'Rendered HTML is available at %s\n' "$artifact" >&2
+fi
+'''

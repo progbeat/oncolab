@@ -1,16 +1,19 @@
 import asyncio
+import fcntl
 import json
 import os
 import shutil
 import stat
 import subprocess as sp
 import sys
+import time
+from functools import partial
 from pathlib import Path
-from signal import SIGINT, signal
+from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
 
 def unassign():
-    sp.Popen([sys.executable, "-c", r'''
+    sp.Popen([sys.executable, "-P", "-c", r'''
 import os
 from time import sleep
 from google.colab import runtime
@@ -22,7 +25,7 @@ if key not in os.environb:
     )
 sleep(1)
 runtime.unassign()
-'''], start_new_session=True, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+'''], cwd="/", start_new_session=True, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
 # On Ubuntu 24.04 x86-64, rclone only needs the mount helper, not an apt upgrade.
 FUSE = r'''
@@ -64,27 +67,47 @@ unzip -p "$tmp/rclone.zip" "$archive/rclone" > "$tmp/rclone"
 install -D -m 755 "$tmp/rclone" "$HOME/.local/bin/rclone"
 '''
 
+def drive_environment(profile):
+    # Backend settings are useful, but the control socket belongs to the runner.
+    client_options = {"RCLONE_LOOPBACK", "RCLONE_URL", "RCLONE_USER", "RCLONE_PASS",
+                      "RCLONE_UNIX_SOCKET", "RCLONE_JSON"}
+    env = {key: value for key, value in profile.items()
+           if not (key == "RCLONE_RC" or key.startswith("RCLONE_RC_") or key in client_options)}
+    managed = f"{env.get('HOME', str(Path.home()))}/.local/bin"
+    paths = [managed, *env.get("PATH", "").split(os.pathsep),
+             *os.environ.get("PATH", os.defpath).split(os.pathsep)]
+    env["PATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))
+    return env
+
+
 class DriveMounts:
     def __init__(self, directory):
         self.directory = Path(directory)
-        self.config = self.directory / "rclone.conf"
+        self.config = self.directory / "active.conf"
         self.socket = self.directory / "rc.sock"
         self.attached = []
         self.server = None
+        self.environment = None
+        self.uncertain = False
 
     async def rc(self, method, **parameters):
-        process = await asyncio.create_subprocess_exec(
-            "rclone", "--config", "/dev/null", "rc", "--unix-socket", str(self.socket),
-            method, "--json", json.dumps(parameters), stdout=sp.PIPE, stderr=sp.PIPE,
-        )
-        await process.communicate()
-        if process.returncode:
-            raise RuntimeError(f"rclone {method} failed (exit {process.returncode})")
+        command = ["rclone", "--config", "/dev/null", "rc", "--unix-socket", str(self.socket),
+                   method, "--json", json.dumps(parameters)]
+        try:
+            result = await command_result(command, self.environment, timeout=45)
+        except TimeoutError as exc:
+            if method == "mount/mount":
+                # A timed-out client is not proof that the daemon did not mount.
+                self.uncertain = True
+            raise RuntimeError(f"rclone {method} timed out") from exc
+        if result.returncode:
+            raise RuntimeError(f"rclone {method} failed (exit {result.returncode})")
 
     async def start(self):
         self.server = sp.Popen(
             ["rclone", "--config", str(self.config), "rcd", "--rc-addr", str(self.socket), "--rc-no-auth"],
-            stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True,
+            env=self.environment, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+            start_new_session=True,
         )
         for _ in range(150):
             if self.socket.is_socket():
@@ -99,9 +122,24 @@ class DriveMounts:
         target.mkdir(parents=True, exist_ok=True)
         if target.resolve() != target or any(target.iterdir()):
             raise RuntimeError(f"Mount target must be an empty directory without symlinks: {target}")
-        await self.rc("mount/mount", fs=mount["source"], mountPoint=str(target),
-                      vfsOpt={"ReadOnly": mount["read_only"]})
-        self.attached.append(target)
+
+        async def mount_and_record():
+            try:
+                await self.rc("mount/mount", fs=mount["source"], mountPoint=str(target),
+                              vfsOpt={"ReadOnly": mount["read_only"]})
+            except RuntimeError:
+                if target.is_mount():
+                    self.attached.append(target)
+                raise
+            self.attached.append(target)
+
+        operation = asyncio.create_task(mount_and_record())
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Record a mount completed concurrently with cancellation.
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
 
     def seal(self):
         try:
@@ -109,68 +147,490 @@ class DriveMounts:
         except FileNotFoundError:
             pass
 
-    def close(self):
+    def detach(self, target):
+        target = Path(target)
+        if target in self.attached:
+            if sp.call(["umount", "--", target]):
+                print(f"oncolab: could not unmount {target}; leaving the VM running", file=sys.stderr)
+                return False
+            self.attached.remove(target)
+        return True
+
+    def close(self, preserve=(), *, keep_daemon=False):
         self.seal()
-        failures = [path for path in reversed(self.attached) if sp.call(["umount", "--", path])]
-        if failures:
-            for path in failures:
-                print(f"oncolab: could not unmount {path}; leaving the VM running", file=sys.stderr)
+        results = [self.detach(path) for path in reversed(self.attached[:]) if path not in preserve]
+        if self.uncertain:
+            print("oncolab: Drive mount state is uncertain; leaving the VM and daemon running", file=sys.stderr)
+        if not all(results) or self.attached or keep_daemon or self.uncertain:
             return False
         if self.server is not None:
-            self.server.terminate()
-            self.server.wait()
+            if not stop_process(self.server):
+                return False
         return True
 
 
-async def setup_all(run, plan, drive):
+async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
+    path = Path(result)
+    pid_path = path.with_name("copy-pid")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + start_timeout
+    admission_deadline = None
+
+    def read(path):
+        try:
+            return path.read_text()
+        except FileNotFoundError:
+            return ""
+
+    statuses = ("ok", "failed", "short") if input_pipe else ("ok", "failed")
+    while True:
+        if input_pipe and path.with_name("writer-ready").exists():
+            input_pipe.writer_attached()
+        status = read(path)
+        if status in statuses:
+            if input_pipe:
+                input_pipe.release("keeper")
+            return sp.CompletedProcess([], int(status == "failed"), None, None)
+
+        pid_text = read(pid_path)
+        try:
+            broker_text = read(broker) if broker else ""
+            broker_alive = broker_text.endswith("\n")
+            if broker_alive:
+                os.kill(int(broker_text), 0)
+                heartbeat = Path(broker).with_name("broker-heartbeat")
+                try:
+                    if time.time() - heartbeat.stat().st_mtime > max(5, start_timeout):
+                        raise ProcessLookupError
+                except FileNotFoundError:
+                    # Startup writes the heartbeat before publishing the PID.
+                    if loop.time() >= deadline:
+                        raise ProcessLookupError
+            if pid_text.endswith("\n"):
+                os.kill(int(pid_text), 0)
+            elif broker_alive and path.with_name("admitted").exists():
+                if admission_deadline is None:
+                    admission_deadline = loop.time() + start_timeout
+                elif loop.time() >= admission_deadline:
+                    raise ProcessLookupError
+            elif not broker_alive and loop.time() >= deadline:
+                raise ProcessLookupError
+        except ProcessLookupError:
+            if read(path) in statuses:
+                continue  # Receiver may have published just before exiting.
+            if broker:
+                try:
+                    path.with_name("cancelled").touch()
+                except FileNotFoundError:
+                    pass
+            return sp.CompletedProcess([], 1, None, b"oncolab: copy receiver exited or did not start\n")
+        await asyncio.sleep(.10)
+
+
+def quiesce_archive(result, deadline):
+    lock = Path(result).with_name("publication-lock")
+    with lock.open("a") as publication:
+        while True:
+            try:
+                fcntl.flock(publication, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(.05, remaining))
+
+
+def enter_workdir(plan):
+    workdir = Path(plan.get("workdir", "/content"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    os.chdir(workdir)
+
+
+def stop_process(proc):
+    try:
+        os.killpg(proc.pid, SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except sp.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except sp.TimeoutExpired:
+            print(f"oncolab: could not stop process {proc.pid}", file=sys.stderr)
+            return False
+    # A shell may exit before its process group. Do not leave descendants alive.
+    try:
+        os.killpg(proc.pid, SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
+async def command_result(argv, env, stdin=sp.DEVNULL, *, timeout=None, on_start=None):
+    proc = await asyncio.create_subprocess_exec(
+        *argv, env=env, stdin=stdin, stdout=sp.PIPE, stderr=sp.PIPE, start_new_session=True,
+    )
+    try:
+        if on_start:
+            on_start()
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except (asyncio.CancelledError, OSError):  # Includes the builtin TimeoutError from wait_for.
+        for number in (SIGTERM, SIGKILL):
+            try:
+                os.killpg(proc.pid, number)
+            except ProcessLookupError:
+                pass
+            if number == SIGTERM:
+                await asyncio.sleep(.1)
+        await proc.communicate()
+        raise
+    return sp.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+class TaskInput:
+    """One producer, one task, and no access to the session's command stdin."""
+
+    def __init__(self, result, broker):
+        self.result = Path(result)
+        self.broker = broker
+        self.fifo = self.result.with_name("stdin")
+        self.reader = self.keeper = None
+        self.attached = asyncio.Event()
+
+    def release(self, name):
+        fd = getattr(self, name)
+        if fd is not None:
+            setattr(self, name, None)
+            os.close(fd)
+
+    def launched(self):
+        # The child now owns stdin. Keep only a writer until the remote
+        # sender joins the FIFO, so the child cannot see premature EOF.
+        self.release("reader")
+        self.result.with_name("requested").touch()
+
+    def writer_attached(self):
+        self.release("keeper")
+        self.attached.set()
+
+    async def run(self, command, *, service):
+        process = delivery = attachment = None
+        detached = False
+        self.fifo.parent.mkdir(mode=0o700, exist_ok=True)
+        os.mkfifo(self.fifo, 0o600)
+        try:
+            self.reader = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+            self.keeper = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.set_blocking(self.reader, True)
+            process = asyncio.create_task(command(self.reader, self.launched))
+            delivery = asyncio.create_task(wait_copy(self.result, broker=self.broker, input_pipe=self))
+            await asyncio.wait((process, delivery), return_when=asyncio.FIRST_COMPLETED)
+            if process.done():
+                result = process.result()
+                if result is not None and result.returncode:
+                    return result
+                if not delivery.done():
+                    if service:
+                        attachment = asyncio.create_task(self.attached.wait())
+                        await asyncio.wait((delivery, attachment), return_when=asyncio.FIRST_COMPLETED)
+                        if not delivery.done():
+                            # A ready service may consume input only once the main
+                            # command connects. The SSH helper now owns the
+                            # unnamed pipe's writer; do not wait for it to see EOF.
+                            detached = True
+                            return result
+                    else:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(delivery), 3)
+                        except TimeoutError:
+                            # A successful finite command can intentionally stop
+                            # reading before its writer has even started.
+                            return result
+            transferred = await delivery
+            if transferred.returncode:
+                return transferred
+            return await process
+        finally:
+            try:
+                if not detached and (delivery is None or not delivery.done()):
+                    self.result.with_name("cancelled").touch()
+            finally:
+                self.release("reader")
+                self.release("keeper")
+                self.fifo.unlink(missing_ok=True)
+                tasks = [task for task in (process, delivery, attachment) if task is not None]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class Lifecycle:
+    def __init__(self):
+        self.setup = None
+        self.command = None
+        self.interrupted = 0
+        self.environment = None
+        self.nodes = {}
+        self.began = set()
+        self.services = {}
+
+    def interrupt(self, number, _):
+        if not self.interrupted:
+            self.interrupted = number
+            if self.setup is not None:
+                self.setup.cancel()
+            elif self.command is not None and number != SIGINT:
+                self.command.send_signal(number)
+
+    async def prepare(self, run, plan, drive):
+        self.setup = asyncio.current_task()
+        try:
+            if self.interrupted:
+                return 128 + self.interrupted
+            return await setup_all(run, plan, drive, self)
+        except asyncio.CancelledError:
+            if not self.interrupted:
+                raise
+            return 128 + self.interrupted
+        finally:
+            self.setup = None
+
+    async def start(self, name, step, stdin, on_start=None):
+        argv = step["start"]
+        service = sp.Popen(argv, env=self.environment, stdin=stdin,
+                           stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True)
+        self.services[name] = service
+        if on_start:
+            on_start()
+        probe = step.get("ready")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30
+        # Give an immediate exit a chance to become observable even without a probe.
+        await asyncio.sleep(.05)
+        while service.poll() is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(f"{step['description']} timed out waiting for readiness")
+            if not probe:
+                return
+            attempt = asyncio.create_task(command_result(probe, self.environment, timeout=remaining))
+            try:
+                while service.poll() is None and not attempt.done():
+                    await asyncio.wait((attempt,), timeout=.05)
+                if service.poll() is not None:
+                    break
+                try:
+                    result = attempt.result()
+                except TimeoutError:
+                    pass
+                else:
+                    if not result.returncode:
+                        return
+            finally:
+                if not attempt.done():
+                    attempt.cancel()
+                await asyncio.gather(attempt, return_exceptions=True)
+            await asyncio.sleep(min(.1, max(deadline - loop.time(), 0)))
+        raise RuntimeError(f"{step['description']} exited before readiness (exit {service.returncode})")
+
+    def check_services(self):
+        for name, service in self.services.items():
+            if service.poll() is not None:
+                raise RuntimeError(f"{self.nodes[name][0]['description']} exited before the main command")
+
+    def cleanup(self, drive):
+        held = set()
+        failed = False
+
+        def hold(name):
+            if name not in held:
+                held.add(name)
+                for dep in self.nodes[name][1]:
+                    hold(dep)
+
+        archives = {}
+        for name in self.began:
+            if result := self.nodes[name][0].get("copy_result"):
+                try:
+                    Path(result).with_name("cancelled").touch()
+                    archives[name] = result
+                except OSError as exc:
+                    print(f"oncolab: could not cancel copy for {self.nodes[name][0]['description']}: "
+                          f"{exc.strerror}; leaving the VM running", file=sys.stderr)
+                    hold(name)
+                    failed = True
+        deadline = time.monotonic() + 5
+        for name, result in archives.items():
+            try:
+                idle = quiesce_archive(result, deadline)
+            except OSError:
+                idle = False
+            if not idle:
+                print(f"oncolab: copy for {self.nodes[name][0]['description']} did not stop; "
+                      "leaving the VM running", file=sys.stderr)
+                hold(name)
+                failed = True
+
+        for name in reversed(self.nodes):
+            if name not in self.began or name in held:
+                continue
+            step, _ = self.nodes[name]
+            try:
+                ok = True
+                if hook := step.get("teardown"):
+                    ok = sp.call(hook, env=self.environment, stdin=sp.DEVNULL, stdout=sys.stderr) == 0
+                if ok and (service := self.services.get(name)) is not None:
+                    ok = stop_process(service)
+                if ok and (target := step.get("mount_target")) is not None:
+                    ok = drive.detach(target)
+                if ok:
+                    continue
+                print(f"oncolab: teardown of {step['description']} failed; leaving the VM running", file=sys.stderr)
+            except OSError as exc:
+                print(f"oncolab: teardown of {step['description']} failed: {exc.strerror}; leaving the VM running",
+                      file=sys.stderr)
+            failed = True
+            hold(name)
+        preserve = {Path(step["mount_target"]) for name, (step, _) in self.nodes.items()
+                    if name in held and "mount_target" in step}
+        released = drive.close(preserve, keep_daemon="rcd" in held) if drive else True
+        return released and not failed
+
+
+async def setup_all(run, plan, drive, lifecycle=None):
+    lifecycle = lifecycle or Lifecycle()
     tasks = {}
 
-    def submit(name, description, command, *dependencies):
+    def submit(name, description, command, *dependencies, step=None):
+        step = step if step is not None else {}
+        if "description" not in step:
+            step = {**step, "description": description}
+        lifecycle.nodes[name] = (step, dependencies)
+
         async def execute():
             results = await asyncio.gather(*(tasks[dep] for dep in dependencies))
             if any(result for result in results):
                 return 1
+            lifecycle.began.add(name)
             result = await run(description, command)
             if result is not None and result.returncode:
                 if result.stdout:
                     sys.stderr.buffer.write(result.stdout)
                 if result.stderr:
                     sys.stderr.buffer.write(result.stderr)
-                print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
+                if name != "copy":  # The local transfer reports its concrete error.
+                    print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
 
+    copy_result = plan.get("copy_result")
+    copy_supplies_workdir = plan.get("copy_supplies_workdir", False)
+    if copy_result:
+        async def copy():
+            result = await wait_copy(copy_result)
+            if copy_supplies_workdir and not result.returncode:
+                enter_workdir(plan)
+            return result
+        submit("copy", "Copying files…", copy, step={"copy_result": copy_result})
+
+    drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
     if drive:
-        submit("fuse", "Preparing FUSE…", [*bash, FUSE])
-        submit("rclone", "Preparing rclone…", [*bash, RCLONE])
+        drive.environment = drive_environment(lifecycle.environment if lifecycle.environment is not None else os.environ)
+        workdir_ready = ("copy",) if copy_supplies_workdir else ()
+
+        def install(script):
+            return partial(command_result, [*bash, script], drive.environment)
+
+        submit("fuse", "Preparing FUSE…", install(FUSE), *workdir_ready)
+        submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
         submit("rcd", "Starting Drive mounts…", drive.start, "fuse", "rclone")
+        drive_tasks.extend(("fuse", "rclone", "rcd"))
+        setup_mounts = {step.get("mount") for step in plan["setup"].values()}
         for name, mount in plan["mounts"].items():
+            if name in setup_mounts:
+                continue
             async def attach(mount=mount):
                 await drive.attach(mount)
-            submit(name, f"Mounting {name.removeprefix('mounts.')}…", attach, "rcd")
+            submit(name, f"Mounting {name.removeprefix('mounts.')}…", attach, "rcd",
+                   step={"mount_target": mount["target"]})
+            drive_tasks.append(name)
 
-    names = list(tasks)
     for name, step in plan["setup"].items():
-        submit(f"setup:{name}", step["description"], step["argv"],
-               *(dep if dep.startswith("mounts.") else f"setup:{dep}" for dep in step["depends"]))
+        dependencies = [f"setup:{dep}" for dep in step["needs"]]
+        if copy_supplies_workdir:
+            dependencies.append("copy")
+        key = f"setup:{name}"
+        if mount_key := step.get("mount"):
+            mount = plan["mounts"][mount_key]
 
-    if drive:
-        try:
-            mount_results = await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
-            if drive.socket.exists():
-                # Allow the initial OAuth refresh to save to the private tmpfs
-                # file; an empty path makes rclone retry a failed save.
+            async def command(mount=mount):
+                await drive.attach(mount)
+
+            dependencies.append("rcd")
+            drive_tasks.append(key)
+            step = {**step, "mount_target": mount["target"]}
+        elif lifecycle.environment is not None or {"copy_result", "stdin_result", "start"} & step.keys():
+            async def command(step=step, key=key):
+                broker = Path(plan.get("jobdir", "/dev/null")) / "broker-pid"
+                if result_path := step.get("copy_result"):
+                    Path(result_path).with_name("requested").touch()
+                    result = await wait_copy(result_path, broker=broker)
+                    if result.returncode:
+                        return result
+
+                async def launch(stdin=sp.DEVNULL, on_start=None):
+                    if "start" in step:
+                        await lifecycle.start(key, step, stdin, on_start)
+                        return None
+                    if argv := step.get("argv"):
+                        return await command_result(argv, lifecycle.environment, stdin, on_start=on_start)
+                    return None
+
+                if input_result := step.get("stdin_result"):
+                    service = "start" in step
+                    result = await TaskInput(input_result, broker).run(launch, service=service)
+                    if service and result is None and lifecycle.services[key].poll() is not None:
+                        raise RuntimeError(f"{step['description']} exited while opening task input")
+                    return result
+                return await launch()
+        else:
+            command = step.get("argv", lambda: None)
+        submit(key, step["description"], command, *dependencies, step=step)
+
+    try:
+        if drive:
+            try:
+                mount_results = ()
                 try:
-                    await drive.rc("config/setpath", path="/dev/null")
-                except RuntimeError:
-                    if not any(mount_results):
-                        raise
-                    print("oncolab: could not detach rclone from its staging path", file=sys.stderr)
-        finally:
-            drive.seal()
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    mount_results = await asyncio.gather(*(tasks[name] for name in drive_tasks),
+                                                         return_exceptions=True)
+                finally:
+                    if drive.socket.exists():
+                        # Allow the initial OAuth refresh to save to the private tmpfs
+                        # file; an empty path makes rclone retry a failed save.
+                        try:
+                            await drive.rc("config/setpath", path="/dev/null")
+                        except RuntimeError:
+                            if not (any(mount_results) or lifecycle.interrupted):
+                                raise
+                            print("oncolab: could not detach rclone from its staging path", file=sys.stderr)
+            finally:
+                drive.seal()
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
     for result in results:
         if isinstance(result, BaseException):
             raise result
@@ -183,41 +643,76 @@ def main():
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     os.environ["PATH"] = str(Path.home() / ".local/bin") + ":" + os.environ["PATH"]
     drive = None
+    jobdir = Path(plan["jobdir"]) if "jobdir" in plan else None
+    setup_env, command_env = {}, {}
+    lifecycle = Lifecycle()
     status = 1
-    signal(SIGINT, lambda *_: None)
+    previous = {n: signal(n, lifecycle.interrupt) for n in (SIGINT, SIGHUP, SIGTERM)}
     try:
-        os.chdir("/content")
         if plan["mounts"]:
             path = Path(directory)
             st = path.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Drive staging directory is not private")
             drive = DriveMounts(directory)
+            (path / "rclone.conf").rename(drive.config)
             for name, mount in plan["mounts"].items():
                 var = name.removeprefix("mounts.").upper().replace("-", "_")
                 os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
+        if jobdir:
+            st = jobdir.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+                raise RuntimeError("Job staging directory is not private")
+            if plan.get("has_env"):
+                claimed = jobdir / "active-env.json"
+                try:
+                    (jobdir / "env.json").rename(claimed)
+                except FileNotFoundError:
+                    raise RuntimeError("Staged environment is missing; refusing to run without it") from None
+                try:
+                    with claimed.open() as file:
+                        claimed.unlink()
+                        setup_env, command_env = json.load(file)
+                finally:
+                    claimed.unlink(missing_ok=True)
+        if not plan.get("copy_supplies_workdir"):
+            enter_workdir(plan)
         work = plan["mounts"].get("mounts.work")
         if work:
             os.environ["COLAB_DRIVE"] = work["target"]
-        status = progress(lambda run: setup_all(run, plan, drive), live, color == "1", capture=True)
-        if not status:
+        lifecycle.environment = os.environ | setup_env
+        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1", capture=True)
+        if lifecycle.interrupted:
+            status = 128 + lifecycle.interrupted
+        elif not status:
+            lifecycle.check_services()
             argv = [*plan["entrypoint"], *command]
             try:
-                code = sp.call(argv)
+                environment = {name: value for name, value in (lifecycle.environment | command_env).items()
+                               if value is not None}
+                with sp.Popen(argv, env=environment) as cmd:
+                    lifecycle.command = cmd
+                    code = cmd.wait()
                 status = code if code >= 0 else 128 - code
             except OSError as exc:
                 print(f"oncolab: {argv[0]}: {exc.strerror}", file=sys.stderr)
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
         print(f"oncolab: {exc}", file=sys.stderr)
+        status = status or 1
     finally:
+        lifecycle.command = None
         try:
-            released = drive is None or drive.close()
+            released = lifecycle.cleanup(drive)
+            if jobdir:
+                shutil.rmtree(jobdir, ignore_errors=True)
         except OSError as exc:
             print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)
             released = False
         if released:
             unassign()
+        for number, handler in previous.items():
+            signal(number, handler)
     return (status if status >= 0 else 128 - status) if released else 125
 
 

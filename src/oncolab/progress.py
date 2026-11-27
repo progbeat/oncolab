@@ -5,6 +5,8 @@ def progress(work, live, color, *, capture=False):
     import asyncio
     from contextlib import ExitStack
     from inspect import iscoroutinefunction
+    from os import killpg
+    from signal import SIGKILL
 
     with ExitStack() as stack:
         bar = None
@@ -44,8 +46,18 @@ def progress(work, live, color, *, capture=False):
                 if callable(command):
                     return await asyncio.to_thread(command)
                 output = sp.PIPE if capture or live else None
-                proc = await asyncio.create_subprocess_exec(*command, stdin=sp.DEVNULL, stdout=output, stderr=output)
-                stdout, stderr = await proc.communicate()
+                proc = await asyncio.create_subprocess_exec(
+                    *command, stdin=sp.DEVNULL, stdout=output, stderr=output, start_new_session=True,
+                )
+                try:
+                    stdout, stderr = await proc.communicate()
+                except asyncio.CancelledError:
+                    try:
+                        killpg(proc.pid, SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await proc.communicate()
+                    raise
                 return sp.CompletedProcess(command, proc.returncode, stdout, stderr)
             finally:
                 if counter is not None:

@@ -1,8 +1,26 @@
 name: Tests
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
 permissions:
   contents: read
 jobs:
+  release-policy:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.policy.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: policy
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/release_policy.py --base "$BASE"
+
   python:
     strategy:
       matrix:
@@ -10,7 +28,94 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run --locked python -m unittest discover -s tests -v
       - run: uv build
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.release-policy.outputs.version != ''
+    needs: [release-policy, python]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      manifest_sha256: ${{ steps.distributions.outputs.manifest_sha256 }}
+    concurrency:
+      group: oncolab-release-${{ needs.release-policy.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Build or recover release distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          if bash scripts/verify_pypi_release.sh "$VERSION" --recover; then
+            echo "Reusing distributions from the published immutable release"
+          else
+            status=$?
+            if [[ $status != 3 ]]; then
+              exit "$status"
+            fi
+            uv build --no-sources
+          fi
+      - name: Smoke-test both release distributions and prepare checksums
+        id: distributions
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          for distribution in "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz"; do
+            temp=$(mktemp -d "$RUNNER_TEMP/oncolab-smoke.XXXXXX")
+            export UV_TOOL_DIR="$temp/tools" UV_TOOL_BIN_DIR="$temp/bin"
+            uv --no-config tool install "$PWD/dist/$distribution"
+            test "$("$UV_TOOL_BIN_DIR/oncolab" --version)" = "oncolab $VERSION"
+          done
+          cd dist
+          sha256sum -- "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz" > sha256.sum
+          manifest=$(sha256sum -- sha256.sum)
+          printf 'manifest_sha256=%s\n' "${manifest%% *}" >> "$GITHUB_OUTPUT"
+      - name: Publish this tested version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: bash scripts/publish_release.sh "$VERSION"
+
+  publish-pypi:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.release.result == 'success'
+    needs: [release-policy, release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/oncolab/
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: oncolab-pypi-${{ needs.release-policy.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: false
+      - name: Download and verify the immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-policy.outputs.version }}
+          MANIFEST_SHA256: ${{ needs.release.outputs.manifest_sha256 }}
+        run: bash scripts/verify_pypi_release.sh "$VERSION" "$MANIFEST_SHA256"
+      - name: Publish distributions to PyPI
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          uv --no-config publish --trusted-publishing always --check-url https://pypi.org/simple/ \
+            "dist/oncolab-$VERSION-py3-none-any.whl" "dist/oncolab-$VERSION.tar.gz"
