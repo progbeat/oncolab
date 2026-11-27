@@ -3,11 +3,13 @@ import base64
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 from unittest.mock import AsyncMock, Mock, patch
 
 from oncolab import cli, remote
@@ -91,6 +93,32 @@ class Teardown(unittest.TestCase):
         self.assertEqual(options["cwd"], "/")
         self.assertEqual(argv[0][1:3], ["-P", "-c"])
 
+    def test_early_workdir_failure_scrubs_claimed_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "secret-stage"
+            stage.mkdir(mode=0o700)
+            pending = stage / "rclone.conf"
+            pending.write_bytes(b"unrelated private sections")
+            workdir = root / "regular-file"
+            workdir.touch()
+            plan = {"workdir": str(workdir), "mounts": {
+                "mounts.work": {"target": "/mnt/work"}}}
+            argv = ["remote.py", str(stage), "0", json.dumps(plan), "unused"]
+            real_enter = remote.enter_workdir
+
+            def enter(config):
+                self.assertFalse(pending.exists())
+                self.assertEqual((stage / "active.conf").read_bytes(), b"unrelated private sections")
+                real_enter(config)
+
+            with (patch("sys.argv", argv), patch.dict(os.environ),
+                  patch.object(remote, "enter_workdir", side_effect=enter),
+                  patch.object(remote, "unassign") as unassign, patch("sys.stderr", new_callable=io.StringIO)):
+                self.assertEqual(remote.main(), 1)
+            self.assertFalse(stage.exists())
+            unassign.assert_called_once_with()
+
 
 class RemoteMounts(unittest.IsolatedAsyncioTestCase):
     async def test_mount_modes_and_sealing_before_payload(self):
@@ -171,6 +199,52 @@ target = "/mnt/work"
             allocate.assert_not_called()
             run_session.assert_not_called()
 
+    def test_unused_symlink_loop_is_ignored_but_selected_config_fails_before_allocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "profile.toml"
+            profile.write_text('[rclone]\nconfig = "loop"\n')
+            (root / "loop").symlink_to("loop")
+            self.assertIsNone(plan(profile)[1])
+            argv = ["oncolab", "--config", str(profile), "--mount",
+                    "source=first:path,target=/mnt/a", "--", "true"]
+            with (patch("sys.argv", argv), patch.object(cli, "allocate") as allocate,
+                  patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                  self.assertRaises(SystemExit) as exit_status):
+                cli.main()
+            self.assertEqual(exit_status.exception.code, 2)
+            self.assertIn("loop", stderr.getvalue())
+            allocate.assert_not_called()
+
+    def test_ambiguous_ssh_recovery_removes_only_pending_before_closing_master(self):
+        for cleanup_status in (0, 255):
+            with self.subTest(cleanup_status=cleanup_status):
+                operations = []
+
+                def run(argv, **kwargs):
+                    if kwargs.get("input"):
+                        [(stage, files)] = json.loads(kwargs["input"]).items()
+                        self.assertEqual(list(files), ["rclone.conf"])
+                        operations.append(stage)
+                    elif "-O" in argv:
+                        operations.append("close")
+                    else:
+                        self.assertEqual(shlex.split(argv[-1]), ["rm", "-f", "--", operations[0] + "/rclone.conf"])
+                        self.assertIn("ProxyCommand=false", argv)
+                        self.assertEqual(kwargs["timeout"], 5)
+                        operations.append("recover")
+                        return subprocess.CompletedProcess(argv, cleanup_status)
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with (patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+                      patch.object(cli.sp, "run", side_effect=run), patch.object(cli.sp, "call", return_value=255),
+                      patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                    result = cli.run_session("failed-session", {"setup": {}}, b"private", None,
+                                             ["true"], False, False, False, Event())
+                self.assertEqual(result, (255, False))
+                self.assertEqual(operations[1:], ["recover", "close"])
+                self.assertEqual("could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
+
     def test_mount_without_existing_explicit_config_fails_before_allocation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -206,6 +280,7 @@ target = "/mnt/work"
             bootstrap = []
 
             def run(argv, **kwargs):
+                self.assertFalse(argv[-1].startswith("rm "))
                 self.assertNotIn("SECRET_FIXTURE", repr(argv))
                 self.assertNotIn(base64.b64encode(raw).decode("ascii"), repr(argv))
                 if staged := kwargs.get("input"):

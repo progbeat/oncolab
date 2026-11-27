@@ -381,6 +381,33 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             keys = sp.run(["ssh-add", "-L"], capture_output=True).stdout.splitlines()
             advertised = public.read_bytes().split()[:2]
             terminal_connect = any(key.split()[:2] == advertised for key in keys)
+        recover_pending = rclone_ini is not None
+        master_closed = False
+
+        def close_master():
+            nonlocal master_closed
+            if master_closed:
+                return
+            master_closed = True
+            try:
+                if recover_pending:
+                    # The runner claims the pending file by rename. Never
+                    # remove active credentials or disturb a running mount.
+                    command = shlex.join(["rm", "-f", "--", f"{drive_stage}/rclone.conf"])
+                    try:
+                        cleanup = sp.run(
+                            [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target, command],
+                            stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=5,
+                        )
+                        confirmed = cleanup.returncode == 0
+                    except (OSError, sp.TimeoutExpired):
+                        confirmed = False
+                    if not confirmed:
+                        print(f"oncolab: could not confirm cleanup of unclaimed rclone config for {name!r}",
+                              file=sys.stderr)
+            finally:
+                sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+
         stage = shlex.join(["python3", "-c", STAGE]) if staging else "true"
         try:
             with without_echo(terminal_connect):
@@ -400,8 +427,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint) if groups else None
             argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            if status == 0:
+                recover_pending = False
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
-                sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                close_master()
             if transfer:
                 error, _ = transfer.result()
                 if error:
@@ -412,14 +441,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     transfer_errors = task_upload.result(timeout=3)
                 except TimeoutError:
                     # The payload has exited; no remote teardown can still be waiting on this broker.
-                    sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                    close_master()
                     transfer_errors = task_upload.result()
                 for error in transfer_errors:
                     print(f"oncolab: {error}", file=sys.stderr)
                     status = status or 1
             return status, False
         finally:
-            sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            close_master()
 
 
 def main():

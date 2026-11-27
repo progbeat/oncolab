@@ -157,7 +157,6 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
     copies = profile_copies(root.get("copy", []), base)
     copy_requested = copy_requested or bool(copies)
     rclone = table(root.get("rclone", {}), ("config",), "rclone")
-    rclone_path = local_path(rclone["config"], base, "rclone.config").resolve() if "config" in rclone else None
     forwards = ports([*strings(root.get("ports", []), "ports"), *cli_ports])
     ssh = table(root.get("ssh", {}), ("known_hosts",), "ssh")
     known_hosts = local_path(ssh["known_hosts"], base, "ssh.known_hosts") if "known_hosts" in ssh else None
@@ -172,7 +171,7 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         table(entry, ("source", "target", "readonly"), where)
         source = string(entry.get("source"), where + ".source")
         remote, separator, _ = source.partition(":")
-        if not separator or not re.fullmatch(r"[\w. -]+", remote) or not remote.strip():
+        if not separator or not re.fullmatch(r"[\w.+@][\w.+@ -]*(?<! )", remote):
             raise ConfigError(f"{where}.source must be REMOTE:PATH")
         target = PurePosixPath(string(entry.get("target"), where + ".target"))
         if not target.is_absolute():
@@ -255,9 +254,12 @@ def plan(path, *, copy_requested=False, cli_mounts=(), cli_ports=()):
         config["copies"] = copies
     if forwards:
         config["ports"] = forwards
-    if mounts and rclone_path is None:
-        raise ConfigError("Mounts require an explicit [rclone].config file")
-    return config, rclone_path if mounts else None, known_hosts
+    rclone_path = None
+    if mounts:
+        if "config" not in rclone:
+            raise ConfigError("Mounts require an explicit [rclone].config file")
+        rclone_path = local_path(rclone["config"], base, "rclone.config")
+    return config, rclone_path, known_hosts
 
 
 def read_rclone_config(path):

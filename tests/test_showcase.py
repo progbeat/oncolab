@@ -76,14 +76,21 @@ run = ["echo", ""]
                 ("type=gdrive,source=gdrive:work,target=/content/work", "unknown key"),
                 ("source=work,target=/content/work", "REMOTE:PATH"),
                 ("source=/tmp/local:work,target=/content/work", "REMOTE:PATH"),
+                ("source=-first:work,target=/content/work", "REMOTE:PATH"),
+                ("source= first:work,target=/content/work", "REMOTE:PATH"),
+                ("source=first :work,target=/content/work", "REMOTE:PATH"),
             ):
                 with self.assertRaisesRegex(ConfigError, message):
                     plan(profile, cli_mounts=[spec])
             with self.assertRaisesRegex(ConfigError, "Conflicting remote ports"):
                 plan(profile, cli_ports=["8080:80", "8080:90"])
-            config, _, _ = plan(profile, cli_mounts=["source=Other Remote:path:more,target=work,readonly"])
+            config, _, _ = plan(profile, cli_mounts=["source=Other Remote:path:more,target=work,readonly",
+                                                     "source=team+archive@org:Reports,target=/mnt/reports",
+                                                     "source=team@org:,target=/mnt/team"])
             self.assertEqual(config["mounts"]["mounts.cli-1"],
                              {"source": "Other Remote:path:more", "target": "/content/work", "read_only": True})
+            self.assertEqual(config["mounts"]["mounts.cli-2"]["source"], "team+archive@org:Reports")
+            self.assertEqual(config["mounts"]["mounts.cli-3"]["source"], "team@org:")
 
 
 class Transfers(unittest.TestCase):

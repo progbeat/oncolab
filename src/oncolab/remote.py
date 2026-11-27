@@ -69,7 +69,7 @@ install -D -m 755 "$tmp/rclone" "$HOME/.local/bin/rclone"
 class DriveMounts:
     def __init__(self, directory):
         self.directory = Path(directory)
-        self.config = self.directory / "rclone.conf"
+        self.config = self.directory / "active.conf"
         self.socket = self.directory / "rc.sock"
         self.attached = []
         self.server = None
@@ -629,6 +629,16 @@ def main():
     status = 1
     previous = {n: signal(n, lifecycle.interrupt) for n in (SIGINT, SIGHUP, SIGTERM)}
     try:
+        if plan["mounts"]:
+            path = Path(directory)
+            st = path.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+                raise RuntimeError("Drive staging directory is not private")
+            drive = DriveMounts(directory)
+            (path / "rclone.conf").rename(drive.config)
+            for name, mount in plan["mounts"].items():
+                var = name.removeprefix("mounts.").upper().replace("-", "_")
+                os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
         if not plan.get("copy_supplies_workdir"):
             enter_workdir(plan)
         if jobdir:
@@ -643,15 +653,6 @@ def main():
                 else:
                     command_env = values
                 env_path.unlink()
-        if plan["mounts"]:
-            path = Path(directory)
-            st = path.lstat()
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
-                raise RuntimeError("Drive staging directory is not private")
-            drive = DriveMounts(directory)
-            for name, mount in plan["mounts"].items():
-                var = name.removeprefix("mounts.").upper().replace("-", "_")
-                os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
         work = plan["mounts"].get("mounts.work")
         if work:
             os.environ["COLAB_DRIVE"] = work["target"]

@@ -154,7 +154,9 @@ oncolab --mount source=gdrive:work,target=/content/work -- ls /content/work
 
 `source` uses rclone's `remote:path` notation. The part before the colon
 names a section in the selected rclone config. One session can mount paths
-from several named remotes in that file. Targets must be empty,
+from several named remotes in that file. If a source or target contains a
+literal comma, declare the mount in TOML instead of using `--mount`.
+Targets must be empty,
 non-overlapping directories below `/content`, `/mnt`, `/home`, or `/root`.
 The tool exports `ONCOLAB_MOUNT_<NAME>` to setup and the command (uppercased, with
 hyphens replaced by underscores). A mount named `work` also sets `COLAB_DRIVE`.
