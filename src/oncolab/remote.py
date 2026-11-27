@@ -238,7 +238,9 @@ def main():
         if not status:
             argv = [*plan["entrypoint"], *command]
             try:
-                code = sp.call(argv, env=os.environ | command_env)
+                environment = {name: value for name, value in (os.environ | command_env).items()
+                               if value is not None}
+                code = sp.call(argv, env=environment)
                 status = code if code >= 0 else 128 - code
             except OSError as exc:
                 print(f"oncolab: {argv[0]}: {exc.strerror}", file=sys.stderr)

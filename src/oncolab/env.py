@@ -1,3 +1,4 @@
+import os
 import re
 
 from .config import ConfigError
@@ -13,14 +14,12 @@ def _validate(name, value, where):
 
 
 def parse_env(assignments):
-    """Parse explicit NAME=VALUE arguments without expanding local variables."""
+    """Parse literal values and explicitly forwarded local variables."""
     environment = {}
     for assignment in assignments:
         name, separator, value = assignment.partition("=")
-        if not separator:
-            raise ConfigError("--env expects NAME=VALUE")
         _validate(name, value, "--env")
-        environment[name] = value
+        environment[name] = value if separator else os.environ.get(name)
     return environment
 
 

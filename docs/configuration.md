@@ -39,9 +39,14 @@ MODE = "train"
 Put `workdir` before any table header. It must be an absolute path on the VM
 filesystem. It is created if needed and is the starting directory for setup
 and the command, before any `cd` in the entrypoint. The `[env]` table sets
-literal string values for the entrypoint and command, not for setup. Repeat
-`--env NAME=VALUE` to override values; the last assignment wins. Avoid
-credentials in CLI arguments, shell history or plaintext profiles.
+literal string values for the entrypoint and command, not for setup. Use
+`-e NAME=VALUE` (or `--env NAME=VALUE`) to set an explicit value. With
+`-e NAME`, `oncolab` takes the value from the exported local environment;
+if it is absent locally, the variable is unset for the command even if the
+profile or VM supplied it. `-e NAME=` sets an empty value. Repeat the option
+as needed; the last occurrence wins. Forward only values you intend to
+expose to the remote command. Avoid putting secrets in command-line values
+or plaintext profiles.
 
 ### Copy local files
 

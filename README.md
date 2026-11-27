@@ -48,7 +48,8 @@ outputs to persistent storage before the VM is released.
 
 **On the development branch:** set `workdir` in your profile to change the VM
 working directory, use `--copy` to stage files for the run, or use
-`--env NAME=VALUE` to set variables for the command:
+`-e NAME=VALUE` to set variables for the command (`-e NAME` forwards an
+exported local variable):
 
 ```sh
 oncolab --gpu T4 --copy train.py --env MODE=train -- python3 train.py

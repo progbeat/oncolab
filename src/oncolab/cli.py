@@ -258,8 +258,8 @@ def main():
     parser.add_argument("--version", action="version", version=f"oncolab {version('oncolab')}")
     parser.add_argument("--copy", action="append", default=[], metavar="LOCAL[:REMOTE]",
                         help="Copy a file or directory to the VM before running; repeatable")
-    parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
-                        help="Set an environment variable for the command; repeatable")
+    parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
+                        help="Set a value or forward a named local variable; repeatable")
     parser.add_argument("--config", type=Path, help="Use an explicit local TOML configuration")
     hardware = parser.add_mutually_exclusive_group()
     hardware.add_argument("--gpu", metavar="MODEL",
