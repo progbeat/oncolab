@@ -2,7 +2,7 @@
 
 ## Command execution
 
-Commands start in `/content`. A remote terminal is allocated when both stdin and
+Commands start in the profile's `workdir` (`/content` by default). A remote terminal is allocated when both stdin and
 stdout are terminals. Put `oncolab` options before the command; `--` explicitly
 marks the boundary. The remaining arguments are passed to the command. Use
 `bash -c '…'` when you want shell syntax evaluated on the VM.
@@ -27,6 +27,45 @@ No profile is loaded from the current project automatically. The default is
 `~/.config/oncolab/config.toml`); `--config` selects a file explicitly.
 Profiles can execute code. Use only profiles and scripts you trust.
 
+### Working directory and environment
+
+```toml
+workdir = "/content/project"
+
+[env]
+MODE = "train"
+```
+
+Put `workdir` before any table header. It must be an absolute path on the VM
+filesystem. It is created if needed and is the starting directory for setup
+and the command, before any `cd` in the entrypoint. The `[env]` table sets
+literal string values for the entrypoint and command, not for setup. Repeat
+`--env NAME=VALUE` to override values; the last assignment wins. Avoid
+credentials in CLI arguments, shell history or plaintext profiles.
+
+### Copy local files
+
+Examples (repeat `--copy` for more than one source):
+
+```sh
+oncolab --copy train.py -- python3 train.py
+oncolab --copy ./project:code -- ls code
+oncolab --copy data.csv:/tmp/input.csv -- wc -l /tmp/input.csv
+```
+
+Local relative paths resolve from the current local directory. Without a
+destination, copy under the source basename into the VM working directory.
+A relative destination is resolved against the same VM directory. A trailing
+slash sets a containing directory; otherwise the destination is the exact new
+file or directory path. Destinations must not exist or overlap a Drive mount.
+Directories include hidden files; symlinks and other special entries are
+rejected rather than followed. Choose narrow sources if a project directory
+contains sensitive files. Changes on the VM are not copied back.
+
+Copy streams over the same SSH connection while independent setup runs.
+If a setup step uses a copied file, add `depends = ["copy"]` to wait for
+all uploads. The final command starts only after copy and setup succeed.
+
 ### Setup steps
 
 Under `[setup.<name>]`, set exactly one of:
@@ -37,7 +76,7 @@ Under `[setup.<name>]`, set exactly one of:
   options. Relative paths are resolved beside the profile.
 
 `description` is optional and appears during setup. `depends` lists setup names
-or `mounts.<name>` prerequisites. Independent steps run in parallel; unknown
+or `mounts.<name>` prerequisites, or `"copy"` when using `--copy`. Independent steps run in parallel; unknown
 dependencies and cycles fail before a VM is allocated. Shell exports in setup
 do not carry into the final command; use `entrypoint` for that.
 

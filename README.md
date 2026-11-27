@@ -43,9 +43,18 @@ oncolab -- bash -c 'uname -m && pwd'       # evaluate the shell expression on Co
 oncolab python3 - < train.py              # send a standalone local script over stdin
 ```
 
-Commands start in `/content` on the VM. Your local working directory and files
-aren't copied. Use setup or a Drive mount for a project; save outputs to
-persistent storage before the VM is released. Put `oncolab` flags before the
+Commands start in `/content`. Local files aren't copied automatically. Save
+outputs to persistent storage before the VM is released.
+
+**On the development branch:** set `workdir` in your profile to change the VM
+working directory, use `--copy` to stage files for the run, or use
+`--env NAME=VALUE` to set variables for the command:
+
+```sh
+oncolab --gpu T4 --copy train.py --env MODE=train -- python3 train.py
+```
+
+Put `oncolab` flags before the
 command. See `oncolab --help` for accelerator and memory options.
 
 ## Configure the VM

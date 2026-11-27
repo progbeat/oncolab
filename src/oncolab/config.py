@@ -43,15 +43,20 @@ def local_path(value, base, where):
     return base / path
 
 
-def plan(path):
+def plan(path, *, copy_requested=False):
+    from .env import parse_config_env
     if path is None:
         path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "oncolab/config.toml"
         if not path.exists():
-            return {"mounts": {}, "setup": {}, "entrypoint": []}, {}, None
+            return {"mounts": {}, "setup": {}, "entrypoint": [], "workdir": "/content", "env": {}}, {}, None
     path = path.expanduser()
     with path.open("rb") as file:
         root = tomllib.load(file)
-    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh"), str(path))
+    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env"), str(path))
+    workdir = PurePosixPath(string(root.get("workdir", "/content"), "workdir"))
+    if workdir.anchor != "/" or ".." in workdir.parts:
+        raise ConfigError("workdir must be an absolute VM path without '..'")
+    env = parse_config_env(root.get("env", {}))
     base = path.absolute().parent
     rclone = table(root.get("rclone", {}), ("config", "allow_full_drive"), "rclone")
     allow_full = boolean(rclone.get("allow_full_drive", False), "rclone.allow_full_drive")
@@ -66,10 +71,10 @@ def plan(path):
     for name, entry in root.get("mounts", {}).items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ConfigError(f"Invalid mount name: {name!r}")
-        env = name.upper().replace("-", "_")
-        if env in env_names:
+        mount_env = name.upper().replace("-", "_")
+        if mount_env in env_names:
             raise ConfigError(f"Mount {name!r} conflicts with another mount's environment variable")
-        env_names.add(env)
+        env_names.add(mount_env)
         key = f"mounts.{name}"
         table(entry, ("source", "target", "read_only", "config"), key)
         source = string(entry.get("source"), key + ".source")
@@ -111,9 +116,13 @@ def plan(path):
             raise ConfigError(f"setup.{name}.run cannot be empty")
         setup[name] = {"description": string(entry.get("description", name), f"setup.{name}.description"),
                        "argv": argv, "depends": strings(entry.get("depends", []), f"setup.{name}.depends")}
+    if any(workdir.is_relative_to(target) for target in targets):
+        raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
+    if copy_requested and "copy" in setup:
+        raise ConfigError("setup.copy conflicts with the --copy dependency")
     for name, step in setup.items():
         for dependency in step["depends"]:
-            if dependency not in setup and dependency not in mounts:
+            if dependency not in setup and dependency not in mounts and not (dependency == "copy" and copy_requested):
                 raise ConfigError(f"setup.{name}: unknown dependency {dependency!r}")
     try:
         order = graphlib.TopologicalSorter({name: step["depends"] for name, step in setup.items()}).static_order()
@@ -121,7 +130,8 @@ def plan(path):
     except graphlib.CycleError as exc:
         raise ConfigError("Setup dependencies contain a cycle") from exc
     entrypoint = strings(root.get("entrypoint", []), "entrypoint")
-    return {"mounts": mounts, "setup": setup, "entrypoint": entrypoint}, origins, known_hosts
+    return {"mounts": mounts, "setup": setup, "entrypoint": entrypoint,
+            "workdir": str(workdir), "env": env}, origins, known_hosts
 
 
 def credentials(origins):

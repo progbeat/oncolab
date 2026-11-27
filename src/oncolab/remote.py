@@ -122,6 +122,18 @@ class DriveMounts:
         return True
 
 
+async def wait_copy(result):
+    path = Path(result)
+    while True:
+        try:
+            status = path.read_text()
+        except FileNotFoundError:
+            status = ""
+        if status:
+            return sp.CompletedProcess([], int(status != "ok"), None, None)
+        await asyncio.sleep(.10)
+
+
 async def setup_all(run, plan, drive):
     tasks = {}
 
@@ -141,24 +153,34 @@ async def setup_all(run, plan, drive):
             return 0
         tasks[name] = asyncio.create_task(execute())
 
+    if copy_result := plan.get("copy_result"):
+        async def copy():
+            return await wait_copy(copy_result)
+        submit("copy", "Copying files…", copy)
+    else:
+        copy_result = None
+
+    drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
     if drive:
         submit("fuse", "Preparing FUSE…", [*bash, FUSE])
         submit("rclone", "Preparing rclone…", [*bash, RCLONE])
         submit("rcd", "Starting Drive mounts…", drive.start, "fuse", "rclone")
+        drive_tasks.extend(("fuse", "rclone", "rcd"))
         for name, mount in plan["mounts"].items():
             async def attach(mount=mount):
                 await drive.attach(mount)
             submit(name, f"Mounting {name.removeprefix('mounts.')}…", attach, "rcd")
+            drive_tasks.append(name)
 
-    names = list(tasks)
     for name, step in plan["setup"].items():
         submit(f"setup:{name}", step["description"], step["argv"],
-               *(dep if dep.startswith("mounts.") else f"setup:{dep}" for dep in step["depends"]))
+               *(dep if dep.startswith("mounts.") or (copy_result and dep == "copy")
+                 else f"setup:{dep}" for dep in step["depends"]))
 
     if drive:
         try:
-            mount_results = await asyncio.gather(*(tasks[name] for name in names), return_exceptions=True)
+            mount_results = await asyncio.gather(*(tasks[name] for name in drive_tasks), return_exceptions=True)
             if drive.socket.exists():
                 # Allow the initial OAuth refresh to save to the private tmpfs
                 # file; an empty path makes rclone retry a failed save.
@@ -183,10 +205,22 @@ def main():
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     os.environ["PATH"] = str(Path.home() / ".local/bin") + ":" + os.environ["PATH"]
     drive = None
+    jobdir = Path(plan["jobdir"]) if "jobdir" in plan else None
+    command_env = {}
     status = 1
     signal(SIGINT, lambda *_: None)
     try:
-        os.chdir("/content")
+        workdir = Path(plan.get("workdir", "/content"))
+        workdir.mkdir(parents=True, exist_ok=True)
+        os.chdir(workdir)
+        if jobdir:
+            st = jobdir.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+                raise RuntimeError("Job staging directory is not private")
+            env_path = jobdir / "env.json"
+            if env_path.exists():
+                command_env = json.loads(env_path.read_text())
+                env_path.unlink()
         if plan["mounts"]:
             path = Path(directory)
             st = path.lstat()
@@ -203,7 +237,7 @@ def main():
         if not status:
             argv = [*plan["entrypoint"], *command]
             try:
-                code = sp.call(argv)
+                code = sp.call(argv, env=os.environ | command_env)
                 status = code if code >= 0 else 128 - code
             except OSError as exc:
                 print(f"oncolab: {argv[0]}: {exc.strerror}", file=sys.stderr)
@@ -212,6 +246,8 @@ def main():
         print(f"oncolab: {exc}", file=sys.stderr)
     finally:
         try:
+            if jobdir:
+                shutil.rmtree(jobdir, ignore_errors=True)
             released = drive is None or drive.close()
         except OSError as exc:
             print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)

@@ -19,7 +19,7 @@ class Configuration(unittest.TestCase):
 
     def test_no_implicit_project_config(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
-            self.assertEqual(plan(None)[0], {"mounts": {}, "setup": {}, "entrypoint": []})
+            self.assertEqual(plan(None)[0], {"mounts": {}, "setup": {}, "entrypoint": [], "workdir": "/content", "env": {}})
 
     def test_mounts_setup_order_and_entrypoint(self):
         config, origins, host = self.parse("""
@@ -139,10 +139,10 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
 
 class CLI(unittest.TestCase):
     def test_no_forced_stop_after_ambiguous_disconnect(self):
-        with patch.object(cli, "plan", return_value=({}, {}, None)), patch.object(cli, "release") as release, \
+        with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, {}, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \
                 patch("sys.argv", ["oncolab", "--", "test", "spaces and $metacharacters"]):
-            def session(name, config, ini, hosts, command, forward, terminal, color, attempted):
+            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, sources):
                 self.assertEqual(command, ["test", "spaces and $metacharacters"])
                 attempted.set()
                 return 255, False
@@ -151,7 +151,7 @@ class CLI(unittest.TestCase):
             release.assert_not_called()
 
     def test_definite_pre_payload_failure_releases(self):
-        with patch.object(cli, "plan", return_value=({}, {}, None)), patch.object(cli, "release") as release, \
+        with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, {}, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \
                 patch.object(cli, "run_session", return_value=(255, True)), patch("sys.argv", ["oncolab", "test"]):
             self.assertEqual(cli.main(), 255)
