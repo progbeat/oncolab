@@ -69,8 +69,10 @@ class Showcase(unittest.TestCase):
                        else """run = 'test "$VALUE" = shared; printf setup > prepared'""")
             profile.write_text(f'''workdir = "{work}"
 ports = ["18080:8765"]
+entrypoint = ["sh", "-ec", 'test "$SHARED" = profile; exec "$@"', "entrypoint"]
 [env]
 VALUE = "shared"
+SHARED = "profile"
 [setup.transfer]
 needs = ["prepare"]
 copy = [{{ source = "data.txt", target = "data", chmod = 0o640 }}]
@@ -82,7 +84,7 @@ teardown = 'test "$VALUE" = shared; printf teardown > done'
             env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "FAKE_RAM": str(fake_ram),
                    "XDG_CONFIG_HOME": str(root), "NO_COLOR": "1"}
             result = subprocess.run([executable, "--config", str(profile), "-e", "VALUE=override", "--",
-                                     "sh", "-ec", 'test "$VALUE" = override; cat'],
+                                     "sh", "-ec", 'test "$VALUE" = override; test "$SHARED" = profile; cat'],
                                     env=env, input="main stdin\n", text=True, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "main stdin\n")

@@ -217,7 +217,7 @@ class Copy(unittest.TestCase):
                 plan(config)
             config.write_text(task + '[setup.copy]\ncopy = { source = "train:today.py" }\n')
             parsed, _, _ = plan(config)
-            self.assertEqual(parsed["setup"]["use"]["depends"], ["copy"])
+            self.assertEqual(parsed["setup"]["use"]["needs"], ["copy"])
             self.assertEqual(parsed["setup"]["copy"]["copies"],
                              [(str(config.parent / "train:today.py"), None, None)])
             config.write_text(task + '[[copy]]\nlocal = "train:today.py"\n')
@@ -241,7 +241,7 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "result"
             steps = {
-                "independent": {"description": "independent", "argv": ["true"], "depends": []},
+                "independent": {"description": "independent", "argv": ["true"], "needs": []},
             }
             seen = []
             copy_running = asyncio.Event()
@@ -285,8 +285,8 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                         marker.with_name("copy-ok").write_text("ok")
                         stages = []
                         steps = {
-                            "copy": {"description": "named copy", "argv": ["true"], "depends": []},
-                            "pwd": {"description": "checking cwd", "argv": ["pwd"], "depends": ["copy"]},
+                            "copy": {"description": "named copy", "argv": ["true"], "needs": []},
+                            "pwd": {"description": "checking cwd", "argv": ["pwd"], "needs": ["copy"]},
                         }
 
                         async def run(label, command):

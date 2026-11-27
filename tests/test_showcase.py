@@ -31,7 +31,7 @@ class ShowcaseConfig(unittest.TestCase):
         self.assertEqual(len(config["mounts"]), 1)
         self.assertEqual(rclone_path, (profile.parent / "rclone-colab.conf").resolve())
         self.assertEqual(own["git"]["copies"], [(str(profile.parent / "install-git.sh"), "-", None)])
-        self.assertEqual(own["git-on"]["depends"], ["git"])
+        self.assertEqual(own["git-on"]["needs"], ["git"])
         self.assertEqual(own["preview"]["start"][:3], ["python3", "-m", "http.server"])
         self.assertIn("teardown", own["preview"])
 
@@ -285,11 +285,11 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
                 "assert os.environ['SHOWCASE'] == 'shared'"
             ), str(stdin / "stdin"), str(first_seen), str(root / "out")]
             graph = {
-                "first": {"description": "first", "depends": [], "argv": [
+                "first": {"description": "first", "needs": [], "argv": [
                     sys.executable, "-c",
                     "import pathlib,sys,time; time.sleep(.2); pathlib.Path(sys.argv[1]).touch()", str(state),
                 ]},
-                "second": {"description": "second", "depends": ["first"], "argv": command,
+                "second": {"description": "second", "needs": ["first"], "argv": command,
                            "copy_result": str(result), "stdin_result": str(input_result)},
             }
             lifecycle = remote.Lifecycle()
@@ -400,10 +400,10 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
         lifecycle = remote.Lifecycle()
         lifecycle.environment = os.environ.copy()
         graph = {
-            "service": {"description": "service", "depends": [],
+            "service": {"description": "service", "needs": [],
                         "start": [sys.executable, "-c", "raise SystemExit(4)"],
                         "ready": ["true"]},
-            "after": {"description": "after", "depends": ["service"], "argv": ["true"]},
+            "after": {"description": "after", "needs": ["service"], "argv": ["true"]},
         }
         try:
             with self.assertRaisesRegex(RuntimeError, "exited before readiness"):
@@ -437,7 +437,7 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
             lifecycle.environment = os.environ.copy()
             cleanup = root / "cleaned"
             graph = {"stream": {
-                "description": "stream", "depends": [], "stdin_result": str(result),
+                "description": "stream", "needs": [], "stdin_result": str(result),
                 "argv": [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                 "teardown": ["touch", str(cleanup)],
             }}
@@ -476,11 +476,11 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
             lifecycle = remote.Lifecycle()
             lifecycle.environment = os.environ.copy()
             graph = {
-                "service": {"description": "service", "depends": [],
+                "service": {"description": "service", "needs": [],
                             "start": [sys.executable, "-c", "import time; time.sleep(30)"]},
-                "middle": {"description": "middle", "depends": ["service"], "argv": ["true"],
+                "middle": {"description": "middle", "needs": ["service"], "argv": ["true"],
                            "teardown": ["touch", str(root / "middle-cleaned")]},
-                "partial": {"description": "partial", "depends": ["middle"],
+                "partial": {"description": "partial", "needs": ["middle"],
                             "argv": [sys.executable, "-c", (
                                 "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)"
                             ), str(entered)],
@@ -595,7 +595,7 @@ while not trigger.exists():
 received.write_bytes(sys.stdin.buffer.read())
 time.sleep(30)
 """
-            graph = {"listener": {"description": "listener", "depends": [],
+            graph = {"listener": {"description": "listener", "needs": [],
                                   "start": [sys.executable, "-c", server, *map(str, (ready, trigger, received))],
                                   "ready": ["test", "-f", str(ready)], "stdin_result": str(result)}}
             lifecycle = remote.Lifecycle()

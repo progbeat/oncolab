@@ -457,8 +457,8 @@ def main():
                         help="Copy a file or directory to the VM before running; repeatable")
     parser.add_argument("--copy-to", action="append", nargs=2, default=[], metavar=("LOCAL", "REMOTE"),
                         help="Copy using separate literal paths; repeatable")
-    parser.add_argument("--mount", action="append", default=[], metavar="source=REMOTE:PATH,target=PATH",
-                        help="Mount an rclone remote path; repeatable")
+    parser.add_argument("--mount", action="append", default=[], metavar="source=REMOTE:PATH,target=PATH[,readonly]",
+                        help="Mount an rclone remote path; read/write by default, add ,readonly for read-only; repeatable")
     parser.add_argument("-p", "--publish", action="append", default=[], metavar="LOCAL_PORT:REMOTE_PORT",
                         help="Forward a local loopback TCP port to the VM; repeatable")
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",

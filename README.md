@@ -75,7 +75,8 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 - [Advanced profiles](docs/configuration.md#examples): multiple mounts with
   separate read/write settings, Git-on, or a wrapper that changes `HOME`.
 - [Configuration showcase](examples/showcase.toml): task dependencies,
-  file inputs, managed processes, and teardown.
+  file inputs, managed processes, and teardown. The `-v` / `--volume` comment
+  describes [future local bind mounts](https://github.com/progbeat/oncolab/issues/4).
 
 [Configuration reference](docs/configuration.md) ·
 [Drive permissions and safety](docs/configuration.md#security-and-cleanup)

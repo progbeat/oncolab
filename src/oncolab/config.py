@@ -133,12 +133,10 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
         base = path.absolute().parent
     if "copy" in root:
         raise ConfigError("Top-level copy is not supported; use copy in a named [setup.<name>] task")
-    table(root, ("rclone", "mounts", "setup", "entrypoint", "ssh", "workdir", "env", "ports"), str(path))
-    if not isinstance(root.get("mounts", {}), dict):
-        raise ConfigError("mounts must be a table")
-    if root.get("mounts"):
+    if "mounts" in root:
         raise ConfigError("Legacy [mounts.*] entries must be migrated to [setup.<name>].mount. "
                           "Select a dedicated [rclone].config: oncolab transfers the whole file.")
+    table(root, ("rclone", "setup", "entrypoint", "ssh", "workdir", "env", "ports"), str(path))
     workdir = PurePosixPath(string(root.get("workdir", "/content"), "workdir"))
     if workdir.anchor != "/" or ".." in workdir.parts:
         raise ConfigError("workdir must be an absolute VM path without '..'")
@@ -188,22 +186,18 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ConfigError(f"Invalid setup step name: {name!r}")
         where = f"setup.{name}"
-        table(entry, ("run", "script", "description", "depends", "needs", "start", "ready",
+        table(entry, ("run", "description", "needs", "start", "ready",
                       "teardown", "copy", "mount"), where)
-        if "needs" in entry and "depends" in entry:
-            raise ConfigError(f"{where}: specify needs or legacy depends, not both")
-        if len({"run", "script", "start", "mount"} & entry.keys()) > 1:
-            raise ConfigError(f"{where}: run, script, start and mount are mutually exclusive")
+        if len({"run", "start", "mount"} & entry.keys()) > 1:
+            raise ConfigError(f"{where}: run, start and mount are mutually exclusive")
         if "mount" in entry and "copy" in entry:
             raise ConfigError(f"{where}: define copies and mounts as separate tasks")
         if "ready" in entry and "start" not in entry:
             raise ConfigError(f"{where}.ready requires start")
-        if not {"run", "script", "start", "copy", "mount"} & entry.keys():
-            raise ConfigError(f"{where}: expected run, script, start, copy or mount")
+        if not {"run", "start", "copy", "mount"} & entry.keys():
+            raise ConfigError(f"{where}: expected run, start, copy or mount")
         step = {"description": string(entry.get("description", name), f"{where}.description"),
-                "depends": strings(entry.get("needs", entry.get("depends", [])), f"{where}.needs")}
-        if "script" in entry:
-            step["argv"] = argv(local_path(entry["script"], base, f"{where}.script").read_text(), f"{where}.run")
+                "needs": strings(entry.get("needs", []), f"{where}.needs")}
         for field in ("run", "start", "ready", "teardown"):
             if field in entry:
                 step["argv" if field == "run" else field] = argv(entry[field], f"{where}.{field}")
@@ -222,12 +216,12 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
     if any(workdir.is_relative_to(target) for target in targets):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
     for name, step in setup.items():
-        for dependency in step["depends"]:
+        for dependency in step["needs"]:
             if dependency not in setup:
                 raise ConfigError(f"setup.{name}: unknown dependency {dependency!r}")
     try:
-        order = graphlib.TopologicalSorter({name: step["depends"] for name, step in setup.items()}).static_order()
-        setup = {name: setup[name] for name in order if name in setup}
+        order = graphlib.TopologicalSorter({name: step["needs"] for name, step in setup.items()}).static_order()
+        setup = {name: setup[name] for name in order}
     except graphlib.CycleError as exc:
         raise ConfigError("Setup dependencies contain a cycle") from exc
     entrypoint = strings(root.get("entrypoint", []), "entrypoint")

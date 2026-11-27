@@ -38,7 +38,7 @@ mount = { source = "gdrive:work", target = "/content/work" }
 mount = { source = "ref:files", target = "/mnt/ref", readonly = true }
 [setup.last]
 run = "true"
-depends = ["first", "work"]
+needs = ["first", "work"]
 [setup.first]
 run = ["printf", "%s", "a b"]
 """)
@@ -54,8 +54,8 @@ run = ["printf", "%s", "a b"]
 
     def test_bad_dependency_and_cycle(self):
         for text in (
-            '[setup.a]\nrun = "true"\ndepends = ["missing"]',
-            '[setup.a]\nrun = "true"\ndepends = ["b"]\n[setup.b]\nrun = "true"\ndepends = ["a"]',
+            '[setup.a]\nrun = "true"\nneeds = ["missing"]',
+            '[setup.a]\nrun = "true"\nneeds = ["b"]\n[setup.b]\nrun = "true"\nneeds = ["a"]',
         ):
             with self.assertRaises(ConfigError):
                 self.parse(text)
@@ -79,10 +79,15 @@ mount = { source = "gdrive:a", target = "/mnt/a" }
 mount = { source = "gdrive:b", target = "/mnt/b" }
 """)
 
-    def test_empty_legacy_mount_table_does_not_select_credentials(self):
-        config, path, _ = self.parse('[rclone]\nconfig = "shared.conf"\n[mounts]\n')
-        self.assertEqual(config["mounts"], {})
-        self.assertIsNone(path)
+    def test_legacy_profile_keys_are_rejected(self):
+        for contents, key in (
+            ('[setup.old]\nscript = "not-read.sh"\n', "script"),
+            ('[setup.old]\nrun = ["true"]\ndepends = []\n', "depends"),
+            ('[rclone]\nallow_full_drive = true\n', "allow_full_drive"),
+            ('[mounts]\n', "Legacy"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ConfigError, key):
+                self.parse(contents)
 
 
 class Teardown(unittest.TestCase):
@@ -120,6 +125,16 @@ class Teardown(unittest.TestCase):
             unassign.assert_called_once_with()
 
 
+class CommandHelp(unittest.TestCase):
+    def test_mount_help_shows_readonly(self):
+        with (patch("sys.argv", ["oncolab", "--help"]), patch("sys.stdout", new_callable=io.StringIO) as stdout,
+              self.assertRaises(SystemExit) as exit_context):
+            cli.main()
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertIn("target=PATH[,readonly]", stdout.getvalue())
+        self.assertIn("read-only", stdout.getvalue())
+
+
 class RemoteMounts(unittest.IsolatedAsyncioTestCase):
     async def test_mount_modes_and_sealing_before_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,12 +149,34 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
                 if callable(cmd):
                     await cmd()
                 return None
-            self.assertEqual(await remote.setup_all(run, {"mounts": mounts, "setup": {}}, drive), 0)
+            lifecycle = remote.Lifecycle()
+            lifecycle.environment = {"PATH": "/profile/bin:/usr/bin", "MODE": "shared"}
+            with patch.object(remote, "command_result", new_callable=AsyncMock) as install:
+                install.return_value = subprocess.CompletedProcess([], 0)
+                status = await remote.setup_all(run, {"mounts": mounts, "setup": {}}, drive, lifecycle)
+            self.assertEqual(status, 0)
+            self.assertCountEqual([call.args[0][-1] for call in install.await_args_list],
+                                  [remote.FUSE, remote.RCLONE])
+            for call in install.await_args_list:
+                self.assertIs(call.args[1], lifecycle.environment)
+            self.assertIs(drive.environment, lifecycle.environment)
             sent = {call.kwargs["fs"]: call.kwargs["vfsOpt"]["ReadOnly"] for call in drive.rc.await_args_list if call.args == ("mount/mount",)}
             self.assertEqual(sent, {"demo:work": False, "demo:ref": True})
             self.assertEqual(drive.rc.await_args.args, ("config/setpath",))
             self.assertFalse(drive.socket.exists())
             self.assertFalse(drive.config.exists())
+
+    async def test_rclone_daemon_and_client_use_profile_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            drive = remote.DriveMounts(tmp)
+            drive.environment = {"PATH": "/profile/bin:/usr/bin", "MODE": "shared"}
+            with (patch.object(remote.sp, "Popen") as daemon, patch.object(Path, "is_socket", return_value=True),
+                  patch.object(remote, "command_result", new_callable=AsyncMock) as client):
+                client.return_value = subprocess.CompletedProcess([], 0)
+                await drive.start()
+                await drive.rc("config/setpath", path="/dev/null")
+            self.assertIs(daemon.call_args.kwargs["env"], drive.environment)
+            self.assertIs(client.await_args.args[1], drive.environment)
 
     async def test_parallel_setup_and_dependencies(self):
         started = asyncio.Event()
@@ -156,7 +193,7 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
                 self.assertCountEqual(finishes, ["left", "right"])
             finishes.append(label)
             return subprocess.CompletedProcess([], 0)
-        setup = {name: {"description": name, "argv": ["true"], "depends": deps}
+        setup = {name: {"description": name, "argv": ["true"], "needs": deps}
                  for name, deps in (("left", []), ("right", []), ("last", ["left", "right"]))}
         self.assertEqual(await asyncio.wait_for(remote.setup_all(run, {"setup": setup}, None), 1), 0)
         self.assertEqual(finishes[-1], "last")

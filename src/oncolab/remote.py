@@ -7,6 +7,7 @@ import stat
 import subprocess as sp
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
@@ -73,13 +74,14 @@ class DriveMounts:
         self.socket = self.directory / "rc.sock"
         self.attached = []
         self.server = None
+        self.environment = None
         self.uncertain = False
 
     async def rc(self, method, **parameters):
         command = ["rclone", "--config", "/dev/null", "rc", "--unix-socket", str(self.socket),
                    method, "--json", json.dumps(parameters)]
         try:
-            result = await command_result(command, None, timeout=45)
+            result = await command_result(command, self.environment, timeout=45)
         except TimeoutError as exc:
             if method == "mount/mount":
                 # A timed-out client is not proof that the daemon did not mount.
@@ -91,7 +93,8 @@ class DriveMounts:
     async def start(self):
         self.server = sp.Popen(
             ["rclone", "--config", str(self.config), "rcd", "--rc-addr", str(self.socket), "--rc-no-auth"],
-            stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL, start_new_session=True,
+            env=self.environment, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+            start_new_session=True,
         )
         for _ in range(150):
             if self.socket.is_socket():
@@ -528,8 +531,14 @@ async def setup_all(run, plan, drive, lifecycle=None):
     drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
     if drive:
-        submit("fuse", "Preparing FUSE…", [*bash, FUSE])
-        submit("rclone", "Preparing rclone…", [*bash, RCLONE])
+        drive.environment = lifecycle.environment
+        workdir_ready = ("copy",) if copy_supplies_workdir else ()
+
+        def install(script):
+            return partial(command_result, [*bash, script], lifecycle.environment)
+
+        submit("fuse", "Preparing FUSE…", install(FUSE), *workdir_ready)
+        submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
         submit("rcd", "Starting Drive mounts…", drive.start, "fuse", "rclone")
         drive_tasks.extend(("fuse", "rclone", "rcd"))
         setup_mounts = {step.get("mount") for step in plan["setup"].values()}
@@ -543,7 +552,7 @@ async def setup_all(run, plan, drive, lifecycle=None):
             drive_tasks.append(name)
 
     for name, step in plan["setup"].items():
-        dependencies = [f"setup:{dep}" for dep in step["depends"]]
+        dependencies = [f"setup:{dep}" for dep in step["needs"]]
         if copy_supplies_workdir:
             dependencies.append("copy")
         key = f"setup:{name}"
@@ -645,11 +654,7 @@ def main():
                 raise RuntimeError("Job staging directory is not private")
             env_path = jobdir / "env.json"
             if env_path.exists():
-                values = json.loads(env_path.read_text())
-                if isinstance(values, list):
-                    setup_env, command_env = values
-                else:
-                    command_env = values
+                setup_env, command_env = json.loads(env_path.read_text())
                 env_path.unlink()
         work = plan["mounts"].get("mounts.work")
         if work:

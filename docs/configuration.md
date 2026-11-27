@@ -39,7 +39,8 @@ MODE = "train"
 Put `workdir` before any table header. It must be an absolute path on the VM
 filesystem. It is created if needed and is the starting directory for setup
 and the command, before any `cd` in the entrypoint. The `[env]` table sets
-literal string values for setup, teardown, the entrypoint, and the command. Use
+literal string values for setup (including Drive preparation and rclone), task
+teardown, the entrypoint, and the command. Use
 `-e NAME=VALUE` (or `--env NAME=VALUE`) to set an explicit value. With
 `-e NAME`, `oncolab` takes the value from the exported local environment;
 if it is absent locally, the variable is unset for the command even if the
@@ -117,7 +118,9 @@ filesystem. It does not consume the main command's input.
 An optional `teardown` runs for a task that began execution, even if its
 setup stopped partway through. It runs before releasing direct or transitive
 dependencies. If teardown fails, its dependencies and the VM stay running.
-Legacy setup commands can still use `depends` and `script`.
+Use `needs` for dependencies and `run` for commands. Older `depends` and
+`script` fields are not supported. To run a local script, stream it into the
+step with `copy = "prepare.sh:-"` and run `["bash", "-s"]`.
 
 ### Google Drive mounts
 
@@ -135,8 +138,11 @@ Declare `mount` as a named setup task so other tasks can wait for it with
 `needs`. For a one-off mount, keep `[rclone].config` in your profile and use:
 
 ```sh
-oncolab --mount source=gdrive:work,target=/content/work -- ls /content/work
+oncolab --mount source=gdrive:work,target=/content/work,readonly -- ls /content/work
 ```
+
+CLI mounts are read/write by default, subject to the remote’s permissions.
+Add `,readonly` (or `,readonly=true`) to mount without write access.
 
 `source` uses rclone's `remote:path` notation. The part before the colon
 names a section in the selected rclone config. One session can mount paths
