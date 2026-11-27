@@ -280,7 +280,7 @@ async def command_result(argv, env, stdin=sp.DEVNULL, *, timeout=None, on_start=
         if on_start:
             on_start()
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-    except (asyncio.CancelledError, OSError):
+    except (asyncio.CancelledError, OSError):  # Includes the builtin TimeoutError from wait_for.
         for number in (SIGTERM, SIGKILL):
             try:
                 os.killpg(proc.pid, number)

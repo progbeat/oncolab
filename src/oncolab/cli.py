@@ -243,14 +243,20 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
         sp.Popen([*channel, command], stdin=sp.DEVNULL, stdout=sp.PIPE,
                  stderr=diagnostic, text=True) as broker,
     ):
-        def wake_runner(job):
+        def report_result(job):
             if job.cancelled():
                 return
-            if job.exception() is not None or not job.result()[1]:
-                # Dropping only the broker wakes the remote copy waiters;
-                # leave the command SSH channel alive for resource teardown.
-                if broker.poll() is None:
-                    broker.terminate()
+            if job.exception() is not None:
+                notified = False
+            else:
+                error, notified = job.result()
+                if error:
+                    # Ready services can finish receiving stdin after the command starts.
+                    # Report late failures now, without cutting off SSH or teardown.
+                    print(f"oncolab: {error}", file=sys.stderr, flush=True)
+            if not notified and broker.poll() is None:
+                # Dropping only the broker wakes the remote copy waiters.
+                broker.terminate()
 
         for line in broker.stdout:
             key = line.rstrip("\n")
@@ -263,10 +269,12 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
             else:
                 job = streams.submit(upload_stream, endpoint, key, input_source)
             jobs.append(job)
-            job.add_done_callback(wake_runner)
+            job.add_done_callback(report_result)
         if broker.wait():
             diagnostic.seek(0)
-            errors.append(diagnostic.read().decode(errors="replace").strip() or "task copy channel disconnected")
+            error = diagnostic.read().decode(errors="replace").strip() or "task copy channel disconnected"
+            print(f"oncolab: {error}", file=sys.stderr, flush=True)
+            errors.append(error)
             for job in jobs:
                 job.cancel()
         for job in jobs:
@@ -444,8 +452,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     # The payload has exited; no remote teardown can still be waiting on this broker.
                     close_master()
                     transfer_errors = task_upload.result()
-                for error in transfer_errors:
-                    print(f"oncolab: {error}", file=sys.stderr)
+                if transfer_errors:
                     status = status or 1
             return status, False
         finally:

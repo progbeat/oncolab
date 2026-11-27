@@ -214,6 +214,37 @@ class Transfers(unittest.TestCase):
         ):
             self.assertEqual(cli.upload_tasks([], "the-peer", "/job", groups, "/forwarded"), [])
 
+    def test_late_stream_failure_is_reported_before_the_broker_exits(self):
+        reported = Event()
+
+        def lines():
+            yield "stream\n"
+            if not reported.wait(2):
+                raise AssertionError("stream failure must be printed while SSH can still be active")
+
+        class Broker:
+            stdout = lines()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def wait(self):
+                return 0
+
+        def printing(message, **_):
+            self.assertEqual(message, "oncolab: test stream failure")
+            reported.set()
+
+        with (patch.object(cli.sp, "Popen", return_value=Broker()),
+              patch.object(cli, "upload_stream", return_value=("test stream failure", True)),
+              patch("oncolab.cli.print", side_effect=printing, create=True) as output):
+            self.assertEqual(cli.upload_tasks([], "peer", "/job", {"stream": ((), Path("input"))},
+                                              "/forwarded"), ["test stream failure"])
+        output.assert_called_once()
+
     def test_streamlocal_upload_framing_with_socketpair(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "stdin"

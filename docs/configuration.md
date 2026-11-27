@@ -117,7 +117,10 @@ are relative to the profile; relative VM targets use `workdir`. Use
 `--copy` instead if the destination is the working directory itself or one
 of its parents. A task can only copy, or copy before its `run` or `start`. The special target `-`
 feeds one file into that task's stdin instead of copying to its destination
-filesystem. It does not consume the main command's input.
+filesystem. It does not consume the main command's input. A ready service
+can keep receiving its input after the main command starts; it may need the
+main command to connect before consuming the rest. Late failures are reported
+without interrupting the command or its cleanup.
 
 An optional `teardown` runs for a task that began execution, even if its
 setup stopped partway through. It runs before releasing direct or transitive
