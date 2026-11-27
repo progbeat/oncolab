@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shlex
+import socket
 import subprocess as sp
 import sys
 import termios
@@ -18,7 +19,7 @@ from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
 from .config import credentials, plan
-from .copy import COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
+from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
 from .progress import progress, run_step
 
@@ -140,11 +141,11 @@ for directory, entries in json.load(sys.stdin).items():
 """
 
 
-def upload(ssh, target, result, sources=(), targets=(), modes=None, *, input_source=None):
+def upload(ssh, target, result, sources=(), targets=(), modes=None):
     helper = files("oncolab").joinpath("copy.py").read_text()
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
-    args = ["--stdin"] if input_source is not None else [json.dumps(targets)]
-    if input_source is None and modes is not None:
+    args = [json.dumps(targets)]
+    if modes is not None:
         args.append(json.dumps(modes))
     command = shlex.join(["python3", "-c", helper, result, *args])
     try:
@@ -153,10 +154,7 @@ def upload(ssh, target, result, sources=(), targets=(), modes=None, *, input_sou
         ) as process:
             try:
                 with process.stdin:
-                    if input_source is None:
-                        send_archive(process.stdin, sources)
-                    else:
-                        send_input(process.stdin, input_source)
+                    send_archive(process.stdin, sources)
             except (OSError, ValueError) as exc:
                 local_error = exc
             else:
@@ -166,13 +164,11 @@ def upload(ssh, target, result, sources=(), targets=(), modes=None, *, input_sou
             detail = diagnostic.read().decode(errors="replace").strip()
         if not status and not local_error:
             return None, True
-        if status == INPUT_CLOSED and (local_error is None or isinstance(local_error, BrokenPipeError)):
-            return None, True
         # A closed pipe is usually a symptom of the receiver's error.
         if isinstance(local_error, BrokenPipeError) and detail:
             local_error = None
         error = (str(local_error) if local_error is not None else detail) or f"copy channel exited with status {status}"
-        if status in (0, COPY_FAILED, INPUT_CLOSED):
+        if status in (0, COPY_FAILED):
             return error, True
     except OSError as exc:
         error = str(exc)
@@ -203,53 +199,52 @@ def call_with_upload(argv, transfer):
             process.wait()
 
 
-REQUESTS = r"""import os, sys, time
-from pathlib import Path
-
-jobdir = Path(sys.argv[1])
-pending = set(sys.argv[2:])
-active = set()
-try:
-    (jobdir / "broker-pid").write_text(f"{os.getpid()}\n")
-except FileNotFoundError:
-    sys.exit(0)
-heartbeat = time.monotonic()
-while (pending or active) and jobdir.is_dir():
-    for name in sorted(pending):
-        if (jobdir / name / "requested").is_file():
-            print(name, flush=True)
-            pending.remove(name)
-            active.add(name)
-    for name in sorted(active):
-        try:
-            result = (jobdir / name / "copy-result").read_text()
-        except FileNotFoundError:
-            continue
-        if result in ("ok", "failed", "short"):
-            active.remove(name)
-    if pending or active:
-        if time.monotonic() - heartbeat >= .5:
-            print(".", flush=True)
-            heartbeat = time.monotonic()
-        time.sleep(.05)
-"""
+def upload_stream(endpoint, key, source):
+    # Unlike an SSH exec channel, each streamlocal forward is not counted
+    # against MaxSessions. Keep data off the control channel and payload stdin.
+    local_error = None
+    try:
+        with socket.socket(socket.AF_UNIX) as link:
+            link.connect(str(endpoint))
+            link.sendall(key.encode("ascii") + b"\n")
+            try:
+                with link.makefile("wb") as stream:
+                    send_input(stream, source)
+            except (OSError, ValueError) as exc:
+                local_error = exc
+            try:
+                link.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            reply = link.recv(1)
+    except OSError as exc:
+        return f"could not open task stdin for {source.name}: {exc}", False
+    status = reply[0] if reply else None
+    if status == 0 and local_error is None:
+        return None, True
+    if status == INPUT_CLOSED and (local_error is None or isinstance(local_error, BrokenPipeError)):
+        return None, True
+    notified = status in (0, COPY_FAILED, INPUT_CLOSED)
+    detail = str(local_error) if local_error else ("stream interrupted" if notified else "connection lost")
+    return f"could not stream {source.name} to task stdin: {detail}", notified
 
 
-def upload_tasks(ssh, target, jobdir, groups):
+def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
-    command = shlex.join(["python3", "-c", REQUESTS, jobdir, *groups])
+    helper = files("oncolab").joinpath("copy.py").read_text()
+    types = {key: source is not None for key, (_, source) in groups.items()}
+    command = shlex.join(["python3", "-c", helper, "--broker", jobdir, json.dumps(types)])
     jobs, errors = [], []
-    # Long-lived service input can backpressure indefinitely. Keep archive
-    # capacity available, while staying below the default SSH MaxSessions
-    # limit even with the broker, payload, and a legacy copy in flight.
     with (
-        ThreadPoolExecutor(max_workers=2) as archives,
-        ThreadPoolExecutor(max_workers=4) as streams,
+        ThreadPoolExecutor(max_workers=ARCHIVE_WORKERS) as archives,
+        ThreadPoolExecutor(max_workers=max(1, sum(types.values()))) as streams,
         TemporaryFile() as diagnostic,
         sp.Popen([*channel, command], stdin=sp.DEVNULL, stdout=sp.PIPE,
                  stderr=diagnostic, text=True) as broker,
     ):
         def wake_runner(job):
+            if job.cancelled():
+                return
             if job.exception() is not None or not job.result()[1]:
                 # Dropping only the broker wakes the remote copy waiters;
                 # leave the command SSH channel alive for resource teardown.
@@ -261,16 +256,21 @@ def upload_tasks(ssh, target, jobdir, groups):
             if key not in groups:
                 continue
             entries, input_source = groups.pop(key)
-            sources, targets, modes = zip(*entries) if entries else ((), (), ())
-            workers = streams if input_source is not None else archives
-            job = workers.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result",
-                                 sources, targets, modes, input_source=input_source)
+            if input_source is None:
+                sources, targets, modes = zip(*entries)
+                job = archives.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result", sources, targets, modes)
+            else:
+                job = streams.submit(upload_stream, endpoint, key, input_source)
             jobs.append(job)
             job.add_done_callback(wake_runner)
         if broker.wait():
             diagnostic.seek(0)
             errors.append(diagnostic.read().decode(errors="replace").strip() or "task copy channel disconnected")
+            for job in jobs:
+                job.cancel()
         for job in jobs:
+            if job.cancelled():
+                continue
             error, _ = job.result()
             if error:
                 errors.append(error)
@@ -364,10 +364,13 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
                            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                            "-o", "ProxyCommand=" + shlex.join(proxy), *trust]
-        if ports:
+        endpoint = f"{tmp}/stdin.sock" if any(source is not None for _, source in groups.values()) else None
+        if ports or endpoint:
             connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
-            for local, remote_port in ports:
-                connect_options.extend(("-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}"))
+        if endpoint:
+            connect_options.extend(("-L", f"{endpoint}:{jobdir}/stdin.sock"))
+        for local, remote_port in ports:
+            connect_options.extend(("-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}"))
         terminal_connect = False
         if terminal and public:
             keys = sp.run(["ssh-add", "-L"], capture_output=True).stdout.splitlines()
@@ -389,7 +392,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
             attempted.set()
             transfer = transfers.submit(upload, ssh, target, result, sources, targets) if sources else None
-            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups) if groups else None
+            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint) if groups else None
             argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):

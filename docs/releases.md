@@ -20,11 +20,11 @@ against current `master` and wait for a fresh `release-policy` check. Require th
 up-to-date check in branch protection if more than one maintainer merges releases.
 After merge, the same workflow publishes only after both supported Python
 versions pass CI and both release distributions pass fresh installation
-smoke tests. It
-creates the new version tag at the tested commit and attaches the wheel,
+smoke tests. It creates the new version tag at the tested commit and attaches the wheel,
 source distribution and SHA-256 checksums to a draft before publishing.
-After verifying that release is immutable, a separate job downloads and
-verifies the published files, then uploads the same wheel and source
+After verifying that release is immutable, a separate job downloads the
+published files and checks the manifest against the digest from the
+successful release job. It then verifies and uploads the same wheel and source
 distribution to PyPI. No manual tag, manual upload, or stored PyPI token is
 needed.
 
@@ -57,8 +57,10 @@ add the publisher under that project's **Publishing** settings instead.
 
 The first successful upload creates the project; a pending publisher does not
 reserve the name. If PyPI upload fails after GitHub publication, fix the cause
-and rerun the failed job on the original workflow run. It uses the already
-published GitHub assets and skips identical files already present on PyPI.
-If an existing file has a different digest, investigate rather than trying to
-replace it. After the first upload, use `uv tool run --no-cache --from
+and rerun only the failed job on the original workflow run, retaining the
+successful release job's manifest digest. The retry uses the already published
+GitHub assets and skips identical files already present on PyPI. If the digest
+is missing or an artifact does not match, publication fails; investigate
+rather than replacing an existing file or moving a tag. After the first upload,
+use `uv tool run --no-cache --from
 "oncolab==<version>" oncolab --version` to check a fresh installation from PyPI.

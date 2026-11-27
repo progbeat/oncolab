@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      manifest_sha256: ${{ steps.distributions.outputs.manifest_sha256 }}
     concurrency:
       group: oncolab-release-${{ needs.release-policy.outputs.version }}
       cancel-in-progress: false
@@ -51,6 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv build --no-sources
       - name: Smoke-test both release distributions and prepare checksums
+        id: distributions
         env:
           VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
@@ -62,6 +65,8 @@ jobs:
           done
           cd dist
           sha256sum -- "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz" > sha256.sum
+          manifest=$(sha256sum -- sha256.sum)
+          printf 'manifest_sha256=%s\n' "${manifest%% *}" >> "$GITHUB_OUTPUT"
       - name: Publish this tested version
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,7 +98,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.release-policy.outputs.version }}
-        run: bash scripts/verify_pypi_release.sh "$VERSION"
+          MANIFEST_SHA256: ${{ needs.release.outputs.manifest_sha256 }}
+        run: bash scripts/verify_pypi_release.sh "$VERSION" "$MANIFEST_SHA256"
       - name: Publish distributions to PyPI
         env:
           VERSION: ${{ needs.release-policy.outputs.version }}

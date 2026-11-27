@@ -113,7 +113,7 @@ def publish(source, target, directory_modes, mode=None):
                 raise
 
 
-def receive_archive(stream, targets, modes=None):
+def receive_archive(stream, targets, modes=None, *, cancelled=None):
     with tempfile.TemporaryDirectory(prefix="oncolab-copy-") as staging:
         root = Path(staging)
         names = {str(i) for i in range(len(targets))}
@@ -140,6 +140,8 @@ def receive_archive(stream, targets, modes=None):
             pass
         if not complete or not all(PurePosixPath(str(i)) in seen for i in range(len(targets))):
             raise ValueError("Incomplete copy stream")
+        if cancelled and (cancelled.is_file() or not cancelled.parent.is_dir()):
+            raise ValueError("Copy cancelled before writing its destinations")
         paths = [Path(target) for target in targets]
         for target in paths:
             if target.resolve() != target or target.exists():
@@ -158,6 +160,7 @@ def receive_archive(stream, targets, modes=None):
 
 COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.
 INPUT_CLOSED = 43  # The consumer exited or closed stdin without reading to EOF.
+ARCHIVE_WORKERS = 2
 
 
 def publish_result(result, status):
@@ -182,17 +185,26 @@ def notify_failure(result):
 
 
 def copy_receiver(result, targets, modes=None):
-    Path(result).with_name("copy-pid").write_text(f"{os.getpid()}\n")
-    status = "failed"
+    result = Path(result)
     try:
-        if modes is None:
-            receive_archive(sys.stdin.buffer, targets)
-        else:
-            receive_archive(sys.stdin.buffer, targets, modes)
+        result.with_name("copy-pid").write_text(f"{os.getpid()}\n")
+    except FileNotFoundError:
+        return COPY_FAILED
+    status = "failed"
+    cancelled = result.with_name("cancelled")
+    try:
+        if cancelled.is_file():
+            raise ValueError("Copy cancelled before its receiver started")
+        receive_archive(sys.stdin.buffer, targets, modes, cancelled=cancelled)
         status = "ok"
     except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print(exc, file=sys.stderr)
-    publish_result(result, status)
+    try:
+        publish_result(result, status)
+    except FileNotFoundError:
+        if result.parent.is_dir():
+            raise
+        return COPY_FAILED
     return COPY_FAILED if status == "failed" else 0
 
 
@@ -210,7 +222,7 @@ def send_input(stream, source):
     stream.write(b"\0" * 4)
 
 
-def input_receiver(result):
+def input_receiver(result, stdin=None, stopping=None):
     result = Path(result)
     try:
         result.with_name("copy-pid").write_text(f"{os.getpid()}\n")
@@ -219,11 +231,11 @@ def input_receiver(result):
     cancelled = result.with_name("cancelled")
     fifo = result.with_name("stdin")
     status = "failed"
-    stdin = sys.stdin.fileno()
+    stdin = sys.stdin.fileno() if stdin is None else stdin
     writer = None
 
     def check_cancelled():
-        if cancelled.exists() or not result.parent.is_dir():
+        if (stopping and stopping.is_set()) or cancelled.exists() or not result.parent.is_dir():
             raise BrokenPipeError("Task stopped before its stdin stream completed")
 
     def read_exact(count):
@@ -276,10 +288,114 @@ def input_receiver(result):
     return {"failed": COPY_FAILED, "short": INPUT_CLOSED, "ok": 0}[status]
 
 
+def transfer_broker(jobdir, groups):
+    """Admit archive transfers and provision the private streaming endpoint."""
+    import socket
+    import socketserver
+    import threading
+    import time
+
+    jobdir = Path(jobdir)
+    stream_keys = {name for name, is_stream in groups.items() if is_stream}
+    claimed = set()
+    lock = threading.Lock()
+    stopping = threading.Event()
+    server = None
+    listener = None
+    endpoint = jobdir / "stdin.sock"
+
+    class StreamServer(socketserver.ThreadingUnixStreamServer):
+        request_queue_size = max(socket.SOMAXCONN, len(stream_keys))
+
+    class Stream(socketserver.BaseRequestHandler):
+        def handle(self):
+            try:
+                self.request.settimeout(5)
+                key = bytearray()
+                for _ in range(64):
+                    next_byte = self.request.recv(1)
+                    if next_byte == b"\n":
+                        break
+                    if not next_byte:
+                        return
+                    key.extend(next_byte)
+                else:
+                    return
+                name = key.decode("ascii")
+                with lock:
+                    if name not in stream_keys or name in claimed:
+                        return
+                    directory = jobdir / name
+                    if not (directory / "admitted").is_file():
+                        return
+                    claimed.add(name)
+                self.request.settimeout(None)
+                code = input_receiver(directory / "copy-result", self.request.fileno(), stopping)
+                self.request.sendall(bytes((code,)))
+            except (OSError, ValueError):
+                return
+
+    try:
+        if stream_keys:
+            server = StreamServer(str(endpoint), Stream)
+            endpoint.chmod(0o600)
+            listener = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .05}, daemon=True)
+            listener.start()
+        heartbeat = jobdir / "broker-heartbeat"
+        heartbeat.touch()
+        (jobdir / "broker-pid").write_text(f"{os.getpid()}\n")
+        pending, active = set(groups), set()
+        last_beat = time.monotonic()
+        while (pending or active) and jobdir.is_dir():
+            for name in tuple(active):
+                directory = jobdir / name
+                if (directory / "cancelled").is_file():
+                    active.remove(name)
+                    continue
+                try:
+                    result = (directory / "copy-result").read_text()
+                except FileNotFoundError:
+                    continue
+                if result in ("ok", "failed", "short"):
+                    active.remove(name)
+            archives = sum(name not in stream_keys for name in active)
+            for name in sorted(pending):
+                is_stream = name in stream_keys
+                if (not is_stream and archives >= ARCHIVE_WORKERS):
+                    continue
+                directory = jobdir / name
+                if not (directory / "requested").is_file():
+                    continue
+                if not (directory / "cancelled").is_file():
+                    (directory / "admitted").touch()
+                    print(name, flush=True)
+                    active.add(name)
+                    archives += not is_stream
+                pending.remove(name)
+            if pending or active:
+                if time.monotonic() - last_beat >= .5:
+                    heartbeat.touch()
+                    print(".", flush=True)
+                    last_beat = time.monotonic()
+                time.sleep(.05)
+    except FileNotFoundError:
+        if jobdir.is_dir():
+            raise
+    finally:
+        stopping.set()
+        if server is not None:
+            if listener is not None and listener.is_alive():
+                server.shutdown()
+            server.server_close()
+            endpoint.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     import json
 
-    if sys.argv[2] == "--failed":
+    if sys.argv[1] == "--broker":
+        transfer_broker(sys.argv[2], json.loads(sys.argv[3]))
+    elif sys.argv[2] == "--failed":
         notify_failure(sys.argv[1])
     elif sys.argv[2] == "--stdin":
         raise SystemExit(input_receiver(sys.argv[1]))

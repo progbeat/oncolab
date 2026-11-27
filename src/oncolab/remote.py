@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess as sp
 import sys
+import time
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
@@ -156,6 +157,7 @@ async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
     pid_path = path.with_name("copy-pid")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + start_timeout
+    admission_deadline = None
 
     def read(path):
         try:
@@ -176,15 +178,34 @@ async def wait_copy(result, *, start_timeout=30, broker=None, input_pipe=None):
         pid_text = read(pid_path)
         try:
             broker_text = read(broker) if broker else ""
-            if broker_text.endswith("\n"):
+            broker_alive = broker_text.endswith("\n")
+            if broker_alive:
                 os.kill(int(broker_text), 0)
+                heartbeat = Path(broker).with_name("broker-heartbeat")
+                try:
+                    if time.time() - heartbeat.stat().st_mtime > max(5, start_timeout):
+                        raise ProcessLookupError
+                except FileNotFoundError:
+                    # Startup writes the heartbeat before publishing the PID.
+                    if loop.time() >= deadline:
+                        raise ProcessLookupError
             if pid_text.endswith("\n"):
                 os.kill(int(pid_text), 0)
-            elif loop.time() >= deadline:
+            elif broker_alive and path.with_name("admitted").exists():
+                if admission_deadline is None:
+                    admission_deadline = loop.time() + start_timeout
+                elif loop.time() >= admission_deadline:
+                    raise ProcessLookupError
+            elif not broker_alive and loop.time() >= deadline:
                 raise ProcessLookupError
         except ProcessLookupError:
             if read(path) in statuses:
                 continue  # Receiver may have published just before exiting.
+            if broker:
+                try:
+                    path.with_name("cancelled").touch()
+                except FileNotFoundError:
+                    pass
             return sp.CompletedProcess([], 1, None, b"oncolab: copy receiver exited or did not start\n")
         await asyncio.sleep(.10)
 

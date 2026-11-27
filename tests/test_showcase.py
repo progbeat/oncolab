@@ -1,12 +1,13 @@
 import asyncio
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from signal import SIGINT
-from threading import Event
+from threading import Event, Thread
 from unittest.mock import Mock, patch
 
 from oncolab import cli, remote
@@ -80,11 +81,11 @@ run = ["echo", ""]
 
 
 class Transfers(unittest.TestCase):
-    def test_four_blocked_input_streams_do_not_starve_an_archive(self):
-        groups = {f"stream-{i}": ((), Path(f"source-{i}")) for i in range(4)}
+    def test_five_blocked_input_streams_all_start_without_starving_an_archive(self):
+        groups = {f"stream-{i}": ((), Path(f"source-{i}")) for i in range(5)}
         groups["archive"] = ([(Path("data.txt"), "/content/data.txt", None)], None)
         archived = Event()
-        blockers = [Event() for _ in range(4)]
+        blockers = [Event() for _ in range(5)]
 
         class Broker:
             stdout = iter(tuple(f"{name}\n" for name in groups))
@@ -98,17 +99,63 @@ class Transfers(unittest.TestCase):
             def wait(self):
                 return 0
 
-        def transfer(_ssh, _target, _result, _sources, _targets, _modes, *, input_source):
-            if input_source is None:
-                if not all(started.wait(1) for started in blockers):
-                    return "input streams did not start", True
-                archived.set()
-                return None, True
-            blockers[int(input_source.name[-1])].set()
+        def archive(*_):
+            if not all(started.wait(1) for started in blockers):
+                return "input streams did not start", True
+            archived.set()
+            return None, True
+
+        def stream(_endpoint, _key, source):
+            blockers[int(source.name[-1])].set()
             return (None if archived.wait(2) else "archive starved by stdin streams"), True
 
-        with patch.object(cli.sp, "Popen", return_value=Broker()), patch.object(cli, "upload", transfer):
-            self.assertEqual(cli.upload_tasks([], "the-peer", "/job", groups), [])
+        with (
+            patch.object(cli.sp, "Popen", return_value=Broker()),
+            patch.object(cli, "upload", archive),
+            patch.object(cli, "upload_stream", stream),
+        ):
+            self.assertEqual(cli.upload_tasks([], "the-peer", "/job", groups, "/forwarded"), [])
+
+    def test_streamlocal_upload_framing_with_socketpair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "stdin"
+            payload = b"input\0\n" * 10000
+            source.write_bytes(payload)
+            local, remote_sock = socket.socketpair()
+            local.settimeout(5)
+            remote_sock.settimeout(5)
+            received = []
+
+            class Endpoint:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    local.close()
+
+                def connect(self, destination):
+                    self.destination = destination
+
+                def __getattr__(self, name):
+                    return getattr(local, name)
+
+            def server():
+                with remote_sock, remote_sock.makefile("rb") as stream:
+                    received.append(stream.readline())
+                    while size := int.from_bytes(stream.read(4), "big"):
+                        received.append(stream.read(size))
+                    remote_sock.sendall(b"\0")
+
+            worker = Thread(target=server)
+            worker.start()
+            try:
+                with patch.object(cli.socket, "socket", return_value=Endpoint()):
+                    self.assertEqual(cli.upload_stream("/forwarded", "task-4-input", source), (None, True))
+            finally:
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(received[0], b"task-4-input\n")
+            self.assertEqual(b"".join(received[1:]), payload)
 
 
 async def run(_, command):
@@ -368,12 +415,14 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
                     broker=path / "broker-pid"), 1)
             self.assertEqual(result.returncode, 1)
 
-    async def test_broker_alive_does_not_remove_receiver_start_deadline(self):
+    async def test_admitted_copy_times_out_start_but_not_an_active_transfer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             broker, result = root / "broker-pid", root / "copy-result"
             pid = f"{os.getpid()}\n"
             broker.write_text(pid)
+            (root / "broker-heartbeat").touch()
+            result.with_name("admitted").touch()
             expired = await asyncio.wait_for(remote.wait_copy(result, broker=broker, start_timeout=.02), 1)
             self.assertEqual(expired.returncode, 1)
 
@@ -385,6 +434,49 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
             _, finished = await asyncio.wait_for(asyncio.gather(active_transfer(),
                 remote.wait_copy(result, broker=broker, start_timeout=.02)), 1)
             self.assertEqual(finished.returncode, 0)
+
+    async def test_live_broker_leaves_third_archive_queued_past_receiver_start_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dirs = [root / f"task-{i}" for i in range(3)]
+            for directory in dirs:
+                directory.mkdir()
+                (directory / "requested").touch()
+            broker = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import json,sys; from oncolab.copy import transfer_broker;"
+                "transfer_broker(sys.argv[1], json.loads(sys.argv[2]))", str(root),
+                json.dumps({d.name: False for d in dirs}), stdout=asyncio.subprocess.DEVNULL,
+            )
+
+            async def admitted(directory):
+                while not (directory / "admitted").exists():
+                    await asyncio.sleep(.005)
+
+            waiter = None
+            try:
+                await asyncio.wait_for(asyncio.gather(*(admitted(d) for d in dirs[:2])), 3)
+                last = dirs[2]
+                result = last / "copy-result"
+                waiter = asyncio.create_task(remote.wait_copy(result, broker=root / "broker-pid", start_timeout=.02))
+                await asyncio.sleep(.25)
+                self.assertFalse((last / "admitted").exists())
+                self.assertFalse(waiter.done(), "queued copy expired before an archive slot was free")
+                (dirs[0] / "copy-result").write_text("ok")
+                await asyncio.wait_for(admitted(last), 3)
+                (last / "copy-pid").write_text(f"{os.getpid()}\n")
+                await asyncio.sleep(.25)
+                self.assertFalse(waiter.done(), "active copy incorrectly hit the startup deadline")
+                result.write_text("ok")
+                self.assertEqual((await asyncio.wait_for(waiter, 1)).returncode, 0)
+                (dirs[1] / "copy-result").write_text("ok")
+                self.assertEqual(await asyncio.wait_for(broker.wait(), 3), 0)
+            finally:
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                if broker.returncode is None:
+                    broker.kill()
+                    await broker.wait()
 
     async def test_ready_service_can_read_stdin_only_after_the_main_command_triggers_it(self):
         with tempfile.TemporaryDirectory() as tmp:

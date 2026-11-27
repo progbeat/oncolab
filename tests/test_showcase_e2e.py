@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,12 +17,17 @@ import sys
 args = sys.argv[1:]
 if "-O" in args:
     raise SystemExit(0)
-command = shlex.split(args[-1].replace("/dev/shm/oncolab-", os.environ["FAKE_RAM"] + "/oncolab-"))
+ram = os.environ["FAKE_RAM"] + "/oncolab-"
+command = shlex.split(args[-1].replace("/dev/shm/oncolab-", ram))
 if "-M" in args:
     assert "127.0.0.1:18080:127.0.0.1:8765" in args
+    for i, option in enumerate(args):
+        if option == "-L" and args[i+1].startswith("/"):
+            local, remote = args[i+1].split(":", 1)
+            os.symlink(remote.replace("/dev/shm/oncolab-", ram), local)
     # The bootstrap's private JSON also contains the remote directory paths.
     import subprocess
-    data = sys.stdin.buffer.read().replace(b"/dev/shm/oncolab-", os.fsencode(os.environ["FAKE_RAM"] + "/oncolab-"))
+    data = sys.stdin.buffer.read().replace(b"/dev/shm/oncolab-", os.fsencode(ram))
     raise SystemExit(subprocess.run([sys.executable, *command[1:]], input=data).returncode)
 if command[:4] == ["uv", "run", "--no-project", "python3"]:
     command = command[3:]
@@ -31,11 +37,23 @@ os.execv(sys.executable, [sys.executable, *command[1:]])
 
 
 class Showcase(unittest.TestCase):
+    def test_task_files_and_teardown_use_profile_env_with_cli_override(self):
+        self.run_case(streamed=False)
+
     def test_task_input_and_teardown_use_profile_env_without_consuming_main_stdin(self):
+        self.run_case(streamed=True)
+
+    def run_case(self, *, streamed):
         executable = shutil.which("oncolab")
         self.assertIsNotNone(executable)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="oc-e2e-", dir="/tmp") as directory:
             root = Path(directory).resolve()
+            if streamed:
+                with socket.socket(socket.AF_UNIX) as probe:
+                    try:
+                        probe.bind(str(root / "probe"))
+                    except PermissionError:
+                        self.skipTest("sandbox does not allow binding Unix sockets")
             work, fake_ram = root / "vm", root / "ram"
             fake_ram.mkdir()
             colab, ssh = root / "colab", root / "ssh"
@@ -47,6 +65,8 @@ class Showcase(unittest.TestCase):
             (root / "prepare.sh").write_text('test "$VALUE" = shared\nprintf setup > prepared\n')
             (root / "data.txt").write_text("copied")
             profile = root / "test.toml"
+            prepare = ('copy = "prepare.sh:-"\nrun = ["bash", "-e", "-o", "pipefail", "-s"]' if streamed
+                       else """run = 'test "$VALUE" = shared; printf setup > prepared'""")
             profile.write_text(f'''workdir = "{work}"
 ports = ["18080:8765"]
 [env]
@@ -57,8 +77,7 @@ copy = [{{ source = "data.txt", target = "data", chmod = 0o640 }}]
 run = 'test "$(cat prepared)" = setup'
 teardown = 'test "$VALUE" = shared; printf teardown > done'
 [setup.prepare]
-copy = "prepare.sh:-"
-run = ["bash", "-e", "-o", "pipefail", "-s"]
+{prepare}
 ''')
             env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "FAKE_RAM": str(fake_ram),
                    "XDG_CONFIG_HOME": str(root), "NO_COLOR": "1"}
