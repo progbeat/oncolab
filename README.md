@@ -1,6 +1,6 @@
 # oncolab
 
-[![CI: passing](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/progbeat/oncolab/actions/runs/45880383678)
+[![CI: passing](https://img.shields.io/github/actions/workflow/status/progbeat/oncolab/tests.yml?branch=main&event=push&label=CI)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
 [![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
 
@@ -16,19 +16,19 @@ install tools and mount Google Drive before the command starts.
 
 ## Quick start
 
-On macOS or Linux, you need [uv](https://docs.astral.sh/uv/), OpenSSH, a Colab
-account, and SSH access to this private GitHub repository.
+On macOS or Linux, you need [uv](https://docs.astral.sh/uv/), OpenSSH, and a
+Colab account.
 
 1. If you don't already have the official Colab CLI, install it:
    `uv tool install google-colab-cli`.
 2. If you're not signed in to Colab, run `colab sessions` and complete the Google
    sign-in. For the **Colab** connection you need a supported local SSH key, such
-   as `~/.ssh/id_ed25519` with its matching `.pub`. This is separate from GitHub
-   authentication. [SSH setup and key selection](docs/configuration.md#ssh).
+   as `~/.ssh/id_ed25519` with its matching `.pub`.
+   [SSH setup and key selection](docs/configuration.md#ssh).
 3. Install `oncolab` and run your first command:
 
    ```sh
-   uv tool install 'git+ssh://git@github.com/progbeat/oncolab.git@v0.1.0'
+   uv tool install 'git+https://github.com/progbeat/oncolab.git@v0.1.0'
    oncolab echo hello
    ```
 
