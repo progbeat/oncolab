@@ -543,8 +543,7 @@ async def setup_all(run, plan, drive, lifecycle=None):
             drive_tasks.append(name)
 
     for name, step in plan["setup"].items():
-        dependencies = [dep if dep.startswith("mounts.") else f"setup:{dep}"
-                        for dep in step["depends"]]
+        dependencies = [f"setup:{dep}" for dep in step["depends"]]
         if copy_supplies_workdir:
             dependencies.append("copy")
         key = f"setup:{name}"

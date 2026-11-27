@@ -108,8 +108,9 @@ copy = { source = "input.txt", target = "data/input.txt", chmod = 0o644 }
 
 Task-local `copy` accepts the same short path form as `--copy`, a table with
 `source`, optional `target` and optional `chmod`, or a list of these. Sources
-are relative to the profile; relative VM targets use `workdir`. A task can
-only copy, or copy before its `run` or `start`. The special target `-`
+are relative to the profile; relative VM targets use `workdir`. Use
+`--copy` instead if the destination is the working directory itself or one
+of its parents. A task can only copy, or copy before its `run` or `start`. The special target `-`
 feeds one file into that task's stdin instead of copying to its destination
 filesystem. It does not consume the main command's input.
 

@@ -223,10 +223,8 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
         raise ConfigError("workdir must be on the VM filesystem, outside Drive mounts")
     for name, step in setup.items():
         for dependency in step["depends"]:
-            if dependency not in setup and dependency not in mounts:
+            if dependency not in setup:
                 raise ConfigError(f"setup.{name}: unknown dependency {dependency!r}")
-            if any(step.get("mount") == dependency for step in setup.values()):
-                raise ConfigError(f"setup.{name}: refer to a setup mount by its task name, not {dependency!r}")
     try:
         order = graphlib.TopologicalSorter({name: step["depends"] for name, step in setup.items()}).static_order()
         setup = {name: setup[name] for name in order if name in setup}

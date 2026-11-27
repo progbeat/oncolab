@@ -283,9 +283,14 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                         marker.parent.mkdir()
                         marker.touch()
                         marker.with_name("copy-ok").write_text("ok")
-                        steps = {"pwd": {"description": "checking cwd", "argv": ["pwd"], "depends": []}}
+                        stages = []
+                        steps = {
+                            "copy": {"description": "named copy", "argv": ["true"], "depends": []},
+                            "pwd": {"description": "checking cwd", "argv": ["pwd"], "depends": ["copy"]},
+                        }
 
                         async def run(label, command):
+                            stages.append(label)
                             if label == "Copying files…":
                                 self.assertFalse(workdir.exists())
                                 pending = asyncio.create_task(wait_copy(marker))
@@ -295,7 +300,7 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                                 publish_result(marker, "ok")
                                 await pending
                                 return await command()
-                            if label == "checking cwd":
+                            if label in {"named copy", "checking cwd"}:
                                 self.assertEqual(Path.cwd(), workdir)
                                 return subprocess.CompletedProcess([], 0)
                             return await command()
@@ -304,5 +309,6 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                             "setup": steps, "copy_result": str(marker), "workdir": str(workdir),
                             "copy_supplies_workdir": True,
                         }, None), 2), 0)
+                        self.assertEqual(stages, ["Copying files…", "named copy", "checking cwd"])
             finally:
                 os.chdir(original)

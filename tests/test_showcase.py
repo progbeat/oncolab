@@ -91,6 +91,10 @@ run = ["echo", ""]
                              {"source": "Other Remote:path:more", "target": "/content/work", "read_only": True})
             self.assertEqual(config["mounts"]["mounts.cli-2"]["source"], "team+archive@org:Reports")
             self.assertEqual(config["mounts"]["mounts.cli-3"]["source"], "team@org:")
+            with profile.open("a") as config_file:
+                config_file.write('[setup.use]\nrun = ["true"]\nneeds = ["mounts.cli-1"]\n')
+            with self.assertRaisesRegex(ConfigError, "unknown dependency"):
+                plan(profile, cli_mounts=["source=Other:work,target=/content/work"])
 
 
 class Transfers(unittest.TestCase):
@@ -275,7 +279,8 @@ class ShowcaseRuntime(unittest.IsolatedAsyncioTestCase):
                 "import os,sys; from pathlib import Path;"
                 "first=sys.stdin.buffer.readline();"
                 "assert not Path(sys.argv[1]).exists();"
-                "Path(sys.argv[2]).write_bytes(first);"
+                "seen=Path(sys.argv[2]); pending=seen.with_suffix('.tmp');"
+                "pending.write_bytes(first); pending.replace(seen);"
                 "Path(sys.argv[3]).write_bytes(first+sys.stdin.buffer.read());"
                 "assert os.environ['SHOWCASE'] == 'shared'"
             ), str(stdin / "stdin"), str(first_seen), str(root / "out")]
