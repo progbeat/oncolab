@@ -166,10 +166,17 @@ resolved beside the TOML profile. All mounts in the session share a single
 config. There is no default rclone config lookup or section filtering.
 VFS cache settings use rclone defaults.
 
-If you're upgrading a profile with `[mounts.<name>]`, move each mount to
-`[setup.<name>].mount`, use `readonly` instead of `read_only`, and refer to
-its task by name in `needs`. Review the dedicated config before selecting
-it: the previous version sent only the selected sections.
+If you're upgrading a profile with `[mounts.<name>]`:
+
+1. Move each mount to a `mount` entry under `[setup.<name>]`. Rename
+   `read_only` to `readonly` and refer to the task by name in `needs`.
+2. Remove `[rclone].allow_full_drive` and any per-mount `config` overrides.
+   Create one dedicated rclone config containing only the named remotes
+   needed for this session, and set `[rclone].config` explicitly.
+3. Review the selected file and its OAuth scopes before running. The previous
+   version transferred only selected sections and rejected full-scope Drive
+   credentials unless you opted in. The new version sends the entire
+   selected file without that scope check; `readonly` is not an OAuth scope.
 
 ### Local access to VM ports
 
