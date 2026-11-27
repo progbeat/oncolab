@@ -74,8 +74,9 @@ def drive_environment(profile):
     env = {key: value for key, value in profile.items()
            if not (key == "RCLONE_RC" or key.startswith("RCLONE_RC_") or key in client_options)}
     managed = f"{env.get('HOME', str(Path.home()))}/.local/bin"
-    paths = env.get("PATH", os.defpath).split(os.pathsep)
-    env["PATH"] = os.pathsep.join([managed, *(path for path in paths if path != managed)])
+    paths = [managed, *env.get("PATH", "").split(os.pathsep),
+             *os.environ.get("PATH", os.defpath).split(os.pathsep)]
+    env["PATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))
     return env
 
 

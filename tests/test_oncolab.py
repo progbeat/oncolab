@@ -150,12 +150,13 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
                     await cmd()
                 return None
             lifecycle = remote.Lifecycle()
-            lifecycle.environment = {"HOME": "/profile/home", "PATH": "/usr/bin:/bin", "MODE": "shared",
+            lifecycle.environment = {"HOME": "/profile/home", "PATH": "/profile/bin", "MODE": "shared",
                                      "RCLONE_RC_BASEURL": "/alt", "RCLONE_LOOPBACK": "true",
                                      "RCLONE_URL": "https://example.invalid/", "RCLONE_DRIVE_SCOPE": "drive.readonly"}
-            expected = {"HOME": "/profile/home", "PATH": "/profile/home/.local/bin:/usr/bin:/bin",
+            expected = {"HOME": "/profile/home", "PATH": "/profile/home/.local/bin:/profile/bin:/usr/bin:/bin",
                         "MODE": "shared", "RCLONE_DRIVE_SCOPE": "drive.readonly"}
-            with patch.object(remote, "command_result", new_callable=AsyncMock) as install:
+            with (patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}),
+                  patch.object(remote, "command_result", new_callable=AsyncMock) as install):
                 install.return_value = subprocess.CompletedProcess([], 0)
                 status = await remote.setup_all(run, {"mounts": mounts, "setup": {}}, drive, lifecycle)
             self.assertEqual(status, 0)
@@ -164,7 +165,7 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
             for call in install.await_args_list:
                 self.assertIs(call.args[1], drive.environment)
             self.assertEqual(drive.environment, expected)
-            self.assertEqual(lifecycle.environment["PATH"], "/usr/bin:/bin")
+            self.assertEqual(lifecycle.environment["PATH"], "/profile/bin")
             self.assertEqual(lifecycle.environment["RCLONE_RC_BASEURL"], "/alt")
             sent = {call.kwargs["fs"]: call.kwargs["vfsOpt"]["ReadOnly"] for call in drive.rc.await_args_list if call.args == ("mount/mount",)}
             self.assertEqual(sent, {"demo:work": False, "demo:ref": True})
