@@ -11,6 +11,7 @@ from concurrent.futures import Future
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from oncolab.cli import call_with_upload, upload
@@ -48,6 +49,26 @@ class Copy(unittest.TestCase):
             escaped = str(literal).replace(":", r"\:")
             self.assertEqual(copy_plan([escaped, f"{escaped}:other:file"], "/content", []),
                              [(literal, "/content/train:today"), (literal, "/content/other:file")])
+
+    def test_copy_preserves_literal_backslashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            literal, decoded = root / r"two\\slashes", root / r"two\slashes"
+            literal.touch()
+            self.assertEqual(copy_plan([str(literal)], "/content", [])[0][0], literal)
+            decoded.touch()
+            with self.assertRaisesRegex(ValueError, "Ambiguous"):
+                copy_plan([str(literal)], "/content", [])
+            doubled = str(literal).replace("\\", "\\\\")
+            self.assertEqual(copy_plan([doubled], "/content", [])[0][0], literal)
+
+    def test_copy_accepts_two_long_but_valid_path_components(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve() / ("a" * 130)
+            source.touch()
+            target = "b" * 130
+            self.assertEqual(copy_plan([f"{source}:{target}"], "/content", []),
+                             [(source, f"/content/{target}")])
 
     def test_round_trip_and_never_replaces_existing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,6 +177,14 @@ class Copy(unittest.TestCase):
             with self.assertRaises(ValueError):
                 send_archive(io.BytesIO(), [source])
             (source / "link").unlink()
+            socket = source / "socket"
+            socket.touch()
+            lstat = os.lstat
+            with patch("os.lstat", side_effect=lambda path, *a, **kw:
+                       SimpleNamespace(st_mode=stat.S_IFSOCK) if Path(path) == socket else lstat(path, *a, **kw)):
+                with self.assertRaisesRegex(ValueError, "special files"):
+                    send_archive(io.BytesIO(), [source])
+            socket.unlink()
             stream = io.BytesIO()
             send_archive(stream, [source])
             target = root / "target"

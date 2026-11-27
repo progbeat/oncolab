@@ -14,19 +14,33 @@ def split_copy_spec(spec):
     while i < len(spec):
         char = spec[i]
         if char == ":":
-            return "".join(local), spec[i + 1:]
+            return "".join(local), spec[:i], spec[i + 1:]
         if char == "\\" and spec[i + 1:i + 2] in (":", "\\"):
             i += 1
         local.append(spec[i])
         i += 1
-    return "".join(local), None
+    return "".join(local), spec, None
+
+
+def literal_exists(path):
+    try:
+        return Path(path).expanduser().exists()
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        # LOCAL:REMOTE can be too long as one component but valid separately.
+        return False
 
 
 def copy_plan(specs, workdir, mounts):
     sources, targets = [], []
     for spec in specs:
-        local, remote = split_copy_spec(spec)
-        if remote is not None and spec == f"{local}:{remote}" and Path(spec).expanduser().exists():
+        local, raw_local, remote = split_copy_spec(spec)
+        if raw_local != local and literal_exists(raw_local):
+            if literal_exists(local):
+                raise ValueError(r"Ambiguous --copy path: escape each literal backslash as \\")
+            local = raw_local
+        if remote is not None and literal_exists(spec):
             raise ValueError(r"Ambiguous --copy path: escape literal local colons as \:")
         sep = remote is not None
         if not local or sep and not remote:
@@ -57,16 +71,19 @@ def regular(member):
 
 
 class CopyTar(tarfile.TarFile):
-    def gettarinfo(self, *args, **kwargs):
+    def gettarinfo(self, name=None, arcname=None, fileobj=None):
         # Treat each directory entry as a separate file without dereferencing symlinks.
         self.inodes.clear()
-        return super().gettarinfo(*args, **kwargs)
+        member = super().gettarinfo(name, arcname, fileobj)
+        if member is None:  # tarfile would silently skip sockets.
+            raise ValueError(f"--copy does not transfer special files: {name}")
+        return regular(member)
 
 
 def send_archive(stream, sources):
     with CopyTar.open(fileobj=stream, mode="w|") as archive:
         for i, source in enumerate(sources):
-            archive.add(source, arcname=str(i), filter=regular)
+            archive.add(source, arcname=str(i))
         # Distinguish a complete archive from a stream truncated between members.
         archive.addfile(tarfile.TarInfo("complete"))
 
