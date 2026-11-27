@@ -54,12 +54,12 @@ def send_archive(stream, sources):
         archive.addfile(tarfile.TarInfo("complete"))
 
 
-def publish(source, target):
+def publish(source, target, directory_modes):
     if source.is_dir():
         target.mkdir(mode=0o700)
         for entry in source.iterdir():
-            publish(entry, target / entry.name)
-        shutil.copystat(source, target)
+            publish(entry, target / entry.name, directory_modes)
+        target.chmod(directory_modes.get(source, 0o700))
     else:
         try:
             os.link(source, target)
@@ -82,6 +82,7 @@ def receive_archive(stream, targets):
         root = Path(staging)
         names = {str(i) for i in range(len(targets))}
         seen = set()
+        directory_modes = {}
         complete = False
         with tarfile.open(fileobj=stream, mode="r|") as archive:
             for member in archive:
@@ -94,6 +95,10 @@ def receive_archive(stream, targets):
                 if path in seen:
                     raise ValueError("Duplicate path in copy stream")
                 seen.add(path)
+                if member.isdir():
+                    # The data filter ignores directory modes during extraction.
+                    # Restore safe access only after all children are published.
+                    directory_modes[root / path] = (member.mode & 0o755) | 0o700
                 archive.extract(member, root, filter="data")
         while stream.read(1024 * 1024):
             pass
@@ -107,7 +112,7 @@ def receive_archive(stream, targets):
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.resolve() != target:
                 raise ValueError(f"--copy destination contains a symlink: {target}")
-            publish(root / str(i), target)
+            publish(root / str(i), target, directory_modes)
 
 
 COPY_FAILED = 42  # Receiver reported failure; distinct from SSH transport failure.
@@ -135,6 +140,7 @@ def notify_failure(result):
 
 
 def copy_receiver(result, targets):
+    Path(result).with_name("copy-pid").write_text(f"{os.getpid()}\n")
     status = "failed"
     try:
         receive_archive(sys.stdin.buffer, targets)

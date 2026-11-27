@@ -122,15 +122,33 @@ class DriveMounts:
         return True
 
 
-async def wait_copy(result):
+async def wait_copy(result, *, start_timeout=30):
     path = Path(result)
-    while True:
+    pid_path = path.with_name("copy-pid")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + start_timeout
+
+    def read(path):
         try:
-            status = path.read_text()
+            return path.read_text()
         except FileNotFoundError:
-            status = ""
+            return ""
+
+    while True:
+        status = read(path)
         if status in ("ok", "failed"):
             return sp.CompletedProcess([], int(status != "ok"), None, None)
+
+        pid_text = read(pid_path)
+        try:
+            if pid_text.endswith("\n"):
+                os.kill(int(pid_text), 0)
+            elif loop.time() >= deadline:
+                raise ProcessLookupError
+        except ProcessLookupError:
+            if read(path) in ("ok", "failed"):
+                continue  # Receiver may have published just before exiting.
+            return sp.CompletedProcess([], 1, None, b"oncolab: copy receiver exited or did not start\n")
         await asyncio.sleep(.10)
 
 

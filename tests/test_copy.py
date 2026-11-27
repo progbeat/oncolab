@@ -40,7 +40,10 @@ class Copy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             source = root / "source"
-            source.mkdir()
+            source.mkdir(mode=0o700)
+            nested = source / "nested"
+            nested.mkdir()
+            nested.chmod(0o751)
             (source / "a b").write_bytes(b"bytes")
             (source / ".hidden").write_bytes(b"hidden")
             os.link(source / "a b", source / "hardlink")
@@ -51,6 +54,8 @@ class Copy(unittest.TestCase):
             receive_archive(io.BytesIO(stream.getvalue()), [destination, file])
             self.assertEqual((destination / "a b").read_bytes(), b"bytes")
             self.assertEqual((destination / ".hidden").read_bytes(), b"hidden")
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((destination / "nested").stat().st_mode), 0o751)
             self.assertEqual(file.read_bytes(), b"hidden")
             self.assertEqual((destination / "hardlink").read_bytes(), b"bytes")
             self.assertNotEqual((destination / "a b").stat().st_ino, (destination / "hardlink").stat().st_ino)
@@ -74,15 +79,15 @@ class Copy(unittest.TestCase):
                  patch("oncolab.copy.shutil.copyfileobj", side_effect=copy):
                 fail = True
                 with self.assertRaises(OSError) as caught:
-                    publish(source, target)
+                    publish(source, target, {})
                 self.assertEqual(caught.exception.errno, errno.ENOSPC)
                 self.assertFalse(target.exists())
                 fail = False
-                publish(source, target)
+                publish(source, target, {})
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
                 self.assertEqual(target.read_text(), "content")
                 with self.assertRaises(FileExistsError):
-                    publish(source, target)
+                    publish(source, target, {})
                 self.assertEqual(target.read_text(), "content")
 
     def test_notification_replaces_empty_marker_without_writing_data(self):
@@ -164,6 +169,17 @@ class Copy(unittest.TestCase):
 
 
 class CopySetup(unittest.IsolatedAsyncioTestCase):
+    async def test_abandoned_receiver_fails_without_waiting_forever(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "copy-result"
+            marker.touch()
+            result = await wait_copy(marker, start_timeout=0)
+            self.assertEqual(result.returncode, 1)
+            marker.with_name("copy-pid").write_text("10000\n")
+            with patch("oncolab.remote.os.kill", side_effect=ProcessLookupError):
+                result = await wait_copy(marker)
+            self.assertEqual(result.returncode, 1)
+
     async def test_independent_setup_overlaps_copy_and_dependent_setup_waits(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "result"
