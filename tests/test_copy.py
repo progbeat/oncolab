@@ -36,6 +36,11 @@ class Copy(unittest.TestCase):
             ]:
                 with self.assertRaises(ValueError):
                     copy_plan(specs, "/content", mounts)
+            with patch.dict(os.environ, {"HOME": str(Path(tmp).resolve())}):
+                self.assertEqual(copy_plan(["~:home"], "/content", []),
+                                 [(Path(tmp).resolve(), "/content/home")])
+                with self.assertRaisesRegex(ValueError, "Cannot expand"):
+                    copy_plan(["~oncolab-no-such-test-account"], "/content", [])
             root_alias = Path(tmp).resolve().parents[-2] / ".."
             for path in (Path("/"), root_alias):
                 with self.assertRaisesRegex(ValueError, "filesystem root"):

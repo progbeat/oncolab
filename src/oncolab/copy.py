@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 def literal_exists(path):
     try:
-        Path(path).expanduser().lstat()
+        Path(os.path.expanduser(path)).lstat()
         return True
     except (FileNotFoundError, NotADirectoryError):
         return False
@@ -33,7 +33,10 @@ def copy_plan(specs, workdir, mounts, *, explicit=()):
     for local, remote in [*pairs, *explicit]:
         if not local or remote == "":
             raise ValueError("--copy expects LOCAL or LOCAL:REMOTE; --copy-to expects two paths")
-        source = Path(local).expanduser().absolute()
+        try:
+            source = Path(local).expanduser().absolute()
+        except RuntimeError:
+            raise ValueError(f"Cannot expand --copy home directory: {local}") from None
         if source.is_symlink() or not (source.is_file() or source.is_dir()):
             raise ValueError(f"--copy source must be a regular file or directory: {local}")
         source = source.resolve()
