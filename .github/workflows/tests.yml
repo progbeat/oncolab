@@ -1,8 +1,26 @@
 name: Tests
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 permissions:
   contents: read
 jobs:
+  release-policy:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.policy.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: policy
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/release_policy.py --base "$BASE"
+
   python:
     strategy:
       matrix:
@@ -10,7 +28,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run --locked python -m unittest discover -s tests -v
       - run: uv build
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-policy.outputs.version != ''
+    needs: [release-policy, python]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: oncolab-release-${{ needs.release-policy.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build --no-sources
+      - name: Verify the wheel and prepare checksums
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          wheel="$PWD/dist/oncolab-$VERSION-py3-none-any.whl"
+          export UV_TOOL_DIR="$RUNNER_TEMP/oncolab-tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/oncolab-bin"
+          uv tool install "$wheel"
+          test "$("$UV_TOOL_BIN_DIR/oncolab" --version)" = "oncolab $VERSION"
+          cd dist
+          sha256sum -- "oncolab-$VERSION-py3-none-any.whl" "oncolab-$VERSION.tar.gz" > sha256.sum
+      - name: Publish this tested version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: bash scripts/publish_release.sh "$VERSION"
