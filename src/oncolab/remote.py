@@ -160,19 +160,15 @@ async def setup_all(run, plan, drive):
             return 0
         tasks[name] = asyncio.create_task(execute())
 
-    if copy_result := plan.get("copy_result"):
+    copy_result = plan.get("copy_result")
+    copy_supplies_workdir = plan.get("copy_supplies_workdir", False)
+    if copy_result:
         async def copy():
-            return await wait_copy(copy_result)
+            result = await wait_copy(copy_result)
+            if copy_supplies_workdir and not result.returncode:
+                enter_workdir(plan)
+            return result
         submit("copy", "Copying files…", copy)
-    else:
-        copy_result = None
-
-    workdir_dependencies = ()
-    if plan.get("copy_supplies_workdir"):
-        async def prepare_workdir():
-            enter_workdir(plan)
-        submit("workdir", "Preparing working directory…", prepare_workdir, "copy")
-        workdir_dependencies = ("workdir",)
 
     drive_tasks = []
     bash = ["bash", "-eo", "pipefail", "-c"]
@@ -188,9 +184,12 @@ async def setup_all(run, plan, drive):
             drive_tasks.append(name)
 
     for name, step in plan["setup"].items():
+        dependencies = list(step["depends"])
+        if copy_supplies_workdir and "copy" not in dependencies:
+            dependencies.append("copy")
         submit(f"setup:{name}", step["description"], step["argv"],
-               *workdir_dependencies, *(dep if dep.startswith("mounts.") or (copy_result and dep == "copy")
-                 else f"setup:{dep}" for dep in step["depends"]))
+               *(dep if dep.startswith("mounts.") or (copy_result and dep == "copy")
+                 else f"setup:{dep}" for dep in dependencies))
 
     if drive:
         try:

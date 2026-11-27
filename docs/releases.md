@@ -15,6 +15,9 @@ examples, tests and CI-only changes keep the existing version.
    ```
 
 PR checks validate the version change and build the package without publishing.
+Merge one version bump at a time. Before merging another package PR, update it
+against current `main` and wait for a fresh `release-policy` check. Require that
+up-to-date check in branch protection if more than one maintainer merges releases.
 After merge, the same workflow publishes only after both supported Python
 versions pass CI and the built wheel passes an installation smoke test. It
 creates the new version tag at the tested commit and attaches the wheel,

@@ -142,7 +142,7 @@ class CLI(unittest.TestCase):
         with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, {}, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \
                 patch("sys.argv", ["oncolab", "--", "test", "spaces and $metacharacters"]):
-            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, sources):
+            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, copies):
                 self.assertEqual(command, ["test", "spaces and $metacharacters"])
                 attempted.set()
                 return 255, False

@@ -22,7 +22,8 @@ class Copy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "train with spaces.py"
             source.touch()
-            _, targets = copy_plan([str(source), f"{source}:other/"], "/content/workspace", [])
+            copies = copy_plan([str(source), f"{source}:other/"], "/content/workspace", [])
+            targets = [target for _, target in copies]
             self.assertEqual(targets, ["/content/workspace/train with spaces.py",
                                        "/content/workspace/other/train with spaces.py"])
             for specs, mounts in [
@@ -40,6 +41,7 @@ class Copy(unittest.TestCase):
             source.mkdir()
             (source / "a b").write_bytes(b"bytes")
             (source / ".hidden").write_bytes(b"hidden")
+            os.link(source / "a b", source / "hardlink")
             stream = io.BytesIO()
             send_archive(stream, [source, source / ".hidden"])
             destination = root / "dest"
@@ -48,23 +50,10 @@ class Copy(unittest.TestCase):
             self.assertEqual((destination / "a b").read_bytes(), b"bytes")
             self.assertEqual((destination / ".hidden").read_bytes(), b"hidden")
             self.assertEqual(file.read_bytes(), b"hidden")
+            self.assertEqual((destination / "hardlink").read_bytes(), b"bytes")
+            self.assertNotEqual((destination / "a b").stat().st_ino, (destination / "hardlink").stat().st_ino)
             with self.assertRaisesRegex(ValueError, "already exists"):
                 receive_archive(io.BytesIO(stream.getvalue()), [destination, file])
-
-    def test_hard_links_are_transferred_as_separate_regular_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            source = root / "source"
-            source.mkdir()
-            (source / "first").write_text("contents")
-            os.link(source / "first", source / "second")
-            stream = io.BytesIO()
-            send_archive(stream, [source, source / "first"])
-            target = root / "target"
-            receive_archive(io.BytesIO(stream.getvalue()), [target, root / "extra"])
-            for path in (target / "first", target / "second", root / "extra"):
-                self.assertEqual(path.read_text(), "contents")
-            self.assertNotEqual((target / "first").stat().st_ino, (target / "second").stat().st_ino)
 
     def test_notification_replaces_empty_marker_without_writing_data(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,7 +194,8 @@ class CopySetup(unittest.IsolatedAsyncioTestCase):
                                 self.assertFalse(pending.done(), "empty marker must not complete the transfer")
                                 destination.mkdir()
                                 publish_result(marker, "ok")
-                                return await pending
+                                await pending
+                                return await command()
                             if label == "checking cwd":
                                 self.assertEqual(Path.cwd(), workdir)
                                 return subprocess.CompletedProcess([], 0)

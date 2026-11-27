@@ -30,7 +30,7 @@ def copy_plan(specs, workdir, mounts):
             raise ValueError(f"--copy destination overlaps a Drive mount: {target}")
         sources.append(source)
         targets.append(target)
-    return sources, [str(target) for target in targets]
+    return list(zip(sources, map(str, targets)))
 
 
 def regular(member):

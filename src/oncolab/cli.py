@@ -192,16 +192,16 @@ def call_with_upload(argv, transfer):
             process.wait()
 
 
-def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *, sources=()):
+def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *, copies=()):
     proxy, identity, public = ssh_options(name)
     target = "root@colab-runtime"
-    workdir = "/dev/shm/oncolab-" + secrets.token_hex(12)
+    drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
     remote = inspect.getsource(progress) + "\n" + files("oncolab").joinpath("remote.py").read_text()
-    jobdir = workdir + "-job"
+    jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
     config = dict(config)
     env = config.pop("env", {})
-    targets = config.pop("copy_targets", [])
+    sources, targets = zip(*copies) if copies else ((), ())
     if env or sources:
         config["jobdir"] = jobdir
     if sources:
@@ -209,13 +209,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         config["copy_supplies_workdir"] = any(Path(config["workdir"]).is_relative_to(path) for path in targets)
     staging = {}
     if rclone_ini:
-        staging[workdir] = {"rclone.conf": rclone_ini.decode()}
+        staging[drive_stage] = {"rclone.conf": rclone_ini.decode()}
     if env or sources:
         staging[jobdir] = {"env.json": json.dumps(env)} if env else {}
     if sources:
         staging[jobdir].update({"copy-result": "", "copy-ok": "ok", "copy-failed": "failed"})
-    staged_input = json.dumps(staging).encode() if staging else None
-    payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, workdir,
+    # The bootstrap channel must never read the command's stdin.
+    staged_input = json.dumps(staging).encode() if staging else b""
+    payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
                           str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
@@ -281,9 +282,8 @@ def main():
     try:
         config, origins, known_hosts = plan(args.config, copy_requested=bool(args.copy))
         config["env"] |= parse_env(args.env)
-        sources, targets = copy_plan(args.copy, config["workdir"],
-                                     [Path(m["target"]) for m in config["mounts"].values()])
-        config["copy_targets"] = targets
+        copies = copy_plan(args.copy, config["workdir"],
+                           [Path(m["target"]) for m in config["mounts"].values()])
         ini = credentials(origins) if origins else b""
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
@@ -299,7 +299,7 @@ def main():
         if not name:
             return status
         status, fallback = run_session(name, config, ini, known_hosts, command,
-                                       args.forward_agent, terminal, color, attempted, sources=sources)
+                                       args.forward_agent, terminal, color, attempted, copies=copies)
         if fallback:
             release(name, terminal, color)
         if attempted.is_set() and (status == 255 or status < 0):
