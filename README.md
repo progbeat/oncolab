@@ -2,7 +2,7 @@
 
 [![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/progbeat/oncolab/releases/tag/v0.1.0)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)](pyproject.toml)
-[![CI: GitHub Actions](https://img.shields.io/badge/CI-GitHub_Actions-0969da)](https://github.com/progbeat/oncolab/actions/workflows/tests.yml)
+[![CI: v0.1.0 passing](https://img.shields.io/badge/CI-v0.1.0%20passing-brightgreen)](https://github.com/progbeat/oncolab/actions/runs/45880383678)
 
 Run a terminal command on a fresh Google Colab VM, without writing a notebook.
 `oncolab` creates the VM, runs your command, and normally releases the VM when it exits. A profile can
