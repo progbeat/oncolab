@@ -110,13 +110,17 @@ def completed_steps(rows, labels, color):
     tty = stream.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     color = color and tty
     width = max((get_cwidth(label) for label in labels), default=1)
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
     with suppress(OSError, ValueError):
         for indent, label, started, ended in rows:
             duration = format_duration(ended - started)
             padding = width - indent - get_cwidth(label)
             if tty:
                 columns = os.get_terminal_size(stream.fileno()).columns
-                available = max(1, columns - indent - 2 - 2 - max(6, len(duration)))
+                available = max(1, columns - indent - 3 - 2 - max(6, len(duration)))
                 if get_cwidth(label) > available:
                     prefix = ""
                     for char in label:
@@ -131,13 +135,18 @@ def completed_steps(rows, labels, color):
                 label = f"\x1b[2m{label}\x1b[0m"
                 timer = f"\x1b[36m{timer}\x1b[0m"
             line = f"{' ' * indent}{mark} {label}{' ' * max(0, padding)}  {timer}\n"
-            if hasattr(stream, "buffer"):
-                stream.flush()
-                stream.buffer.write(line.encode("utf-8"))
-                stream.buffer.flush()
-            else:
+            if fd is None:
                 stream.write(line)
                 stream.flush()
+                continue
+            # A failed buffered write would be retried by Python at shutdown
+            # and could replace a legitimate command exit code with 120.
+            pending = memoryview(line.encode("utf-8"))
+            while pending:
+                written = os.write(fd, pending)
+                if not written:
+                    return
+                pending = pending[written:]
 
 
 def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None, takeover=None,

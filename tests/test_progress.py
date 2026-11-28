@@ -6,6 +6,7 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
 
@@ -64,6 +65,20 @@ class Progress(unittest.TestCase):
             lifecycle.flush_setup_output()
         write.assert_called_once_with(2, b"fixture\n")
         self.assertIsNone(lifecycle.setup_output)
+
+    def test_closed_summary_destination_does_not_replace_command_exit(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5,
+            )
+        finally:
+            os.close(writer)
+        self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
     def test_setup_checks_follow_readiness_and_drop_eliminated_branches(self):
         timeline = SetupTimeline()
