@@ -116,7 +116,7 @@ class Allocation:
                 reason += f"; retry after {delay}s" if delay else "; wait before trying again"
             # Respect a long server holdoff without making a normal command
             # wait for hours, and never start another request before it ends.
-            raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details and delay <= 120,
+            raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details,
                           delay=delay,
                           uncertain=method == "POST" and code >= 500, detail=retry_details.get(code))
         raw = response.text.removeprefix(")]}'\n")
@@ -168,7 +168,7 @@ class Allocation:
             try:
                 return self.attempt()
             except Failure as exc:
-                if not exc.retry or (attempts and number >= attempts):
+                if not exc.retry or (attempts and (number >= attempts or exc.delay > 120)):
                     raise
                 delay = max(exc.delay, min(120, backoff * 2 ** min(number - 1, 16)))
                 emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay)

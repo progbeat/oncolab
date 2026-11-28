@@ -85,11 +85,12 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 ## Troubleshooting
 
 - If Colab needs credentials, run `colab sessions` in a terminal and complete sign-in. `oncolab` does not hold your command's input open for a hidden login prompt.
-- Creating a VM can take several attempts. The progress view shows the current attempt and, on a transient failure, why it is waiting and when it will retry. Use `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator, session limit, or rate limit ends that run with a distinct error. Temporary connection errors can be retried during either the lookup or the allocation request. If Colab asks to wait more than two minutes, the CLI reports that wait instead of retrying early or blocking indefinitely. The existing `COLAB_CLI_REQUEST_TIMEOUT`, `COLAB_CLI_RETRY_BACKOFF`, and `COLAB_CLI_ASSIGN_RETRIES` environment settings still apply; `--attempts` overrides the last one.
+- Creating a VM can take several attempts. The progress view shows the current attempt and, on a transient failure, why it is waiting and when it will retry. Use `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator, session limit, or rate limit ends that run with a distinct error. Temporary connection errors can be retried during either the lookup or the allocation request. On a retryable response, a bounded run reports server holdoffs longer than two minutes and exits rather than retrying early. With `--attempts 0`, it shows the countdown and waits for that holdoff to finish or for Ctrl+C. The existing `COLAB_CLI_REQUEST_TIMEOUT`, `COLAB_CLI_RETRY_BACKOFF`, and `COLAB_CLI_ASSIGN_RETRIES` environment settings still apply; `--attempts` overrides the last one.
 - Use `--debug` for internal diagnostic locations without raw credential data. Output from your own command is not filtered.
 - **Command not found:** run `uv tool update-shell` and reopen your terminal.
 - **SSH fails:** check [key selection](https://github.com/progbeat/oncolab/blob/master/docs/configuration.md#ssh); `oncolab`
-  doesn't read `~/.ssh/config` for the Colab connection.
+  doesn't read `~/.ssh/config` for the Colab connection. If OpenSSH may need to
+  ask for a passphrase, its prompt takes precedence over the live SSH timer.
 - **VM cleanup wasn't confirmed:** check the VM endpoint in `colab sessions`.
   The temporary SSH session name isn't saved in the default Colab CLI config.
   Use Colab's Manage sessions view to stop that VM only once you know no writes are pending.

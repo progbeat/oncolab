@@ -77,6 +77,20 @@ class Protocol(unittest.TestCase):
         self.assertEqual(backend.params["shape"], "hm")
         self.assertTrue(any("Waiting to retry" in c.kwargs["label"] for c in emit.call_args_list))
 
+    def test_long_server_holdoff_is_waited_only_when_unlimited(self):
+        backend = worker.Allocation(None, "NONE", "DEFAULT", False)
+        holdoff = worker.Failure("HTTP 503", retry=True, delay=180)
+        for attempts in (4, 0):
+            with (patch.object(backend, "attempt", side_effect=[holdoff, {"endpoint": "test"}]),
+                  patch.object(worker, "sleep") as sleep, patch.object(worker, "emit")):
+                if attempts:
+                    with self.assertRaises(worker.Failure):
+                        backend.run(attempts)
+                    sleep.assert_not_called()
+                else:
+                    self.assertEqual(backend.run(attempts), {"endpoint": "test"})
+                    sleep.assert_called_once_with(180)
+
     def test_final_refusal_does_not_sleep(self):
         backend = worker.Allocation(None, "V6E1", "TPU", True)
         self.assertNotIn("shape", backend.params)
