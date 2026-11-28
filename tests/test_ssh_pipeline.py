@@ -132,13 +132,12 @@ class ParallelSSH(unittest.TestCase):
                     'assert os.environ["COLAB_DRIVE"] == "/mock/drive"; '
                     'print(sys.stdin.read(), end=""); raise SystemExit(255)'
                 )
-                if cancel_owner:
-                    spawn = ('import pathlib, time; pathlib.Path("command-active").touch(); '
-                             'time.sleep(60); pathlib.Path("command-escaped").touch()')
                 gate = embedded_gate(inspect.getsource(ssh_pipeline),
                                      (inspect.getsource(format_duration), inspect.getsource(progress)))
                 command = ["/bin/sh", "-c", 'test "$PYTHONHOME" = /nonexistent && cat; exit 255'] if native_env else [
                     sys.executable, "-c", spawn]
+                if cancel_owner:
+                    command = ["/bin/sh", "-c", '(sleep .8; touch command-escaped) & touch command-active; wait']
                 client = subprocess.Popen(
                     [sys.executable, "-c", gate, control, "0", "{}", *command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -171,6 +170,7 @@ class ParallelSSH(unittest.TestCase):
                     owner.wait(timeout=8)
                     self.assertEqual(owner.returncode, 143)
                     self.assertTrue((root / "unassigned").exists())
+                    time.sleep(.9)
                     self.assertFalse((root / "command-escaped").exists())
                     return
                 out, err = client.communicate(b"untouched stdin\n", timeout=15)

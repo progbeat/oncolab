@@ -102,6 +102,7 @@ class CommandHandle:
     def __init__(self, pid):
         if type(pid) is not int or pid <= 0:
             raise ValueError("Invalid command process")
+        self.pid = pid
         self.fd = None
         self.gone = False
         try:
@@ -118,18 +119,19 @@ class CommandHandle:
             return
         if self.fd is None:
             raise CommandStateUnknown("Could not confirm that the command stopped")
-        for signum in (signals.SIGTERM, signals.SIGKILL):
-            try:
-                signals.pidfd_send_signal(self.fd, signum)
-            except ProcessLookupError:
+        try:
+            # The admitted process is its own group leader. Stop its
+            # descendants in that group as well, not just the leader.
+            signal_command_group(self.pid, signals.SIGTERM)
+            if not select.select([self.fd], [], [], 1)[0]:
+                signal_command_group(self.pid, signals.SIGKILL)
+            else:
+                # The leader may exit before children that ignored TERM.
+                signal_command_group(self.pid, signals.SIGKILL)
+            if select.select([self.fd], [], [], 2)[0]:
                 return
-            except OSError as exc:
-                raise CommandStateUnknown("Could not confirm that the command stopped") from exc
-            try:
-                if select.select([self.fd], [], [], 2)[0]:
-                    return
-            except OSError as exc:
-                raise CommandStateUnknown("Could not confirm that the command stopped") from exc
+        except OSError as exc:
+            raise CommandStateUnknown("Could not confirm that the command stopped") from exc
         raise CommandStateUnknown("Could not confirm that the command stopped")
 
     def close(self):
@@ -226,24 +228,43 @@ except OSError as exc:
 """
 
 
+def signal_command_group(pid, signum):
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        pass
+
+
 def stop_gate_command(child):
-    if child.poll() is None:
-        child.terminate()
-        try:
-            child.wait(timeout=1)
-        except sp.TimeoutExpired:
-            child.kill()
-            child.wait()
+    signal_command_group(child.pid, signals.SIGTERM)
+    try:
+        child.wait(timeout=1)
+    except sp.TimeoutExpired:
+        pass
+    # Even if the group leader exited, a child could still have ignored TERM.
+    signal_command_group(child.pid, signals.SIGKILL)
+    child.wait()
+
+
+def foreground_group(fd, group):
+    handler = signals.signal(signals.SIGTTOU, signals.SIG_IGN)
+    try:
+        os.tcsetpgrp(fd, group)
+    finally:
+        signals.signal(signals.SIGTTOU, handler)
 
 
 def gated_command(peer, buffer, workdir, environment, command):
     read_fd, write_fd = os.pipe()
     child = None
+    terminal = None
+    old_group = None
+    finished = False
     try:
         # Python and its loader must not see user variables or cwd until
         # admission; PYTHONHOME can otherwise break non-Python commands.
         child = sp.Popen([sys.executable, "-I", "-S", "-c", COMMAND_ENTRY, str(read_fd), *command],
-                         cwd="/", env={"PATH": os.defpath}, pass_fds=(read_fd,))
+                         cwd="/", env={"PATH": os.defpath}, pass_fds=(read_fd,), process_group=0)
         os.close(read_fd)
         read_fd = -1
         peer.sendall(packet("started", child.pid))
@@ -252,6 +273,13 @@ def gated_command(peer, buffer, workdir, environment, command):
             return 130
         if reply != ["go"]:
             raise ValueError("SSH setup owner did not admit the command")
+        if sys.stdin.isatty():
+            terminal = sys.stdin.fileno()
+            try:
+                old_group = os.tcgetpgrp(terminal)
+                foreground_group(terminal, child.pid)
+            except OSError:
+                old_group = None
         admission = os.fdopen(write_fd, "wb")
         write_fd = -1
         with admission:
@@ -266,14 +294,22 @@ def gated_command(peer, buffer, workdir, environment, command):
             except KeyboardInterrupt:
                 # A native PTY delivers Ctrl+C to the command itself too.
                 continue
+        finished = True
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
     finally:
         if read_fd >= 0:
             os.close(read_fd)
         if write_fd >= 0:
             os.close(write_fd)
-        if child is not None:
-            stop_gate_command(child)
+        try:
+            if child is not None and not finished:
+                stop_gate_command(child)
+        finally:
+            if old_group is not None:
+                try:
+                    foreground_group(terminal, old_group)
+                except OSError:
+                    pass
 
 
 def command_gate(path, plan, color, command, render):
