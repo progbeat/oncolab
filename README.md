@@ -112,3 +112,11 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   Use Colab's Manage sessions view to stop that VM only once you know no writes are pending.
 
 [Development](https://github.com/progbeat/oncolab/blob/master/docs/configuration.md#development) · Unofficial; not affiliated with Google.
+
+
+### Experimental parallel setup
+
+Set `ONCOLAB_PARALLEL_SETUP=1` to start setup on the first SSH channel, upload the Drive
+configuration concurrently with eligible setup tasks, and open the command's own SSH
+channel without taking over its stdin. The command waits for setup; the first runner keeps
+the services alive and owns cleanup. Without the opt-in, SSH startup is unchanged.

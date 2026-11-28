@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import base64
 import inspect
 import json
@@ -11,7 +12,7 @@ import subprocess as sp
 import sys
 import termios
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
@@ -19,7 +20,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
-from . import diagnostics
+from . import diagnostics, ssh_pipeline
 from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
@@ -378,6 +379,56 @@ def prepare_copies(config, specs, explicit):
     return cli_copies, task_groups
 
 
+def feed_staging(stream, data):
+    with stream:
+        try:
+            stream.write(data)
+        except BrokenPipeError:
+            pass
+
+
+async def wait_for_master(process, path):
+    while not Path(path).is_socket() and process.poll() is None:
+        await asyncio.sleep(.025)
+    return Path(path).is_socket()
+
+
+def after_staging(ready, failure, action, *args, **kwargs):
+    if ready is not None and not ready.result():
+        return failure
+    return action(*args, **kwargs)
+
+
+async def wait_setup_listener(process):
+    loop = asyncio.get_running_loop()
+    fd = process.stdout.fileno()
+    pending = loop.create_future()
+    partial = b""
+
+    def read():
+        nonlocal partial
+        if pending.done():
+            return
+        try:
+            data = os.read(fd, 65536)
+            if not data:
+                pending.set_result(False)
+            else:
+                partial += data
+                if ssh_pipeline.SETUP_LISTENING in partial.splitlines(keepends=True):
+                    pending.set_result(True)
+                elif len(partial) > 65536:
+                    pending.set_result(False)
+        except OSError as exc:
+            pending.set_exception(exc)
+
+    loop.add_reader(fd, read)
+    try:
+        return await pending
+    finally:
+        loop.remove_reader(fd)
+
+
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
                 copies=(), task_copies=None, store=None, debug=False):
     proxy, identity, public = ssh_options(name, store)
@@ -438,11 +489,46 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
     if live_payload:
         config["terminal_handoff"] = STARTING_RUNNER
-    payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
-                          str(int(color)), json.dumps(config), *command])
+    parallel = os.environ.get("ONCOLAB_PARALLEL_SETUP") == "1"
+    python = ["uv", "run", "--no-project", "python3", "-c"]
+    owner_code = None
+    if parallel:
+        control = drive_stage + "-gate/control.sock"
+        protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
+        remote = protocol + "\n" + remote
+        gate_code = "\n".join((inspect.getsource(progress), protocol, """
+directory, color, raw_plan, *command = sys.argv[1:]
+try:
+    raise SystemExit(command_gate(directory, json.loads(raw_plan), color == "1", command, progress))
+except KeyboardInterrupt:
+    print("[cancelled]", file=sys.stderr)
+    raise SystemExit(130) from None
+except (OSError, ValueError):
+    print("[Setup channel closed] " + json.loads(raw_plan).get("recovery_hint", "Setup runner disconnected") + ".",
+          file=sys.stderr)
+    raise SystemExit(1) from None
+"""))
+        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint") if key in config}
+        command_plan.update(pipeline_role="command")
+        payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
+                              *config["entrypoint"], *command])
+        config.pop("terminal_handoff", None)
+        config.update(pipeline_role="setup", pipeline_control=control,
+                      pipeline_dirs={path: {name: value for name, value in entries.items()
+                                           if name not in ("env.json", "rclone.conf")}
+                                     for path, entries in staging.items()})
+        owner_code = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config), *command])
+        staged_input = ssh_pipeline.packet(env, command_env)
+        if rclone_ini is not None:
+            data = rclone_ini.encode() if isinstance(rclone_ini, str) else rclone_ini
+            staged_input += (json.dumps(base64.b64encode(data).decode()) + "\n").encode()
+    else:
+        payload = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
-    with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
+    with (TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp,
+          ThreadPoolExecutor(4 if parallel else 2) as transfers,
+          (TemporaryFile() if parallel else nullcontext()) as owner_errors):
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
                            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
@@ -472,7 +558,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             connect_options.extend(("-o", "BatchMode=yes"))
         pending = [f"{directory}/{file}" for directory, file in
                    ((drive_stage, "rclone.conf"), (jobdir, "env.json")) if file in staging.get(directory, {})]
+        if parallel:
+            pending = []  # The setup owner directly claims its staged files.
         master_closed = False
+        owner = None
+        ready = None
 
         def close_master():
             nonlocal master_closed
@@ -501,18 +591,36 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         stage = shlex.join(["python3", "-c", STAGE]) if staging else "true"
         try:
             with without_echo(terminal_connect):
-                connected = run_step(CONNECTING, lambda: sp.run(
-                    [*ssh, *connect_options, target, stage],
-                    input=staged_input, capture_output=True,
-                ), terminal_connect, color, labels=labels)
-            if connected.returncode:
-                show_ssh_error(connected.stderr, debug)
-                return connected.returncode, True
+                if parallel:
+                    owner = sp.Popen([*ssh, *connect_options, target, owner_code], stdin=sp.PIPE,
+                                     stdout=sp.PIPE, stderr=owner_errors)
+                    transfers.submit(feed_staging, owner.stdin, staged_input)
+
+                    async def wait_owner():
+                        return await wait_for_master(owner, f"{tmp}/ssh")
+
+                    if not run_step(CONNECTING, wait_owner, terminal_connect, color, labels=labels):
+                        owner_errors.seek(0)
+                        show_ssh_error(owner_errors.read(16_384), debug)
+                        return owner.poll() or 1, True
+                    if sources or groups:
+                        ready = transfers.submit(lambda: asyncio.run(wait_setup_listener(owner)))
+                else:
+                    connected = run_step(CONNECTING, lambda: sp.run(
+                        [*ssh, *connect_options, target, stage],
+                        input=staged_input, capture_output=True,
+                    ), terminal_connect, color, labels=labels)
+                    if connected.returncode:
+                        show_ssh_error(connected.stderr, debug)
+                        return connected.returncode, True
             if live_payload:
                 show_remote_handoff(color)
             attempted.set()
-            transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
-            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
+            unavailable = "SSH setup runner stopped before staging was ready"
+            transfer = transfers.submit(after_staging, ready, (unavailable, False), upload,
+                                        ssh, target, result, sources, targets, debug=debug) if sources else None
+            task_upload = transfers.submit(after_staging, ready, [unavailable], upload_tasks,
+                                           ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
             # Keep native SSH errors separate from the command's stderr.
             # Mux and payload failures can both return 255; only a captured
             # SSH error is evidence for reporting a connection failure.
@@ -553,7 +661,16 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     status = status or 1
             return status, False
         finally:
-            close_master()
+            try:
+                close_master()
+            finally:
+                if owner is not None:
+                    try:
+                        owner.wait(timeout=5)
+                    except sp.TimeoutExpired:
+                        owner.kill()
+                        owner.wait()
+                    owner.stdout.close()
 
 
 def ssh_transport_error(log):

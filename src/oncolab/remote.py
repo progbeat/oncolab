@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import fcntl
 import json
 import os
@@ -10,9 +11,12 @@ import time
 from functools import partial
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
+from tempfile import TemporaryFile
 
 if __package__:
     from .diagnostics import outcome, safe_subprocess_details
+    from .progress import progress
+    from .ssh_pipeline import SETUP_LISTENING, SetupGate, command_gate, stdin_packets, staging_directories
 
 
 _ONCOLAB_COLOR = False
@@ -428,12 +432,12 @@ class Lifecycle:
             elif self.command is not None and number != SIGINT:
                 self.command.send_signal(number)
 
-    async def prepare(self, run, plan, drive):
+    async def prepare(self, run, plan, drive, drive_config=None):
         self.setup = asyncio.current_task()
         try:
             if self.interrupted:
                 return 128 + self.interrupted
-            return await setup_all(run, plan, drive, self)
+            return await setup_all(run, plan, drive, self, drive_config)
         except asyncio.CancelledError:
             if not self.interrupted:
                 raise
@@ -541,7 +545,7 @@ class Lifecycle:
         return released and not failed
 
 
-async def setup_all(run, plan, drive, lifecycle=None):
+async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
     lifecycle = lifecycle or Lifecycle()
     tasks = {}
 
@@ -601,7 +605,14 @@ async def setup_all(run, plan, drive, lifecycle=None):
 
         submit("fuse", "Preparing FUSE…", install(FUSE), *workdir_ready)
         submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
-        submit("rcd", "Starting Drive mounts…", drive.start, "fuse", "rclone")
+        drive_dependencies = ("fuse", "rclone")
+        if drive_config is not None:
+            async def receive_config():
+                await drive_config
+
+            submit("drive-config", "Receiving Drive config…", receive_config)
+            drive_dependencies += ("drive-config",)
+        submit("rcd", "Starting Drive mounts…", drive.start, *drive_dependencies)
         drive_tasks.extend(("fuse", "rclone", "rcd"))
         setup_mounts = {step.get("mount") for step in plan["setup"].values()}
         for name, mount in plan["mounts"].items():
@@ -688,11 +699,105 @@ async def setup_all(run, plan, drive, lifecycle=None):
     return next((result for result in results if result), 0)
 
 
+def send_setup_output(gate, lifecycle):
+    messages, lifecycle.setup_output = lifecycle.setup_output or [], None
+    for data in messages:
+        if isinstance(data, str):
+            data = (data + "\n").encode("utf-8", "backslashreplace")
+        for offset in range(0, len(data), 65536):
+            gate.send("diag", base64.b64encode(data[offset:offset + 65536]).decode())
+    gate.send("end-output")
+
+
+async def pipeline_setup(run, lifecycle, plan, drive, gate):
+    accepted = asyncio.create_task(gate.accept())
+    stream, transport = await stdin_packets()
+    staged_config = None
+    loop = asyncio.get_running_loop()
+    watching = None
+    descriptor = None
+    try:
+        setup_env, command_env = json.loads(await stream.readline())
+        lifecycle.environment = os.environ | setup_env
+
+        async def receive_drive():
+            raw = base64.b64decode(json.loads(await stream.readline()), validate=True)
+            with os.fdopen(os.open(drive.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
+                file.write(raw)
+
+        if drive is not None:
+            staged_config = asyncio.create_task(receive_drive())
+        counter = 0
+
+        async def event_run(label, invoke):
+            nonlocal counter
+            key = counter
+            counter += 1
+            gate.send("start", key, label, time.monotonic())
+            try:
+                return await run(label, invoke)
+            finally:
+                gate.send("done", key)
+
+        async def detect_disconnect():
+            nonlocal descriptor
+            try:
+                await accepted
+            except (OSError, TimeoutError):
+                lifecycle.interrupt(SIGTERM, None)
+                return
+            descriptor = gate.peer.fileno()
+
+            def disconnected():
+                # The command channel sends nothing before setup ends.
+                if not os.read(descriptor, 1):
+                    loop.remove_reader(descriptor)
+                    lifecycle.interrupt(SIGTERM, None)
+
+            loop.add_reader(descriptor, disconnected)
+
+        watching = asyncio.create_task(detect_disconnect())
+        status = await lifecycle.prepare(event_run, plan, drive, staged_config)
+        await accepted
+        inherited = {key: value for key, value in os.environ.items()
+                     if key in ("PATH", "COLAB_DRIVE") or key.startswith("ONCOLAB_MOUNT_")}
+        return status, inherited | setup_env | command_env
+    finally:
+        transport.close()
+        if watching is not None:
+            watching.cancel()
+            await asyncio.gather(watching, return_exceptions=True)
+        if descriptor is not None:
+            loop.remove_reader(descriptor)
+        if staged_config is not None:
+            if not staged_config.done():
+                staged_config.cancel()
+            await asyncio.gather(staged_config, return_exceptions=True)
+        if not accepted.done():
+            accepted.cancel()
+        await asyncio.gather(accepted, return_exceptions=True)
+
+
 def main():
     global _ONCOLAB_COLOR
     directory, color, raw_plan, *command = sys.argv[1:]
     _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
+    if plan.get("pipeline_role") == "command":
+        try:
+            return command_gate(directory, plan, _ONCOLAB_COLOR, command, progress)
+        except KeyboardInterrupt:
+            print("[cancelled]", file=sys.stderr)
+            return 130
+        except (OSError, ValueError):
+            report("Setup channel closed", plan.get("recovery_hint", "The setup runner disconnected.") + ".")
+            return 1
+    owner = plan.get("pipeline_role") == "setup"
+    control_dir = Path(plan["pipeline_control"]).parent if owner else None
+    gate = None
+    owner_reports = None
+    saved_stderr = None
+    sent_result = False
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     handoff = plan.get("terminal_handoff")
 
@@ -710,13 +815,24 @@ def main():
     status = 1
     previous = {n: signal(n, lifecycle.interrupt) for n in (SIGINT, SIGHUP, SIGTERM)}
     try:
+        if owner:
+            staging_directories(plan["pipeline_dirs"])
+            control_dir.mkdir(mode=0o700)
+            gate = SetupGate(plan["pipeline_control"])
+            owner_reports = TemporaryFile(dir=control_dir)
+            saved_stderr = os.dup(sys.stderr.fileno())
+            os.dup2(owner_reports.fileno(), sys.stderr.fileno())
+            sys.stdout.buffer.write(SETUP_LISTENING)
+            sys.stdout.buffer.flush()
+            lifecycle.setup_output = []
         if plan["mounts"]:
             path = Path(directory)
             st = path.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Drive staging directory is not private")
             drive = DriveMounts(directory)
-            (path / "rclone.conf").rename(drive.config)
+            if not owner:
+                (path / "rclone.conf").rename(drive.config)
             for name, mount in plan["mounts"].items():
                 var = name.removeprefix("mounts.").upper().replace("-", "_")
                 os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
@@ -724,7 +840,7 @@ def main():
             st = jobdir.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Job staging directory is not private")
-            if plan.get("has_env"):
+            if plan.get("has_env") and not owner:
                 claimed = jobdir / "active-env.json"
                 try:
                     (jobdir / "env.json").rename(claimed)
@@ -747,11 +863,16 @@ def main():
         # cursor can overwrite their first line (or leave stale timer text).
         if live:
             lifecycle.setup_output = []
-        try:
-            status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
-                              capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
-        finally:
-            lifecycle.flush_setup_output()
+        if owner:
+            status, command_env = progress(lambda run: pipeline_setup(run, lifecycle, plan, drive, gate),
+                                           False, False, capture=True)
+            send_setup_output(gate, lifecycle)
+        else:
+            try:
+                status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
+                                  capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
+            finally:
+                lifecycle.flush_setup_output()
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:
@@ -760,11 +881,16 @@ def main():
             try:
                 environment = {name: value for name, value in (lifecycle.environment | command_env).items()
                                if value is not None}
-                takeover()
-                with sp.Popen(argv, env=environment) as cmd:
-                    lifecycle.command = cmd
-                    code = cmd.wait()
-                status = code if code >= 0 else 128 - code
+                if owner:
+                    gate.send("run", os.getcwd(), command_env)
+                    sent_result = True
+                    status = gate.receive_status()
+                else:
+                    takeover()
+                    with sp.Popen(argv, env=environment) as cmd:
+                        lifecycle.command = cmd
+                        code = cmd.wait()
+                    status = code if code >= 0 else 128 - code
             except OSError as exc:
                 report("Command could not start", f"{argv[0]}: {exc.strerror}.")
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
@@ -778,6 +904,13 @@ def main():
         status = status or 1
     finally:
         lifecycle.command = None
+        if gate is not None and gate.peer is not None and not sent_result:
+            try:
+                if lifecycle.setup_output is not None:
+                    send_setup_output(gate, lifecycle)
+                gate.send("failed")
+            except (OSError, ValueError):
+                pass
         try:
             released = lifecycle.cleanup(drive)
             if jobdir:
@@ -796,7 +929,29 @@ def main():
                 signal(number, handler)
     if not released and (hint := plan.get("recovery_hint")):
         report("Check VM state", f"{hint}.")
-    return (status if status >= 0 else 128 - status) if released else 125
+    final_status = (status if status >= 0 else 128 - status) if released else 125
+    if gate is not None:
+        try:
+            if owner_reports is not None:
+                sys.stderr.flush()
+                os.dup2(saved_stderr, sys.stderr.fileno())
+                os.close(saved_stderr)
+                owner_reports.seek(0)
+            if gate.peer is not None:
+                while owner_reports is not None and (data := owner_reports.read(65536)):
+                    gate.send("diag", base64.b64encode(data).decode())
+                gate.send("status", final_status)
+            elif owner_reports is not None:
+                shutil.copyfileobj(owner_reports, sys.stderr.buffer)
+        except OSError:
+            pass
+        finally:
+            gate.close()
+            if owner_reports is not None:
+                owner_reports.close()
+    if control_dir is not None:
+        shutil.rmtree(control_dir, ignore_errors=True)
+    return final_status
 
 
 def internal_error(operation, exc, debug):

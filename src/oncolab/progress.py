@@ -168,14 +168,14 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                 width = get_cwidth(label if isinstance(label, str) else label())
                 planned_width = max(planned_width, width)
 
-        async def run(label, command):
+        async def run(label, command, *, started_at=None):
             reserve(label)
             counter = None
             if bar is not None:
                 # Publish the counter only after its monotonic timestamp is
                 # initialized; the renderer runs in its own thread.
                 counter = ProgressBarCounter(bar, None, label, not idle, None)
-                counter.started = monotonic()
+                counter.started = monotonic() if started_at is None else started_at
                 if idle and bar.counters == [waiting]:
                     bar.counters[:] = [counter]
                 else:
