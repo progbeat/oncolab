@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
 from oncolab.duration import format_duration
+from oncolab.progress import SetupTimeline
 from oncolab.remote import Lifecycle
 
 
@@ -63,6 +64,69 @@ class Progress(unittest.TestCase):
             lifecycle.flush_setup_output()
         write.assert_called_once_with(2, b"fixture\n")
         self.assertIsNone(lifecycle.setup_output)
+
+    def test_setup_checks_follow_readiness_and_drop_eliminated_branches(self):
+        timeline = SetupTimeline()
+        event = timeline.event
+        event("setup-start", 0)
+        for name, dependencies in (("rclone", ()), ("config", ()), ("git", ()),
+                                   ("mount", ("rclone", "config")), ("seal", ("mount",))):
+            event("setup-job", name, name if name != "seal" else None, dependencies)
+        for name in ("rclone", "config", "git"):
+            event("setup-active", name, 0)
+        event("setup-done", "rclone", 4, 0)
+        self.assertEqual(timeline.candidates(), set())
+        event("setup-done", "config", 6, 0)
+        event("setup-active", "mount", 6)
+        self.assertEqual(timeline.candidates(), {"config"})
+        self.assertEqual([name for _, name, *_ in timeline.rows(False)], ["Setting up…", "git", "mount"])
+        event("setup-done", "mount", 7, 0)
+        event("setup-active", "seal", 7)
+        event("setup-done", "git", 8, 0)
+        event("setup-done", "seal", 9, 0)
+        event("setup-finish", 9, 0)
+        self.assertEqual(timeline.rows(True), [(0, "Setting up…", 0, 9), (2, "config", 0, 6), (2, "mount", 6, 7)])
+        self.assertEqual(timeline.rows(False), [])
+        event("setup-finish", 9, 130)
+        self.assertEqual(timeline.rows(True), [])
+
+    def test_tty_setup_has_a_parent_in_both_modes_and_retains_only_verbose_checks(self):
+        script = """
+import asyncio
+from time import monotonic
+from oncolab.progress import progress
+
+async def exercise(run):
+    event = run.setup_event
+    started = monotonic()
+    event("setup-start", started)
+    event("setup-job", "first", "First job…", ())
+    event("setup-job", "next", "Next job…", ("first",))
+    event("setup-active", "first", started)
+    await asyncio.sleep(.25)
+    event("setup-done", "first", monotonic(), 0)
+    event("setup-active", "next", monotonic())
+    await asyncio.sleep(.25)
+    event("setup-done", "next", monotonic(), 0)
+    event("setup-finish", monotonic(), 0)
+
+progress(exercise, True, False, setup=True, verbose=VERBOSE,
+         labels=["Setting up…", "  First job…", "  Next job…"])
+print("COMMAND_OUTPUT")
+"""
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                raw = self.render_progress(script.replace("VERBOSE", repr(verbose)), 60).decode()
+                plain = self.without_ansi(raw)
+                self.assertIn("Setting up…", plain)
+                self.assertRegex(plain, r"  [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] First job…")
+                self.assertIn("Next job…", plain)
+                if verbose:
+                    self.assertRegex(plain, r"✓ Setting up… +0\.\ds\r?\n  ✓ First job… +0\.\ds\r?\n"
+                                            r"  ✓ Next job… +0\.\ds\r?\nCOMMAND_OUTPUT")
+                else:
+                    self.assertNotIn("✓", plain)
+                    self.assertRegex(raw, r"\x1b\[J[^\r\n]*COMMAND_OUTPUT")
 
     def test_tty_setup_steps_share_elapsed_column_and_leave_no_final_row(self):
         script = """

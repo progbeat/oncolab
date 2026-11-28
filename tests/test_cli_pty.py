@@ -341,7 +341,7 @@ raise SystemExit(namespace["main"]())
                     elif outcome == "failure":
                         self.assertIn("\x1b[37m⠛\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
                     elif outcome == "setup-failure":
-                        self.assertRegex(output, rb"Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
+                        self.assertRegex(output, rb"(?s)Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
                                                  rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")
                         self.assertNotIn(b"READY_FOR_TEST", output)
                     elif outcome == "raw":

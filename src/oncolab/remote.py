@@ -444,16 +444,26 @@ class Lifecycle:
 
     async def prepare(self, run, plan, drive, drive_config=None):
         self.setup = asyncio.current_task()
+        setup_event = getattr(run, "setup_event", None)
+        status = 1
         try:
+            if setup_event:
+                setup_event("setup-start", time.monotonic())
             if self.interrupted:
                 return 128 + self.interrupted
-            return await setup_all(run, plan, drive, self, drive_config)
+            result = await setup_all(run, plan, drive, self, drive_config)
+            if result == 0:
+                self.check_services()
+            status = result
+            return status
         except asyncio.CancelledError:
             if not self.interrupted:
                 raise
             return 128 + self.interrupted
         finally:
             self.setup = None
+            if setup_event:
+                setup_event("setup-finish", time.monotonic(), status)
 
     async def start(self, name, step, stdin, on_start=None):
         argv = step["start"]
@@ -558,12 +568,15 @@ class Lifecycle:
 async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
     lifecycle = lifecycle or Lifecycle()
     tasks = {}
+    setup_event = getattr(run, "setup_event", None)
 
     def submit(name, description, command, *dependencies, step=None):
         step = step if step is not None else {}
         if "description" not in step:
             step = {**step, "description": description}
         lifecycle.nodes[name] = (step, dependencies)
+        if setup_event:
+            setup_event("setup-job", name, description, dependencies)
         reserve = getattr(run, "reserve", None)
         if reserve is not None:
             reserve(description)
@@ -573,8 +586,16 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
             if any(result for result in results):
                 return 1
             lifecycle.began.add(name)
-            result = await run(description, command)
-            if result is not None and result.returncode:
+            if setup_event:
+                setup_event("setup-active", name, time.monotonic())
+            status = 1
+            try:
+                result = await run(description, command)
+                status = 0 if result is None else result.returncode
+            finally:
+                if setup_event:
+                    setup_event("setup-done", name, time.monotonic(), status)
+            if status:
                 if name in ("fuse", "rclone"):
                     # Built-in installers are managed commands, not profile
                     # hooks. Their free-form output may contain internal traces.
@@ -676,6 +697,11 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
             command = step.get("argv", lambda: None)
         submit(key, step["description"], command, *dependencies, step=step)
 
+    # Sealing the config can finish after an unrelated setup job. Model it
+    # as a non-display prerequisite so its mount dependencies are not lost.
+    if drive and setup_event:
+        setup_event("setup-job", "drive-seal", None, drive_tasks)
+        setup_event("setup-active", "drive-seal", time.monotonic())
     try:
         if drive:
             try:
@@ -697,6 +723,8 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
                             ))
             finally:
                 drive.seal()
+            if setup_event:
+                setup_event("setup-done", "drive-seal", time.monotonic(), 0)
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     finally:
         for task in tasks.values():
@@ -742,17 +770,7 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
 
         if drive is not None:
             staged_config = asyncio.create_task(receive_drive())
-        counter = 0
-
-        async def event_run(label, invoke):
-            nonlocal counter
-            key = counter
-            counter += 1
-            gate.send("start", key, label, time.monotonic())
-            try:
-                return await run(label, invoke)
-            finally:
-                gate.send("done", key)
+        run.setup_event = gate.send
 
         async def detect_disconnect():
             nonlocal descriptor
@@ -778,7 +796,7 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
             loop.add_reader(descriptor, disconnected)
 
         watching = asyncio.create_task(detect_disconnect())
-        status = await lifecycle.prepare(event_run, plan, drive, staged_config)
+        status = await lifecycle.prepare(run, plan, drive, staged_config)
         await accepted
         inherited = {key: value for key, value in os.environ.items()
                      if key in ("PATH", "COLAB_DRIVE") or key.startswith("ONCOLAB_MOUNT_")}
@@ -888,7 +906,8 @@ def main():
         else:
             try:
                 status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
-                                  capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
+                                  capture=True, idle=handoff, takeover=lambda: takeover(erase=False),
+                                  setup=True, verbose=plan.get("verbose", False), **options)
             finally:
                 lifecycle.flush_setup_output()
         if lifecycle.interrupted:
