@@ -24,6 +24,16 @@ class Protocol(unittest.TestCase):
         hidden_login.assert_not_called()
         self.assertIs(auth._run_remote_flow, hidden_login)
 
+    def test_auth_refresh_is_available_to_read_requests_only(self):
+        credentials = object()
+        auth = SimpleNamespace(_run_remote_flow=Mock(),
+                               get_credentials=lambda: SimpleNamespace(credentials=credentials))
+        new_session = Mock()
+        reader, writer = worker.credential_session(auth, new_session)
+        self.assertIs(reader.credentials, credentials)
+        self.assertIs(writer, new_session.return_value)
+        new_session.assert_called_once_with(credentials, max_refresh_attempts=0)
+
     def test_wire_parameters_and_http_errors(self):
         class NetworkException(Exception):
             pass
@@ -49,6 +59,7 @@ class Protocol(unittest.TestCase):
             with self.assertRaises(worker.Failure) as refusal:
                 backend.request("POST", "/assign")
             self.assertFalse(refusal.exception.retry)
+            self.assertIn("rejected T4", str(refusal.exception))
             with self.assertRaises(worker.Failure) as refusal:
                 backend.request("POST", "/assign")
             self.assertTrue(refusal.exception.uncertain)
@@ -110,11 +121,12 @@ class Protocol(unittest.TestCase):
 
 
 class InstalledCLI(unittest.TestCase):
-    def run_cli(self, mode, tmp):
+    def run_cli(self, mode, tmp, debug=False):
         fake_colab(Path(tmp))
         env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", XDG_CONFIG_HOME=tmp, TEST_ALLOCATION=mode,
                    TEST_ALLOCATION_READY=str(Path(tmp) / "ready"))
-        return subprocess.Popen([which("oncolab"), "--", "true"], env=env, stdin=subprocess.DEVNULL,
+        flags = ["--debug"] if debug else []
+        return subprocess.Popen([which("oncolab"), *flags, "--", "true"], env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def test_noninteractive_login_fails_with_instruction(self):
@@ -126,13 +138,15 @@ class InstalledCLI(unittest.TestCase):
             self.assertNotIn("Traceback", err)
 
     def test_allocator_crash_is_actionable_without_raw_traceback(self):
-        with tempfile.TemporaryDirectory() as tmp, self.run_cli("crash", tmp) as proc:
-            out, err = proc.communicate(timeout=8)
-            self.assertEqual(proc.returncode, 2)
-            self.assertEqual(out, "")
-            self.assertIn("The Colab allocator exited unexpectedly", err)
-            self.assertNotIn("Traceback", err)
-            self.assertNotIn("secret-token", err)
+        for debug in (False, True):
+            with tempfile.TemporaryDirectory() as tmp, self.run_cli("crash", tmp, debug) as proc:
+                out, err = proc.communicate(timeout=8)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(out, "")
+                self.assertIn("The Colab allocator exited unexpectedly", err)
+                self.assertNotIn("Traceback", err)
+                self.assertNotIn("secret-token", err)
+                self.assertEqual("auth.py:12 in open_session" in err, debug)
 
     def test_sigint_during_backoff_exits_promptly(self):
         import select

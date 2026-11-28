@@ -7,11 +7,14 @@ import shlex
 import shutil
 import subprocess as sp
 import sys
+from contextlib import nullcontext
 from importlib.resources import files
 from pathlib import Path
 from signal import SIGINT
+from tempfile import TemporaryFile
 from time import monotonic
 
+from .diagnostics import safe_subprocess_details
 from .progress import CHECKING_LOGIN, WAITING, run_step
 
 CHECK = "Check 'colab sessions' for an unconfirmed VM."
@@ -92,20 +95,30 @@ def write_diagnostic(message, *, optional=False):
 def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
     if cancellation.requested:
         return 130
-    with sp.Popen(argv, stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.DEVNULL,
-                  start_new_session=True, bufsize=0) as proc:
-        try:
-            return supervise(proc, label, cancellation, diagnostics, debug=debug, live=live, budget=budget)
-        finally:
-            if proc.poll() is None:
-                # Do not let an unexpected error in the monitor turn Popen's
-                # context-manager wait into an unbounded wait on an allocator.
-                proc.send_signal(SIGINT)
-                try:
-                    proc.wait(timeout=11)
-                except sp.TimeoutExpired:
-                    proc.kill()
-                    diagnostics.append(f"oncolab: {CHECK}")
+    debug_stream = TemporaryFile() if debug else nullcontext(None)
+    with debug_stream as error_stream:
+        with sp.Popen(argv, stdin=sp.DEVNULL, stdout=sp.PIPE,
+                      stderr=error_stream if error_stream is not None else sp.DEVNULL,
+                      start_new_session=True, bufsize=0) as proc:
+            try:
+                return supervise(proc, label, cancellation, diagnostics, debug=debug, live=live, budget=budget)
+            finally:
+                if proc.poll() is None:
+                    # Do not let an unexpected error in the monitor turn Popen's
+                    # context-manager wait into an unbounded wait on an allocator.
+                    proc.send_signal(SIGINT)
+                    try:
+                        proc.wait(timeout=11)
+                    except sp.TimeoutExpired:
+                        proc.kill()
+                        diagnostics.append(f"oncolab: {CHECK}")
+                if error_stream is not None:
+                    # Native launcher/import failures happen before the JSON
+                    # protocol. Keep only a bounded tail, never raw stderr.
+                    end = error_stream.seek(0, os.SEEK_END)
+                    error_stream.seek(max(0, end - 16_384))
+                    text = error_stream.read(16_384).decode(errors="replace")
+                    diagnostics.extend(safe_subprocess_details(text))
 
 
 def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):

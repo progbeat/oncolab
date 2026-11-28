@@ -58,14 +58,17 @@ def credential_session(auth, authorized_session):
     auth._run_remote_flow = need_login
     try:
         session = auth.get_credentials()
-        return authorized_session(session.credentials, max_refresh_attempts=0)
+        # Lookup GETs can refresh and resend authentication just as colab
+        # does. A write must never be implicitly replayed by the library.
+        return session, authorized_session(session.credentials, max_refresh_attempts=0)
     finally:
         auth._run_remote_flow = original
 
 
 class Allocation:
-    def __init__(self, session, accelerator, variant, high_mem, request_timeout=120):
+    def __init__(self, session, accelerator, variant, high_mem, request_timeout=120, *, write_session=None):
         self.session = session
+        self.write_session = session if write_session is None else write_session
         self.request_timeout = request_timeout
         self.params = {"nbh": str(uuid4()).replace("-", "_").ljust(44, "."),
                        "variant": variant, "accelerator": accelerator}
@@ -84,7 +87,8 @@ class Allocation:
         if token:
             headers["X-Goog-Colab-Token"] = token
         try:
-            response = self.session.request(method, API + path, params={"authuser": "0", **(params or {})}, headers=headers,
+            transport = self.write_session if method == "POST" else self.session
+            response = transport.request(method, API + path, params={"authuser": "0", **(params or {})}, headers=headers,
                                             timeout=(min(4, timeout), timeout), max_allowed_time=timeout,
                                             allow_redirects=False)
         except RefreshError:
@@ -100,6 +104,8 @@ class Allocation:
                       412: "Allocation refused (session, usage or capacity limit); check 'colab sessions'",
                       429: "Colab is rate limiting requests", 502: "Colab gateway error",
                       503: "Colab service unavailable", 504: "Colab gateway timed out"}.get(code, "unexpected response")
+            if code == 400 and path == "/assign" and self.params["variant"] != "DEFAULT":
+                reason = f"Colab rejected {self.params['accelerator']}; try another accelerator or omit --gpu/--tpu"
             retry_details = {429: "429 rate limited", 502: "502 gateway error",
                              503: "503 unavailable", 504: "504 gateway timeout"}
             raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details,
@@ -222,7 +228,9 @@ def main():
     status = 1
     try:
         emit(label="Checking Colab sign-in…")
-        backend = Allocation(connect(), accelerator, variant, high_mem == "1", float(timeout))
+        read_session, write_session = connect()
+        backend = Allocation(read_session, accelerator, variant, high_mem == "1", float(timeout),
+                             write_session=write_session)
         result = backend.run(int(attempts), float(backoff))
         save_session(store, name, result, backend)
         return 0

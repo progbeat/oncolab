@@ -15,7 +15,9 @@ from pathlib import Path
 assert sys.argv[1] == "-I" and sys.argv[2].endswith("/allocation_worker.py")
 mode = os.environ.get("TEST_ALLOCATION", "success")
 if mode == "crash":
-    print("\033[31mTraceback (most recent call last):\033[0m; secret-token", file=sys.stderr, flush=True)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    print('  File "/fake/auth.py", line 12, in open_session', file=sys.stderr)
+    print("RuntimeError: secret-token", file=sys.stderr, flush=True)
     sys.exit(2)
 if mode == "login":
     print(json.dumps({"error": "No usable Colab credentials. Run 'colab sessions' in a terminal to sign in."}), flush=True)

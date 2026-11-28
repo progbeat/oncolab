@@ -22,6 +22,7 @@ from threading import Event
 from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
+from .diagnostics import safe_subprocess_details
 from .env import parse_env
 from .progress import CONNECTING, preparation_labels, progress, run_step
 
@@ -520,9 +521,8 @@ def show_ssh_error(stderr, debug):
     if debug:
         # Standard Python frame locations are useful without dumping source,
         # rich traceback locals, or a remote request's headers.
-        for filename, number, function in re.findall(
-                r'^\s*File "[^"\n]*/([A-Za-z0-9_.-]+)", line (\d+), in ([A-Za-z_<>]+)\s*$', text, re.MULTILINE):
-            print(f"  {filename}:{number} in {function}", file=sys.stderr)
+        for detail in safe_subprocess_details(text):
+            print(detail, file=sys.stderr)
 
 
 def debug_internal(exc):
