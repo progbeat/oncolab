@@ -172,7 +172,7 @@ def receive(peer, buffer, timeout=None):
     return json.loads(line)
 
 
-async def observe_setup(run, peer, buffer):
+async def observe_setup(run, peer, buffer, live):
     loop = asyncio.get_running_loop()
     tasks = {}
     output = []
@@ -202,7 +202,10 @@ async def observe_setup(run, peer, buffer):
                 done.set()
                 await task
             elif kind == "diag":
-                output.append(fields[0])
+                if live:
+                    output.append(fields[0])
+                else:
+                    pipeline_stderr(base64.b64decode(fields[0]))
             elif kind == "end-output":
                 return output, await read()
             else:
@@ -374,7 +377,7 @@ def command_gate(path, plan, color, command, render, takeover):
         if not live:
             takeover()
         try:
-            output, result = render(lambda run: observe_setup(run, peer, buffer), live, color,
+            output, result = render(lambda run: observe_setup(run, peer, buffer, live), live, color,
                                     labels=plan.get("progress_labels", ()),
                                     idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False))
         except KeyboardInterrupt:

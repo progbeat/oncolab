@@ -313,6 +313,13 @@ class ParallelSSH(unittest.TestCase):
                 wait_file(root / "prerequisites")
                 self.assertFalse((root / "mount-started").exists())
                 self.assertIsNone(client.poll())
+                early_error = b""
+                if setup_fails:
+                    # In a pipe, don't hold an already failed task's error
+                    # until independent work (here the Drive config) finishes.
+                    self.assertTrue(select.select([client.stderr], [], [], 5)[0])
+                    early_error = client.stderr.readline()
+                    self.assertIn(b"[Setup failed] Independent setup (exit 7).", early_error)
                 if cancel_client:
                     wait_file(root / "control-attached")
                     client.send_signal(signal.SIGINT)
@@ -361,7 +368,7 @@ class ParallelSSH(unittest.TestCase):
                     self.assertIn(b"[VM release unconfirmed]", err)
                 elif setup_fails:
                     self.assertEqual((client.returncode, out), (7, b""))
-                    self.assertIn(b"[Setup failed] Independent setup (exit 7).", err)
+                    self.assertEqual(early_error + err, b"[Setup failed] Independent setup (exit 7).\n")
                 else:
                     self.assertEqual((client.returncode, out, err), (payload_status, b"untouched stdin\n", b""))
                 _, err = owner.communicate(timeout=10)

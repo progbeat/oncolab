@@ -274,7 +274,7 @@ def erase_remote_handoff():
     sys.stdout.flush()
 
 
-def show_owner_errors(stream):
+def show_owner_errors(stream, debug):
     stream.seek(0)
     shown = False
     for line in stream.read(16_384).decode(errors="replace").splitlines():
@@ -284,6 +284,9 @@ def show_owner_errors(stream):
         ):
             write_diagnostic(line)
             shown = True
+        elif debug and shown and re.fullmatch(r"(?:[A-Za-z_]+(?:Error|Exception)|"
+                                              r"  [A-Za-z0-9_.<>-]+:\d+ in [A-Za-z0-9_<>.]+)", line):
+            write_diagnostic(line)
     return shown
 
 
@@ -752,8 +755,16 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     if session_open_refused(log):
                         attempted.clear()
                         raise SSHBootstrapError(status, log)
-                    if not show_owner_errors(owner_errors):
-                        show_ssh_error(log, debug, recovery=allocation_hint(name, store))
+                    if not show_owner_errors(owner_errors, debug):
+                        owner_errors.seek(0)
+                        startup = owner_errors.read(16_384).decode(errors="replace")
+                        if status == 127 and re.search(r"(?m)^(?:[^\n]*: )?uv: (?:command )?not found\s*$",
+                                                       startup):
+                            attempted.clear()
+                            write_diagnostic(outcome("Setup could not start",
+                                                     "uv is not available on the Colab VM.", color=color))
+                            return 127, True
+                        show_ssh_error(log, debug, recovery=allocation_hint(name, store), status=status)
                     return status, False
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
@@ -792,7 +803,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if owner is not None and status:
                 # The runner can fail before the display channel connects.
                 # Never replay raw first-channel ProxyCommand diagnostics.
-                show_owner_errors(owner_errors)
+                show_owner_errors(owner_errors, debug)
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):

@@ -402,9 +402,12 @@ class Lifecycle:
         self.began = set()
         self.services = {}
         self.setup_output = None
+        self.setup_sink = None
 
     def write_setup_output(self, data):
-        if self.setup_output is not None:
+        if self.setup_sink is not None:
+            self.setup_sink(data)
+        elif self.setup_output is not None:
             self.setup_output.append(data)
         elif isinstance(data, bytes):
             sys.stderr.buffer.write(data)
@@ -706,13 +709,18 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
     return next((result for result in results if result), 0)
 
 
+def send_setup_diag(gate, data):
+    if isinstance(data, str):
+        data = (data + "\n").encode("utf-8", "backslashreplace")
+    for offset in range(0, len(data), 65536):
+        gate.send("diag", base64.b64encode(data[offset:offset + 65536]).decode())
+
+
 def send_setup_output(gate, lifecycle):
     messages, lifecycle.setup_output = lifecycle.setup_output or [], None
+    lifecycle.setup_sink = None
     for data in messages:
-        if isinstance(data, str):
-            data = (data + "\n").encode("utf-8", "backslashreplace")
-        for offset in range(0, len(data), 65536):
-            gate.send("diag", base64.b64encode(data[offset:offset + 65536]).decode())
+        send_setup_diag(gate, data)
     gate.send("end-output")
 
 
@@ -829,6 +837,8 @@ def main():
             saved_stderr = os.dup(sys.stderr.fileno())
             os.dup2(owner_reports.fileno(), sys.stderr.fileno())
             lifecycle.setup_output = []
+            if not plan.get("pipeline_terminal"):
+                lifecycle.setup_sink = partial(send_setup_diag, gate)
         if plan["mounts"]:
             path = Path(directory)
             st = path.lstat()
