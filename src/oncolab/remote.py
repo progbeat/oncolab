@@ -11,6 +11,9 @@ from functools import partial
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
+if __package__:
+    from .diagnostics import safe_subprocess_details
+
 
 def unassign():
     sp.Popen([sys.executable, "-P", "-c", r'''
@@ -524,10 +527,18 @@ async def setup_all(run, plan, drive, lifecycle=None):
             lifecycle.began.add(name)
             result = await run(description, command)
             if result is not None and result.returncode:
-                if result.stdout:
-                    sys.stderr.buffer.write(result.stdout)
-                if result.stderr:
-                    sys.stderr.buffer.write(result.stderr)
+                if name in ("fuse", "rclone"):
+                    # Built-in installers are managed commands, not profile
+                    # hooks. Their free-form output may contain internal traces.
+                    if plan.get("debug"):
+                        text = b"\n".join((result.stdout or b"", result.stderr or b"")).decode(errors="replace")
+                        for detail in safe_subprocess_details(text):
+                            print(detail, file=sys.stderr)
+                else:
+                    if result.stdout:
+                        sys.stderr.buffer.write(result.stdout)
+                    if result.stderr:
+                        sys.stderr.buffer.write(result.stderr)
                 if name != "copy":  # The local transfer reports its concrete error.
                     print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
                 return result.returncode
@@ -725,6 +736,8 @@ def main():
         finally:
             for number, handler in previous.items():
                 signal(number, handler)
+    if not released and (hint := plan.get("recovery_hint")):
+        print(f"oncolab: {hint}.", file=sys.stderr)
     return (status if status >= 0 else 128 - status) if released else 125
 
 

@@ -288,6 +288,22 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
 
 
 class CLI(unittest.TestCase):
+    def test_managed_install_failure_hides_raw_traceback(self):
+        from oncolab.progress import progress
+
+        fault = b'Traceback (most recent call last):\n  File "/fixture/install.py", line 9, in build\nRuntimeError: private fixture'
+        for debug in (False, True):
+            drive = Mock()
+            drive.socket.exists.return_value = False
+            with (patch.object(remote, "command_result", new=AsyncMock(return_value=subprocess.CompletedProcess(
+                       [], 23, b"", fault))), patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                status = progress(lambda run: remote.setup_all(run, {"setup": {}, "mounts": {}, "debug": debug}, drive),
+                                  False, False, capture=True)
+            self.assertEqual(status, 23)
+            self.assertIn("Preparing FUSE", stderr.getvalue())
+            self.assertNotIn("private fixture", stderr.getvalue())
+            self.assertEqual("install.py:9 in build" in stderr.getvalue(), debug)
+
     def test_legacy_mount_profile_never_reads_or_forwards_shared_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

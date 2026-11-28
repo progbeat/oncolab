@@ -19,6 +19,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
+from . import diagnostics
 from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
@@ -362,8 +363,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    remote = (f"_ONCOLAB_DEBUG = {debug!r}\n" + inspect.getsource(progress) + "\n"
-              + files("oncolab").joinpath("remote.py").read_text())
+    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", inspect.getsource(progress),
+                        inspect.getsource(diagnostics), files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
     labels = preparation_labels(config, bool(copies))
@@ -412,8 +413,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     for name, value in entries.items()}
         for directory, entries in staging.items()
     }).encode() if staging else b""
+    config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
-                          str(int(color)), json.dumps(config | {"debug": debug, "progress_labels": labels}), *command])
+                          str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
     with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
