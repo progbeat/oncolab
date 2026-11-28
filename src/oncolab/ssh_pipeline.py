@@ -309,6 +309,11 @@ def gated_command(peer, buffer, workdir, environment, command):
         try:
             if child is not None and not finished:
                 stop_gate_command(child)
+                if old_group is not None:
+                    # Interactive shells can move jobs into other process
+                    # groups. Do not tear down mounts on an external abort
+                    # unless we can prove the whole terminal session is idle.
+                    raise CommandStateUnknown("Could not confirm that the interactive command stopped")
         finally:
             if old_group is not None:
                 try:

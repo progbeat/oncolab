@@ -134,8 +134,11 @@ class ParallelSSH(unittest.TestCase):
     def test_user_environment_is_applied_after_admission(self):
         self.run_pipeline(native_env=True)
 
+    def test_payload_exit_125_does_not_report_vm_release_failure(self):
+        self.run_pipeline(payload_status=125)
+
     def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, release_fails=False,
-                     native_env=False):
+                     native_env=False, payload_status=255):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             if release_fails:
@@ -174,7 +177,7 @@ class ParallelSSH(unittest.TestCase):
                     'assert os.environ["SETUP_VALUE"] == "early"; '
                     'assert os.environ["COMMAND_VALUE"] == "late"; '
                     'assert os.environ["COLAB_DRIVE"] == "/mock/drive"; '
-                    'print(sys.stdin.read(), end=""); raise SystemExit(255)'
+                    f'print(sys.stdin.read(), end=""); raise SystemExit({payload_status})'
                 )
                 gate = embedded_gate(inspect.getsource(ssh_pipeline),
                                      (inspect.getsource(format_duration), inspect.getsource(progress)))
@@ -225,9 +228,9 @@ class ParallelSSH(unittest.TestCase):
                     self.assertEqual((client.returncode, out), (7, b""))
                     self.assertIn(b"[Setup failed] Independent setup (exit 7).", err)
                 else:
-                    self.assertEqual((client.returncode, out, err), (255, b"untouched stdin\n", b""))
+                    self.assertEqual((client.returncode, out, err), (payload_status, b"untouched stdin\n", b""))
                 _, err = owner.communicate(timeout=10)
-                expected = 125 if release_fails else (7 if setup_fails else 255)
+                expected = 125 if release_fails else (7 if setup_fails else payload_status)
                 self.assertEqual((owner.returncode, err), (expected, b""))
                 self.assertTrue((root / "owner-cleaned").exists())
                 self.assertEqual((root / "unassigned").exists(), not release_fails)

@@ -927,8 +927,9 @@ def main():
             try:
                 unassign()
             except OSError:
-                return 125
-        return (status if status >= 0 else 128 - status) if released else 125
+                return 125, False
+            return (status if status >= 0 else 128 - status), True
+        return 125, False
 
     if gate is not None:
         try:
@@ -953,10 +954,10 @@ def main():
         # Queue VM release only after forwarding teardown diagnostics, but
         # before acknowledging success. Never skip release on a broken sink.
         try:
-            final_status = release_vm()
+            final_status, release_queued = release_vm()
             if gate.peer is not None:
                 gate.peer.settimeout(.5)
-                if final_status == 125 and released:
+                if released and not release_queued:
                     hint = plan.get("recovery_hint", "Check 'colab sessions' for the VM")
                     gate.send("diag", base64.b64encode(
                         (outcome("VM release unconfirmed", hint + ".", color=_ONCOLAB_COLOR) + "\n").encode()
@@ -969,8 +970,8 @@ def main():
             if owner_reports is not None:
                 owner_reports.close()
     else:
-        final_status = release_vm()
-        if final_status == 125 and released:
+        final_status, release_queued = release_vm()
+        if released and not release_queued:
             report("VM release unconfirmed", plan.get("recovery_hint", "Check 'colab sessions' for the VM") + ".")
     if control_dir is not None:
         shutil.rmtree(control_dir, ignore_errors=True)
