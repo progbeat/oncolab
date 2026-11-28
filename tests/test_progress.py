@@ -6,6 +6,9 @@ import re
 import select
 import signal
 import struct
+import socket
+import tempfile
+import threading
 import subprocess
 import sys
 import termios
@@ -17,7 +20,8 @@ from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
 from oncolab.duration import format_duration
-from oncolab.progress import SetupTimeline
+from oncolab.cli import read_setup_summary
+from oncolab.progress import SetupTimeline, display_label, setup_summary_socket
 from oncolab.remote import Lifecycle
 
 
@@ -79,6 +83,36 @@ class Progress(unittest.TestCase):
         finally:
             os.close(writer)
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+
+    def test_control_characters_in_job_labels_stay_on_one_line(self):
+        self.assertEqual(display_label("line 1\nline 2\tfoo\x1b[31m"), "line 1 line 2 foo\\x1b[31m")
+
+    def test_forwarded_setup_summary_acknowledges_after_the_local_write(self):
+        from contextlib import contextmanager
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory(prefix="oc-summary-", dir="/tmp") as directory:
+            path = directory + "/summary.sock"
+            with socket.socket(socket.AF_UNIX) as probe:
+                try:
+                    probe.bind(directory + "/probe")
+                except OSError as exc:
+                    if exc.errno in (errno.EPERM, errno.EACCES):
+                        self.skipTest("sandbox does not allow Unix sockets")
+                    raise
+            stop = threading.Event()
+            stderr = StringIO()
+            with patch("sys.stderr", stderr), contextmanager(setup_summary_socket)(path) as send:
+                reader = threading.Thread(target=read_setup_summary, args=(path, stop, ["Setting up…"], False))
+                reader.start()
+                try:
+                    send([(0, "Setting up…", 0, 2)])
+                    self.assertRegex(stderr.getvalue(), r"^✓ Setting up… +2\.0s\n$")
+                finally:
+                    stop.set()
+                    reader.join(3)
+                self.assertFalse(reader.is_alive())
+            self.assertFalse(os.path.exists(path))
 
     def test_setup_checks_follow_readiness_and_drop_eliminated_branches(self):
         timeline = SetupTimeline()

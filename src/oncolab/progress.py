@@ -13,16 +13,21 @@ COPYING = "Copying files…"
 DRIVE_PREPARATION = ("Preparing FUSE…", "Preparing rclone…", "Starting Drive mounts…")
 
 
+def display_label(label):
+    return "".join(char if char.isprintable() else " " if char.isspace() else ascii(char)[1:-1]
+                   for char in label)
+
+
 def preparation_labels(plan, has_copy=False):
     labels = [ALLOCATING, CHECKING_LOGIN, WAITING, CONNECTING, STARTING_RUNNER, SETTING_UP]
     if has_copy:
         labels.append("  " + COPYING)
     setup = plan.get("setup", {})
-    labels.extend("  " + step["description"] for step in setup.values())
+    labels.extend("  " + display_label(step["description"]) for step in setup.values())
     if mounts := plan.get("mounts"):
         labels.extend("  " + label for label in (*DRIVE_PREPARATION, "Receiving Drive config…"))
         claimed = {step.get("mount") for step in setup.values()}
-        labels.extend(f"  Mounting {name.removeprefix('mounts.')}…" for name in mounts if name not in claimed)
+        labels.extend(display_label(f"  Mounting {name.removeprefix('mounts.')}…") for name in mounts if name not in claimed)
     return labels
 
 
@@ -41,7 +46,7 @@ class SetupTimeline:
             self.started, = fields
         elif kind == "setup-job":
             key, label, dependencies = fields
-            self.jobs[key] = (label, dependencies)
+            self.jobs[key] = (display_label(label) if label is not None else None, dependencies)
         elif kind == "setup-active":
             key, started = fields
             self.starts[key] = started
@@ -106,6 +111,7 @@ def completed_steps(rows, labels, color):
             return sum((2 if east_asian_width(char) in "WF" else 1)
                        for char in value if not combining(char))
 
+    rows = [(indent, display_label(label), started, ended) for indent, label, started, ended in rows]
     stream = sys.stderr
     tty = stream.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     color = color and tty
@@ -149,10 +155,53 @@ def completed_steps(rows, labels, color):
                 pending = pending[written:]
 
 
+def setup_summary_socket(path):
+    """A separate SSH stream keeps retained rows off the command's PTY."""
+    import json
+    import os
+    import socket
+    from contextlib import suppress
+
+    listener = None
+    bound = False
+    try:
+        if path:
+            try:
+                listener = socket.socket(socket.AF_UNIX)
+                listener.bind(path)
+                bound = True
+                os.chmod(path, 0o600)
+                listener.listen(1)
+                listener.settimeout(1)
+            except OSError:
+                if listener is not None:
+                    listener.close()
+                listener = None
+
+        def send(rows):
+            if listener is not None:
+                with suppress(OSError):
+                    peer, _ = listener.accept()
+                    with peer:
+                        peer.settimeout(.5)
+                        peer.sendall(json.dumps(rows).encode() + b"\n")
+                        # The local writer acknowledges after rendering to
+                        # stderr. Do not release a command into a stale frame.
+                        peer.recv(1)
+
+        yield send if path else None
+    finally:
+        if listener is not None:
+            listener.close()
+        if bound:
+            with suppress(OSError):
+                os.unlink(path)
+
+
 def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None, takeover=None,
-             setup=False, verbose=False):
+             setup=False, verbose=False, summary_path=None):
     import asyncio
-    from contextlib import ExitStack
+    from contextlib import ExitStack, contextmanager
     from inspect import iscoroutinefunction
     from os import killpg
     from signal import SIGKILL
@@ -161,7 +210,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
     # The remote runner receives this function and the duration formatter without their modules.
     refresh_interval = 0.1
     timeline = SetupTimeline() if setup else None
-    with ExitStack() as stack:
+    with ExitStack() as outer, ExitStack() as stack:
+        send_summary = outer.enter_context(contextmanager(setup_summary_socket)(summary_path)) if summary_path else None
         bar = None
         if live:
             from prompt_toolkit.filters import Condition
@@ -379,8 +429,10 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
         def setup_event(kind, *fields):
             timeline.event(kind, *fields)
             if bar is not None:
-                if kind == "setup-job" and fields[1]:
-                    reserve("  " + fields[1])
+                if kind == "setup-job":
+                    if fields[1]:
+                        reserve("  " + display_label(fields[1]))
+                    return
                 counters = []
                 for indent, label, started, ended in timeline.rows(verbose):
                     counter = ProgressBarCounter(bar, None, label, False, None)
@@ -393,9 +445,14 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
         if setup:
             run.setup_event = setup_event
         result = asyncio.run(work(run))
-    if verbose and timeline is not None and timeline.status == 0:
-        completed_steps(timeline.rows(True), labels, color)
-    return result
+        stack.close()
+        if verbose and timeline is not None and timeline.status == 0:
+            rows = timeline.rows(True)
+            if send_summary is not None:
+                send_summary(rows)
+            else:
+                completed_steps(rows, labels, color)
+        return result
 
 
 def run_step(label, command, live, color, *, labels=(), timed=True):

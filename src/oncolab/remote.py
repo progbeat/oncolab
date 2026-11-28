@@ -638,10 +638,7 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
         submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
         drive_dependencies = ("fuse", "rclone")
         if drive_config is not None:
-            async def receive_config():
-                await drive_config
-
-            submit("drive-config", "Receiving Drive config…", receive_config)
+            submit("drive-config", "Receiving Drive config…", drive_config)
             drive_dependencies += ("drive-config",)
         submit("rcd", "Starting Drive mounts…", drive.start, *drive_dependencies)
         drive_tasks.extend(("fuse", "rclone", "rcd"))
@@ -755,7 +752,6 @@ def send_setup_output(gate, lifecycle):
 async def pipeline_setup(run, lifecycle, plan, drive, gate):
     accepted = asyncio.create_task(gate.accept())
     stream, transport = await stdin_packets()
-    staged_config = None
     loop = asyncio.get_running_loop()
     watching = None
     descriptor = None
@@ -768,8 +764,6 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
             with os.fdopen(os.open(drive.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
                 file.write(raw)
 
-        if drive is not None:
-            staged_config = asyncio.create_task(receive_drive())
         run.setup_event = gate.send
 
         async def detect_disconnect():
@@ -796,7 +790,7 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
             loop.add_reader(descriptor, disconnected)
 
         watching = asyncio.create_task(detect_disconnect())
-        status = await lifecycle.prepare(run, plan, drive, staged_config)
+        status = await lifecycle.prepare(run, plan, drive, receive_drive if drive is not None else None)
         await accepted
         inherited = {key: value for key, value in os.environ.items()
                      if key in ("PATH", "COLAB_DRIVE") or key.startswith("ONCOLAB_MOUNT_")}
@@ -808,10 +802,6 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
             await asyncio.gather(watching, return_exceptions=True)
         if descriptor is not None:
             loop.remove_reader(descriptor)
-        if staged_config is not None:
-            if not staged_config.done():
-                staged_config.cancel()
-            await asyncio.gather(staged_config, return_exceptions=True)
         if not accepted.done():
             accepted.cancel()
         await asyncio.gather(accepted, return_exceptions=True)
@@ -907,7 +897,8 @@ def main():
             try:
                 status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
                                   capture=True, idle=handoff, takeover=lambda: takeover(erase=False),
-                                  setup=True, verbose=plan.get("verbose", False), **options)
+                                  setup=True, verbose=plan.get("verbose", False),
+                                  summary_path=plan.get("summary_path"), **options)
             finally:
                 lifecycle.flush_setup_output()
         if lifecycle.interrupted:

@@ -29,7 +29,8 @@ from .diagnostics import outcome, safe_subprocess_details
 from .duration import format_duration
 from .env import parse_env
 from .progress import (
-    ALLOCATING, CONNECTING, STARTING_RUNNER, WAITING, SetupTimeline, completed_steps, preparation_labels, progress, run_step,
+    ALLOCATING, CONNECTING, STARTING_RUNNER, WAITING, SetupTimeline, completed_steps, display_label, preparation_labels,
+    progress, run_step, setup_summary_socket,
 )
 
 
@@ -491,6 +492,44 @@ def feed_staging(stream, data):
             pass
 
 
+def tty_merges_separate_stderr(tty):
+    if tty != "-t":
+        return False
+    try:
+        return not os.path.samestat(os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno()))
+    except (OSError, ValueError):
+        return True
+
+
+def read_setup_summary(path, stop, labels, color):
+    while not stop.is_set():
+        try:
+            with socket.socket(socket.AF_UNIX) as peer:
+                peer.settimeout(.25)
+                peer.connect(path)
+                buffer = bytearray()
+                while not stop.is_set():
+                    try:
+                        data = peer.recv(65536)
+                    except TimeoutError:
+                        continue
+                    if not data:
+                        break  # The remote listener may not be up yet.
+                    buffer.extend(data)
+                    if len(buffer) > ssh_pipeline.CONTROL_LIMIT:
+                        return
+                    if buffer.endswith(b"\n"):
+                        rows = json.loads(buffer)
+                        try:
+                            completed_steps(rows, labels, color)
+                        finally:
+                            peer.sendall(b"1")
+                        return
+        except (OSError, ValueError):
+            pass
+        stop.wait(.12)
+
+
 async def wait_setup_listener(process):
     loop = asyncio.get_running_loop()
     fd = process.stdout.fileno()
@@ -526,11 +565,12 @@ def embedded_gate(protocol, render_source):
 
 
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
-                copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None, verbose=False, on_connect=None):
+                copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None, verbose=False):
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    render_source = tuple(inspect.getsource(item) for item in (format_duration, SetupTimeline, completed_steps, progress))
+    render_source = tuple(inspect.getsource(item) for item in
+                          (format_duration, display_label, SetupTimeline, completed_steps, setup_summary_socket, progress))
     remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", *render_source, inspect.getsource(diagnostics),
                         files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
@@ -578,6 +618,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     # The bootstrap channel must never read the command's stdin.
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
+    summary_path = drive_stage + "-summary.sock" if verbose and tty_merges_separate_stderr(tty) else None
+    if summary_path:
+        config["summary_path"] = summary_path
     config.update(debug=debug, verbose=verbose, progress_labels=labels, recovery_hint=allocation_hint(name, store))
     if live_payload:
         config["terminal_handoff"] = STARTING_RUNNER
@@ -589,7 +632,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
         remote = protocol + "\n" + remote
         gate_code = embedded_gate(protocol, render_source)
-        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint", "verbose") if key in config}
+        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint", "verbose", "summary_path") if key in config}
         command_plan.update(pipeline_role="command")
         payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
                               *config["entrypoint"], *command])
@@ -639,6 +682,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
         if endpoint:
             connect_options.extend(("-L", f"{endpoint}:{jobdir}/stdin.sock"))
+        summary_stop = Event()
+        local_summary = f"{tmp}/summary.sock" if summary_path else None
+        if local_summary:
+            connect_options.extend(("-L", f"{local_summary}:{summary_path}"))
         for local, remote_port in ports:
             connect_options.extend(("-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}"))
         terminal_connect = False
@@ -714,8 +761,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 if failure.rejected:
                     pending.clear()
                 raise failure
-            if on_connect is not None:
-                on_connect(connect_started, monotonic())
+            connect_ended = monotonic()
+            if verbose and not parallel:
+                completed_steps([(0, CONNECTING, connect_started, connect_ended)], labels, color)
             with suppress(OSError):
                 proxy_log.unlink(missing_ok=True)
             bootstrap_ready = True
@@ -774,6 +822,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                             return 127, True
                         show_ssh_error(log, debug, recovery=allocation_hint(name, store), status=status)
                     return status, False
+                if verbose:
+                    if live_payload:
+                        erase_remote_handoff()
+                    completed_steps([(0, CONNECTING, connect_started, connect_ended)], labels, color)
+                    if live_payload:
+                        show_remote_handoff(color)
+            if local_summary:
+                transfers.submit(read_setup_summary, local_summary, summary_stop, labels, color)
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
             attempted.set()
@@ -832,6 +888,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     status = status or 1
             return status, False
         finally:
+            summary_stop.set()
             try:
                 close_master()
             finally:
@@ -1053,14 +1110,6 @@ def retry_ssh(name, args, config, ini, known_hosts, command, copies, task_groups
     connection = AllocationLabel()
     wait = AllocationLabel()
     number = 0
-    connection_reported = False
-
-    def report_connection(started, ended):
-        nonlocal connection_reported
-        if not connection_reported:
-            completed_steps([(0, CONNECTING, started, ended)], labels, color)
-            connection_reported = True
-
     try:
         while True:
             number += 1
@@ -1071,8 +1120,7 @@ def retry_ssh(name, args, config, ini, known_hosts, command, copies, task_groups
                 return run_session(name, config, ini, known_hosts, command,
                                    args.forward_agent, terminal, color, attempted, copies=copies,
                                    store=store, debug=args.debug, task_copies=task_groups,
-                                   connect_label=connection, unclaimed=unclaimed, verbose=args.verbose,
-                                   on_connect=report_connection if args.verbose else None)
+                                   connect_label=connection, unclaimed=unclaimed, verbose=args.verbose)
             except SSHBootstrapError as exc:
                 if attempted.is_set():
                     raise

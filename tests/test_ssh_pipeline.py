@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 from oncolab import ssh_pipeline
 from oncolab.cli import call_command_ssh, embedded_gate
 from oncolab.duration import format_duration
-from oncolab.progress import SetupTimeline, completed_steps, progress
+from oncolab.progress import SetupTimeline, completed_steps, display_label, progress, setup_summary_socket
 from oncolab.ssh_pipeline import SETUP_LISTENING, packet
 
 
@@ -298,7 +298,7 @@ class ParallelSSH(unittest.TestCase):
                     f'print(sys.stdin.read(), end=""); raise SystemExit({payload_status})'
                 )
                 gate = embedded_gate(inspect.getsource(ssh_pipeline),
-                                     tuple(inspect.getsource(fn) for fn in (format_duration, SetupTimeline, completed_steps, progress)))
+                                     tuple(inspect.getsource(fn) for fn in (format_duration, display_label, SetupTimeline, completed_steps, setup_summary_socket, progress)))
                 command = ["/bin/sh", "-c", 'test "$PYTHONHOME" = /nonexistent && cat; exit 255'] if native_env else [
                     sys.executable, "-c", spawn]
                 if cancel_owner:
