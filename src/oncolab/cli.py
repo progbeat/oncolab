@@ -24,6 +24,7 @@ from .allocation import AllocationError, Cancellation, run_allocator, write_diag
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .diagnostics import outcome, safe_subprocess_details
+from .duration import format_duration
 from .env import parse_env
 from .progress import CONNECTING, STARTING_RUNNER, preparation_labels, progress, run_step
 
@@ -383,8 +384,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", inspect.getsource(progress),
-                        inspect.getsource(diagnostics), files("oncolab").joinpath("remote.py").read_text()))
+    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", inspect.getsource(format_duration),
+                        inspect.getsource(progress), inspect.getsource(diagnostics),
+                        files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
     labels = preparation_labels(config, bool(copies))

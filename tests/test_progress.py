@@ -15,10 +15,20 @@ import unittest
 from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
+from oncolab.duration import format_duration
 from oncolab.remote import Lifecycle
 
 
 class Progress(unittest.TestCase):
+    def test_durations_use_one_decimal_and_switch_units(self):
+        for seconds, expected in (
+            (-1, "0.0s"), (0, "0.0s"), (59.9, "59.9s"), (60, "1.0m"),
+            (90, "1.5m"), (3594, "59.9m"), (3600, "1.0h"), (5400, "1.5h"),
+            (86040, "23.9h"), (86400, "1.0d"), (129600, "1.5d"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds), expected)
+
     def test_outcome_only_colors_the_heading_on_a_terminal(self):
         with patch("sys.stderr.isatty", return_value=True), patch.dict(os.environ, TERM="xterm"):
             self.assertEqual(outcome("VM creation failed", "Unavailable.", color=True),
@@ -40,18 +50,19 @@ import asyncio
 import inspect
 import subprocess as sp
 import sys
+from time import monotonic
+from oncolab.allocation import AllocationLabel
+from oncolab.duration import format_duration as installed_format_duration
 from oncolab.progress import progress as installed_progress
-# The VM gets only this function's source, not the installed module.
+# The VM gets these functions' source, not the installed modules.
+exec(inspect.getsource(installed_format_duration))
 exec(inspect.getsource(installed_progress))
-class Allocation:
-    def __call__(self):
-        return "Waiting…"
-    def detail(self):
-        return "4s · 503 unavailable"
+allocation = AllocationLabel()
+allocation.state = ("Waiting…", "503 unavailable", monotonic() + 3 * 86400, "2/4")
 labels = ["Short…", "Long planned step with 漢", "Waiting…"]
 async def wait():
     await asyncio.sleep(.55)
-progress(lambda run: run(Allocation(), wait), True, True, labels=labels)
+progress(lambda run: run(allocation, wait), True, True, labels=labels)
 progress(lambda run: run("Short…", wait), True, True, labels=labels)
 print("READY_FOR_COMMAND")
 """
@@ -92,7 +103,8 @@ print("READY_FOR_COMMAND")
             expected_column = get_cwidth("Long planned step with 漢") + 2
             self.assertEqual(column("Waiting"), expected_column)
             self.assertEqual(column("Short"), expected_column)
-            self.assertIn(b"503", rendered)
+            plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+            self.assertRegex(plain, r"attempt 2/4 · 3\.0d · 503 unavailable[^\r\n]*[\r\n]")
             self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
         finally:
             os.close(fd)

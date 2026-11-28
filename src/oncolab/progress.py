@@ -1,6 +1,8 @@
 import subprocess as sp
 import sys
 
+from .duration import format_duration
+
 ALLOCATING = "Creating Colab VM…"
 CHECKING_LOGIN = "Checking Colab sign-in…"
 WAITING = "Waiting to retry…"
@@ -30,7 +32,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
     from os import killpg
     from signal import SIGKILL
 
-    # The remote runner receives this function's source without its module.
+    # The remote runner receives this function and the duration formatter without their modules.
     refresh_interval = 0.1
     with ExitStack() as stack:
         bar = None
@@ -83,7 +85,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
 
                 @staticmethod
                 def value(counter):
-                    return f"{monotonic() - counter.started:.1f}s"
+                    return format_duration(monotonic() - counter.started)
 
                 def get_width(self, progress_bar):
                     self.width = max([self.width, *(len(self.value(c)) for c in progress_bar.counters)])

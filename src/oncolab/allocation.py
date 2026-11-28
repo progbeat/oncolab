@@ -9,12 +9,14 @@ import subprocess as sp
 import sys
 from contextlib import nullcontext
 from importlib.resources import files
+from math import ceil
 from pathlib import Path
 from signal import SIGINT
 from tempfile import TemporaryFile
 from time import monotonic
 
 from .diagnostics import outcome, safe_subprocess_details
+from .duration import format_duration
 from .progress import CHECKING_LOGIN, run_step
 
 CHECK = "Check 'colab sessions' for an unconfirmed VM."
@@ -42,17 +44,18 @@ class Cancellation:
 
 
 class AllocationLabel:
-    state = (CHECKING_LOGIN, "", None)
+    state = (CHECKING_LOGIN, "", None, None)
 
     def __call__(self):
         return self.state[0]
 
     def detail(self):
-        _, detail, deadline = self.state
+        _, detail, deadline, attempt = self.state
         if deadline is None:
             return detail
-        from math import ceil
-        return f"{max(0, ceil(deadline - monotonic()))}s · {detail}"
+        # Round up to a tenth of a second so the countdown does not show zero early.
+        remaining = format_duration(ceil((deadline - monotonic()) * 10) / 10)
+        return " · ".join(part for part in (f"attempt {attempt}" if attempt else "", remaining, detail) if part)
 
 
 def colab_python():
@@ -135,7 +138,7 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, budget):
             now = monotonic()
             if (cancellation.requested or now >= hard_deadline) and interrupt_at is None:
                 interrupt_at = now
-                label.state = ("Cancelling allocation…", "checking Colab", None)
+                label.state = ("Cancelling allocation…", "checking Colab", None, None)
                 proc.send_signal(SIGINT)
                 if cancellation.read in selector.get_map():
                     selector.unregister(cancellation.read)
@@ -168,10 +171,13 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, budget):
                     continue
                 if message := event.get("label"):
                     deadline = event.get("deadline")
-                    label.state = (message, event.get("detail", ""), deadline)
+                    label.state = (message, event.get("detail", ""), deadline, event.get("attempt"))
                     hard_deadline = (deadline or monotonic()) + budget
                 if message := event.get("error"):
                     explained = True
+                    delay = event.get("retry_after")
+                    if type(delay) in (int, float) and 0 < delay < float("inf"):
+                        message += f"; retry after {format_duration(delay)}"
                     if event.get("unconfirmed"):
                         # Group the original refusal and the next action, not
                         # two separate failure messages for the same request.
