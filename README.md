@@ -96,9 +96,13 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   waits for that holdoff to finish or for Ctrl+C. The existing `COLAB_CLI_REQUEST_TIMEOUT`,
   `COLAB_CLI_RETRY_BACKOFF`, and `COLAB_CLI_ASSIGN_RETRIES` environment settings still apply;
   `--attempts` overrides the last one.
-- Use `--debug` for internal diagnostic locations without raw credential data. The main command's
-  output is unchanged. As before, configured setup commands report captured output only on failure,
-  service and readiness output stays quiet, and teardown output goes to stderr.
+- Interactive preparation is transient and disappears before the command starts. If OpenSSH may
+  need a key passphrase or password, it owns the terminal during authentication. With redirected
+  stdout there is no live display. `oncolab` explains its own failures separately, without
+  adding a completion message for the remote command. Use `--debug` for internal diagnostic
+  locations without raw credential data. The main command's output is unchanged. Configured setup
+  commands report captured output only on failure, service and readiness output stays quiet, and
+  teardown output goes to stderr.
 - **Command not found:** run `uv tool update-shell` and reopen your terminal.
 - **SSH fails:** check [key selection](https://github.com/progbeat/oncolab/blob/master/docs/configuration.md#ssh); `oncolab`
   doesn't read `~/.ssh/config` for the Colab connection. If OpenSSH may need to

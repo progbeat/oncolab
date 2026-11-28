@@ -249,7 +249,7 @@ class Allocation:
                     break
                 sleep(max(0, min(.45, deadline - monotonic())))
         if not self.endpoint:
-            emit(error="Could not confirm whether a VM was allocated; check 'colab sessions'.")
+            emit(error="Could not confirm allocation; check 'colab sessions'.", unconfirmed=True)
             return
         path = "/unassign/" + self.endpoint
         release = self.request("GET", path, timeout=2)
@@ -319,7 +319,7 @@ def main():
             try:
                 backend.cleanup()
             except Exception as exc:
-                emit(error=f"Could not verify release of VM {backend.endpoint!r}; check 'colab sessions'.")
+                emit(error=f"Could not verify release of VM {backend.endpoint!r}; check 'colab sessions'.", unconfirmed=True)
                 debug_error(exc, debug == "1")
             finally:
                 Path(store).unlink(missing_ok=True)

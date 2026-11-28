@@ -1,10 +1,12 @@
 import argparse
+import asyncio
 import base64
 import inspect
 import json
 import os
 import re
 import secrets
+import selectors
 import shlex
 import socket
 import subprocess as sp
@@ -23,9 +25,9 @@ from . import diagnostics
 from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
-from .diagnostics import safe_subprocess_details
+from .diagnostics import outcome, safe_subprocess_details
 from .env import parse_env
-from .progress import CONNECTING, preparation_labels, progress, run_step
+from .progress import CONNECTING, STARTING_RUNNER, preparation_labels, progress, run_step
 
 
 @contextmanager
@@ -66,8 +68,8 @@ def allocation_hint(name, store):
     except (OSError, ValueError, KeyError, TypeError):
         endpoint = None
     if isinstance(endpoint, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", endpoint):
-        return f"check 'colab sessions' for VM {endpoint!r}"
-    return "check 'colab sessions' for the VM"
+        return f"Check 'colab sessions' for VM {endpoint!r}"
+    return "Check 'colab sessions' for the VM"
 
 
 def release(name, terminal, color, store=None, *, debug=False):
@@ -89,7 +91,7 @@ def release(name, terminal, color, store=None, *, debug=False):
             details.append("  colab stop timed out")
         except OSError as exc:
             details.append(f"  {type(exc).__name__} starting colab stop")
-    write_diagnostic(f"oncolab: could not confirm release; {hint}")
+    write_diagnostic(outcome("VM release unconfirmed", hint, color=color))
     if debug:
         for detail in details:
             write_diagnostic(detail)
@@ -240,6 +242,56 @@ def call_with_upload(argv, transfer):
             process.terminate()
             process.wait()
 
+def call_tty_payload(argv, transfer, color, labels):
+    # SSH keeps the actual stdin for terminal modes, signals, escape keys and
+    # window size. Only the authenticated mux exec has its output relayed.
+    with sp.Popen(argv, stdout=sp.PIPE, stderr=sp.PIPE) as process, selectors.DefaultSelector() as outputs:
+        outputs.register(process.stdout, selectors.EVENT_READ, sys.stdout.buffer)
+        outputs.register(process.stderr, selectors.EVENT_READ, sys.stderr.buffer)
+
+        def stalled_copy():
+            return transfer is not None and transfer.done() and not transfer.result()[1] and process.poll() is None
+
+        def read_output(timeout):
+            for key, _ in outputs.select(timeout):
+                data = os.read(key.fd, 65536)
+                if data:
+                    return key.data, data
+                outputs.unregister(key.fd)
+            return None
+
+        async def initial_output():
+            # Poll without a worker thread: cancellation must not wait for
+            # a blocked reader before it can terminate SSH.
+            while outputs.get_map() and not stalled_copy():
+                if chunk := read_output(0):
+                    return chunk
+                if outputs.get_map():
+                    await asyncio.sleep(.05)
+            return None
+
+        try:
+            # Erase the local status before the first terminal bytes (also
+            # on early SSH errors), or on EOF if SSH produced no output.
+            chunk = run_step(STARTING_RUNNER, initial_output, True, color, labels=labels)
+            while chunk is not None or outputs.get_map():
+                if chunk is not None:
+                    output, data = chunk
+                    try:
+                        output.write(data)
+                        output.flush()
+                    except BrokenPipeError:
+                        # Still drain SSH if the diagnostic sink closes.
+                        pass
+                if stalled_copy():
+                    return 255
+                chunk = read_output(.2)
+            return 255 if stalled_copy() else process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+
 
 def upload_stream(endpoint, key, source):
     # Unlike an SSH exec channel, each streamlocal forward is not counted
@@ -294,7 +346,7 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None, *, debug=False):
                 if error:
                     # Ready services can finish receiving stdin after the command starts.
                     # Report late failures now, without cutting off SSH or teardown.
-                    print(f"oncolab: {error}", file=sys.stderr, flush=True)
+                    write_diagnostic(outcome("Copy failed", error))
             if not notified and broker.poll() is None:
                 # Dropping only the broker wakes the remote copy waiters.
                 broker.terminate()
@@ -315,7 +367,7 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None, *, debug=False):
         if broker.wait():
             diagnostic.seek(0)
             error = copy_detail(diagnostic) or "task copy channel disconnected"
-            print(f"oncolab: {error}", file=sys.stderr, flush=True)
+            write_diagnostic(outcome("Copy failed", error))
             errors.append(error)
             for job in jobs:
                 job.cancel()
@@ -413,7 +465,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     for name, value in entries.items()}
         for directory, entries in staging.items()
     }).encode() if staging else b""
+    tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
+    live_payload = terminal and tty == "-t"
     config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
+    if live_payload:
+        config["terminal_handoff"] = STARTING_RUNNER
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
                           str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
@@ -468,8 +524,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     except (OSError, sp.TimeoutExpired):
                         confirmed = False
                     if not confirmed:
-                        print(f"oncolab: could not confirm cleanup of unclaimed credentials for {name!r}",
-                              file=sys.stderr)
+                        write_diagnostic(outcome("VM cleanup unconfirmed",
+                                                 f"Could not confirm cleanup of unclaimed credentials for {name!r}.",
+                                                 color=color))
             finally:
                 sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
@@ -483,12 +540,27 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if connected.returncode:
                 show_ssh_error(connected.stderr, debug)
                 return connected.returncode, True
-            tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
             attempted.set()
             transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
             task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
-            argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
-            status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            # Keep native SSH errors separate from the command's stderr.
+            # Mux and payload failures can both return 255; only a captured
+            # SSH error is evidence for reporting a connection failure.
+            ssh_log = Path(tmp) / "payload-ssh.log"
+            argv = [*ssh, "-E", str(ssh_log), "-o", "ProxyCommand=false",
+                    "-o", "ControlMaster=no", tty, target, payload]
+            if live_payload:
+                status = call_tty_payload(argv, transfer, color, labels)
+            else:
+                status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            if status == 255:
+                try:
+                    with ssh_log.open("rb") as log:
+                        ssh_error = log.read(16_384)
+                except OSError:
+                    ssh_error = b""
+                if ssh_error:
+                    show_ssh_error(ssh_error, debug, recovery=allocation_hint(name, store))
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
@@ -496,7 +568,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if transfer:
                 error, _ = transfer.result()
                 if error:
-                    print(f"oncolab: {error}", file=sys.stderr)
+                    write_diagnostic(outcome("Copy failed", error, color=color))
                     status = status or 1
             if task_upload:
                 try:
@@ -512,12 +584,12 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             close_master()
 
 
-def show_ssh_error(stderr, debug):
+def show_ssh_error(stderr, debug, *, recovery=None):
     text = (stderr or b"").decode(errors="replace")
     # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
     # the staging protocol can be reported without exposing URLs or tokens.
     if stage := re.search(r"^oncolab-stage: ([A-Za-z]+)$", text, re.MULTILINE):
-        write_diagnostic("oncolab: Could not stage setup files on the Colab VM.")
+        write_diagnostic(outcome("Setup could not start", "Could not stage setup files on the Colab VM."))
         if debug:
             write_diagnostic(f"oncolab: staging exception: {stage[1]}")
         return
@@ -531,10 +603,15 @@ def show_ssh_error(stderr, debug):
         ("REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH host key changed; verify it before reconnecting."),
         ("Connection timed out", "SSH connection timed out."),
         ("Connection refused", "SSH connection was refused."),
-        ("Connection closed", "The SSH connection closed before setup started."),
+        ("Connection closed", "The SSH connection closed."),
+        ("mux_client_request_session:", "The SSH session could not be opened."),
+        ("mux_client_read_packet:", "The SSH connection closed."),
     )
     hint = next((message for marker, message in reasons if marker in text), None)
-    write_diagnostic("oncolab: " + (hint or "SSH connection failed. Check your SSH key and Colab session."))
+    message = hint or ("OpenSSH could not complete the session." if recovery else "Check your SSH key and Colab session.")
+    if recovery:
+        message += " " + recovery + "."
+    write_diagnostic(outcome("SSH connection failed", message))
     if debug:
         # Standard Python frame locations are useful without dumping source,
         # rich traceback locals, or a remote request's headers.
@@ -559,7 +636,7 @@ def main():
         return 130
     except Exception as exc:
         # Includes failures that occur before an allocation can exist.
-        print("oncolab: Unexpected internal error. Use --debug for details.", file=sys.stderr)
+        write_diagnostic(outcome("oncolab failed", "Unexpected internal error. Use --debug for details."))
         if args is not None and args.debug:
             debug_internal(exc)
         return 1
@@ -644,8 +721,10 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
                                        store=store, debug=args.debug, task_copies=task_groups)
         if fallback:
             release(name, terminal, color, store, debug=args.debug)
-        if attempted.is_set() and (status == 255 or status < 0):
-            write_diagnostic(f"oncolab: SSH status is ambiguous; {allocation_hint(name, store)}")
+        # OpenSSH's positive 255 is indistinguishable from a legitimate
+        # remote exit 255. Do not diagnose the payload's exit status.
+        if attempted.is_set() and status < 0:
+            write_diagnostic(outcome("SSH outcome unconfirmed", allocation_hint(name, store), color=color))
         return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
         # After SSH takes ownership, the existing remote teardown owns release.
@@ -658,18 +737,18 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
             finally:
                 signal(SIGINT, previous)
         elif name:
-            write_diagnostic(f"oncolab: {allocation_hint(name, store)} if it is still running")
+            write_diagnostic(outcome("VM status unconfirmed", allocation_hint(name, store) + ".", color=color))
         cancel_footer(False, color)
         return 130
     except (AllocationError, OSError) as exc:
-        write_diagnostic(f"oncolab: {exc}")
+        write_diagnostic(outcome("Could not start session", str(exc), color=color))
     except Exception as exc:
-        write_diagnostic("oncolab: Unexpected internal error. Use --debug for details.")
+        write_diagnostic(outcome("oncolab failed", "Unexpected internal error. Use --debug for details.", color=color))
         if args.debug:
             debug_internal(exc)
     name = name or stored_session_name(store)
     if name and not attempted.is_set():
         release(name, terminal, color, store, debug=args.debug)
     elif name:
-        write_diagnostic(f"oncolab: {allocation_hint(name, store)} if it is still running")
+        write_diagnostic(outcome("VM status unconfirmed", allocation_hint(name, store) + ".", color=color))
     return 1

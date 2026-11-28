@@ -261,18 +261,27 @@ class InstalledCLI(unittest.TestCase):
                 self.assertNotIn("secret-token", err)
                 self.assertEqual("auth.py:12 in open_session" in err, debug)
 
+    def test_unconfirmed_vm_reports_one_actionable_outcome_without_color_to_pipe(self):
+        with tempfile.TemporaryDirectory() as tmp, self.run_cli("unconfirmed", tmp) as proc:
+            out, err = proc.communicate(timeout=8)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(out, "")
+            self.assertEqual(err, "[VM creation unconfirmed] HTTP 503: Colab service unavailable. "
+                                  "Could not confirm allocation; check 'colab sessions'.\n")
+
     def test_sigint_during_backoff_exits_promptly(self):
-        import select
         with tempfile.TemporaryDirectory() as tmp, self.run_cli("cancel", tmp) as proc:
             try:
-                self.assertTrue(select.select([proc.stderr], [], [], 8)[0])
-                self.assertIn("TEST_BACKOFF_STARTED", proc.stderr.readline())
+                ready = Path(tmp) / "ready"
+                deadline = time.monotonic() + 8
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(ready.is_file())
                 proc.send_signal(signal.SIGINT)
                 out, err = proc.communicate(timeout=5)
                 self.assertEqual(proc.returncode, 130)
                 self.assertEqual(out, "")
-                self.assertIn("[cancelled]", err)
-                self.assertNotIn("Traceback", err)
+                self.assertEqual(err, "[cancelled]\n")
             finally:
                 if proc.poll() is None:
                     proc.kill()

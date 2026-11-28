@@ -14,8 +14,8 @@ from signal import SIGINT
 from tempfile import TemporaryFile
 from time import monotonic
 
-from .diagnostics import safe_subprocess_details
-from .progress import CHECKING_LOGIN, WAITING, run_step
+from .diagnostics import outcome, safe_subprocess_details
+from .progress import CHECKING_LOGIN, run_step
 
 CHECK = "Check 'colab sessions' for an unconfirmed VM."
 
@@ -94,7 +94,7 @@ def write_diagnostic(message):
         pass
 
 
-def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
+def launch(argv, label, cancellation, diagnostics, *, debug, budget):
     if cancellation.requested:
         return 130
     debug_stream = TemporaryFile() if debug else nullcontext(None)
@@ -103,7 +103,7 @@ def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
                       stderr=error_stream if error_stream is not None else sp.DEVNULL,
                       start_new_session=True, bufsize=0) as proc:
             try:
-                return supervise(proc, label, cancellation, diagnostics, debug=debug, live=live, budget=budget)
+                return supervise(proc, label, cancellation, diagnostics, debug=debug, budget=budget)
             finally:
                 if proc.poll() is None:
                     # Do not let an unexpected error in the monitor turn Popen's
@@ -113,7 +113,7 @@ def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
                         proc.wait(timeout=11)
                     except sp.TimeoutExpired:
                         proc.kill()
-                        diagnostics.append(f"oncolab: {CHECK}")
+                        diagnostics.append(("VM status unconfirmed", CHECK))
                 if error_stream is not None:
                     # Native launcher/import failures happen before the JSON
                     # protocol. Keep only a bounded tail, never raw stderr.
@@ -123,7 +123,7 @@ def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
                     diagnostics.extend(safe_subprocess_details(text))
 
 
-def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
+def supervise(proc, label, cancellation, diagnostics, *, debug, budget):
     with selectors.DefaultSelector() as selector:
         selector.register(proc.stdout, selectors.EVENT_READ)
         selector.register(cancellation.read, selectors.EVENT_READ)
@@ -142,9 +142,9 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
             if interrupt_at is not None and now - interrupt_at >= 11:
                 proc.kill()
                 if cancellation.requested:
-                    diagnostics.append(f"oncolab: {CHECK}")
+                    diagnostics.append(("VM status unconfirmed", CHECK))
                     return 130
-                diagnostics.append(f"oncolab: Timed out waiting for Colab. {CHECK}")
+                diagnostics.append(("VM creation timed out", CHECK))
                 return 124
             deadline = hard_deadline if interrupt_at is None else interrupt_at + 11
             ready = selector.select(min(3600, max(0, deadline - monotonic())))
@@ -170,26 +170,34 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
                     deadline = event.get("deadline")
                     label.state = (message, event.get("detail", ""), deadline)
                     hard_deadline = (deadline or monotonic()) + budget
-                    if not live and message == WAITING:
-                        write_diagnostic(f"oncolab: {message} {label.detail()}")
                 if message := event.get("error"):
                     explained = True
-                    diagnostics.append(f"oncolab: {message}")
+                    if event.get("unconfirmed"):
+                        # Group the original refusal and the next action, not
+                        # two separate failure messages for the same request.
+                        for idx, item in enumerate(diagnostics):
+                            if isinstance(item, tuple) and item[0] == "VM creation failed":
+                                diagnostics[idx] = ("VM creation unconfirmed", f"{item[1].rstrip('.')}. {message}")
+                                break
+                        else:
+                            diagnostics.append(("VM status unconfirmed", message))
+                    else:
+                        diagnostics.append(("VM creation failed", message))
                 if debug and (message := event.get("debug")):
                     diagnostics.append(message)
         try:
             status = proc.wait(timeout=1)
         except sp.TimeoutExpired:
             proc.kill()
-            diagnostics.append(f"oncolab: {CHECK}")
+            diagnostics.append(("VM status unconfirmed", CHECK))
             return 130 if cancellation.requested else 1
         if interrupt_at is not None and not cancellation.requested:
-            diagnostics.append("oncolab: Timed out waiting for Colab. " + CHECK)
+            diagnostics.append(("VM creation timed out", CHECK))
             return 124
         elif status < 0 and cancellation.requested:
-            diagnostics.append(f"oncolab: {CHECK}")
+            diagnostics.append(("VM status unconfirmed", CHECK))
         elif status and not (cancellation.requested or explained):
-            diagnostics.append(f"oncolab: The Colab allocator exited unexpectedly (status {status}). {CHECK}")
+            diagnostics.append(("VM creation failed", f"The Colab allocator exited unexpectedly (status {status}). {CHECK}"))
         return status if status >= 0 else (130 if cancellation.requested else 1)
 
 
@@ -206,14 +214,14 @@ def run_allocator(args, store, name, terminal, color, cancellation, labels):
     diagnostics = []
     try:
         status = run_step(label, lambda: launch(argv, label, cancellation, diagnostics,
-                                                debug=args.debug, live=terminal, budget=budget),
+                                                debug=args.debug, budget=budget),
                           terminal, color, labels=labels)
     finally:
         # Do not write diagnostics over the live prompt-toolkit renderer.
         for message in diagnostics:
             # A signal can arrive between this call and os.write. Never
             # block here while the allocation handler is still installed.
-            write_diagnostic(message)
+            write_diagnostic(outcome(*message, color=color) if isinstance(message, tuple) else message)
     if status == 0 and not store.is_file():
         raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
     return status

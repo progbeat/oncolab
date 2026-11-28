@@ -5,12 +5,13 @@ ALLOCATING = "Creating Colab VM…"
 CHECKING_LOGIN = "Checking Colab sign-in…"
 WAITING = "Waiting to retry…"
 CONNECTING = "Connecting via SSH…"
+STARTING_RUNNER = "Preparing remote command…"
 COPYING = "Copying files…"
 DRIVE_PREPARATION = ("Preparing FUSE…", "Preparing rclone…", "Starting Drive mounts…")
 
 
 def preparation_labels(plan, has_copy=False):
-    labels = [ALLOCATING, CHECKING_LOGIN, WAITING, CONNECTING]
+    labels = [ALLOCATING, CHECKING_LOGIN, WAITING, CONNECTING, STARTING_RUNNER]
     if has_copy:
         labels.append(COPYING)
     setup = plan.get("setup", {})
@@ -22,7 +23,7 @@ def preparation_labels(plan, has_copy=False):
     return labels
 
 
-def progress(work, live, color, *, capture=False, labels=(), timed=True):
+def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None):
     import asyncio
     from contextlib import ExitStack
     from inspect import iscoroutinefunction
@@ -151,6 +152,12 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                 style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan"} if color else {}),
                 input=keys, output=output,
             )
+            if idle:
+                # Avoid a blank first frame while the remote event loop
+                # schedules tasks, and a blank gap between task groups.
+                waiting = ProgressBarCounter(bar, None, idle, False, None)
+                waiting.started = monotonic()
+                bar.counters.append(waiting)
             stack.enter_context(bar)
 
         def reserve(label):
@@ -165,9 +172,12 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
             if bar is not None:
                 # Publish the counter only after its monotonic timestamp is
                 # initialized; the renderer runs in its own thread.
-                counter = ProgressBarCounter(bar, None, label, True, None)
+                counter = ProgressBarCounter(bar, None, label, not idle, None)
                 counter.started = monotonic()
-                bar.counters.append(counter)
+                if idle and bar.counters == [waiting]:
+                    bar.counters[:] = [counter]
+                else:
+                    bar.counters.append(counter)
                 bar.invalidate()
             try:
                 if iscoroutinefunction(command):
@@ -191,6 +201,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
             finally:
                 if counter is not None:
                     counter.done = True
+                    if idle:
+                        bar.counters[:] = [c for c in bar.counters if c is not counter] or [waiting]
                     bar.invalidate()
 
         run.reserve = reserve

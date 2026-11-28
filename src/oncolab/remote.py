@@ -12,7 +12,14 @@ from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
 
 if __package__:
-    from .diagnostics import safe_subprocess_details
+    from .diagnostics import outcome, safe_subprocess_details
+
+
+_ONCOLAB_COLOR = False
+
+
+def report(label, message):
+    print(outcome(label, message, color=_ONCOLAB_COLOR), file=sys.stderr)
 
 
 def unassign():
@@ -154,7 +161,7 @@ class DriveMounts:
         target = Path(target)
         if target in self.attached:
             if sp.call(["umount", "--", target]):
-                print(f"oncolab: could not unmount {target}; leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Could not unmount {target}.")
                 return False
             self.attached.remove(target)
         return True
@@ -163,7 +170,7 @@ class DriveMounts:
         self.seal()
         results = [self.detach(path) for path in reversed(self.attached[:]) if path not in preserve]
         if self.uncertain:
-            print("oncolab: Drive mount state is uncertain; leaving the VM and daemon running", file=sys.stderr)
+            report("VM left running", "Drive mount state is uncertain; the mount daemon is still running.")
         if not all(results) or self.attached or keep_daemon or self.uncertain:
             return False
         if self.server is not None:
@@ -265,7 +272,7 @@ def stop_process(proc):
         try:
             proc.wait(timeout=5)
         except sp.TimeoutExpired:
-            print(f"oncolab: could not stop process {proc.pid}", file=sys.stderr)
+            report("Process still running", f"Could not stop process {proc.pid}.")
             return False
     # A shell may exit before its process group. Do not leave descendants alive.
     try:
@@ -465,8 +472,8 @@ class Lifecycle:
                     Path(result).with_name("cancelled").touch()
                     archives[name] = result
                 except OSError as exc:
-                    print(f"oncolab: could not cancel copy for {self.nodes[name][0]['description']}: "
-                          f"{exc.strerror}; leaving the VM running", file=sys.stderr)
+                    report("VM left running", f"Could not cancel copy for {self.nodes[name][0]['description']}: "
+                           f"{exc.strerror}.")
                     hold(name)
                     failed = True
         deadline = time.monotonic() + 5
@@ -476,8 +483,7 @@ class Lifecycle:
             except OSError:
                 idle = False
             if not idle:
-                print(f"oncolab: copy for {self.nodes[name][0]['description']} did not stop; "
-                      "leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Copy for {self.nodes[name][0]['description']} did not stop.")
                 hold(name)
                 failed = True
 
@@ -495,10 +501,9 @@ class Lifecycle:
                     ok = drive.detach(target)
                 if ok:
                     continue
-                print(f"oncolab: teardown of {step['description']} failed; leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Teardown of {step['description']} failed.")
             except OSError as exc:
-                print(f"oncolab: teardown of {step['description']} failed: {exc.strerror}; leaving the VM running",
-                      file=sys.stderr)
+                report("VM left running", f"Teardown of {step['description']} failed: {exc.strerror}.")
             failed = True
             hold(name)
         preserve = {Path(step["mount_target"]) for name, (step, _) in self.nodes.items()
@@ -540,7 +545,7 @@ async def setup_all(run, plan, drive, lifecycle=None):
                     if result.stderr:
                         sys.stderr.buffer.write(result.stderr)
                 if name != "copy":  # The local transfer reports its concrete error.
-                    print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
+                    report("Setup failed", f"{description} (exit {result.returncode}).")
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
@@ -636,7 +641,7 @@ async def setup_all(run, plan, drive, lifecycle=None):
                         except RuntimeError:
                             if not (any(mount_results) or lifecycle.interrupted):
                                 raise
-                            print("oncolab: could not detach rclone from its staging path", file=sys.stderr)
+                            report("Drive cleanup incomplete", "Could not detach rclone from its staging path.")
             finally:
                 drive.seal()
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -652,7 +657,9 @@ async def setup_all(run, plan, drive, lifecycle=None):
 
 
 def main():
+    global _ONCOLAB_COLOR
     directory, color, raw_plan, *command = sys.argv[1:]
+    _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     os.environ["PATH"] = str(Path.home() / ".local/bin") + ":" + os.environ["PATH"]
@@ -696,7 +703,9 @@ def main():
             os.environ["COLAB_DRIVE"] = work["target"]
         lifecycle.environment = os.environ | setup_env
         options = {"labels": plan["progress_labels"]} if "progress_labels" in plan else {}
-        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1", capture=True, **options)
+        handoff = plan.get("terminal_handoff")
+        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
+                          capture=True, idle=handoff, **options)
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:
@@ -705,15 +714,19 @@ def main():
             try:
                 environment = {name: value for name, value in (lifecycle.environment | command_env).items()
                                if value is not None}
+                if handoff and not live:
+                    # Let the local relay yield even if the command is silent
+                    # and SSH did not negotiate a usable remote terminal.
+                    print("\x1b[0m", end="", flush=True)
                 with sp.Popen(argv, env=environment) as cmd:
                     lifecycle.command = cmd
                     code = cmd.wait()
                 status = code if code >= 0 else 128 - code
             except OSError as exc:
-                print(f"oncolab: {argv[0]}: {exc.strerror}", file=sys.stderr)
+                report("Command could not start", f"{argv[0]}: {exc.strerror}.")
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
-        print(f"oncolab: {exc}", file=sys.stderr)
+        report("Remote preparation failed", str(exc))
         status = status or 1
     except Exception as exc:
         internal_error("remote preparation", exc, plan.get("debug"))
@@ -725,7 +738,7 @@ def main():
             if jobdir:
                 shutil.rmtree(jobdir, ignore_errors=True)
         except OSError as exc:
-            print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)
+            report("VM left running", f"Cleanup failed: {exc.strerror}.")
             released = False
         except Exception as exc:
             internal_error("remote cleanup; leaving the VM running", exc, plan.get("debug"))
@@ -737,12 +750,12 @@ def main():
             for number, handler in previous.items():
                 signal(number, handler)
     if not released and (hint := plan.get("recovery_hint")):
-        print(f"oncolab: {hint}.", file=sys.stderr)
+        report("Check VM state", f"{hint}.")
     return (status if status >= 0 else 128 - status) if released else 125
 
 
 def internal_error(operation, exc, debug):
-    print(f"oncolab: Unexpected internal error during {operation}. Use --debug for details.", file=sys.stderr)
+    report("oncolab failed", f"Unexpected internal error during {operation}. Use --debug for details.")
     if debug:
         from traceback import extract_tb
         print(type(exc).__name__, file=sys.stderr)

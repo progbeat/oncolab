@@ -377,7 +377,7 @@ target = "/mnt/work"
                                              ["true"], False, False, False, Event())
                 self.assertEqual(result, (255, False))
                 self.assertEqual(operations[1:], ["recover", "close"])
-                self.assertEqual("could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
+                self.assertEqual("Could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
 
     def test_missing_or_disabled_rclone_config_fails_before_allocation(self):
         with tempfile.TemporaryDirectory() as tmp:

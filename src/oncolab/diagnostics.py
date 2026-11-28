@@ -1,5 +1,16 @@
-"""Extract diagnostic locations from subprocess output without replaying its data."""
+"""Human-facing outcomes and safe diagnostic locations."""
+import os
+import sys
 import re
+
+
+def outcome(label, message, *, color=None):
+    if color is None:
+        color = not os.environ.get("NO_COLOR")
+    heading = f"[{label}]"
+    if color and sys.stderr.isatty() and os.environ.get("TERM", "dumb") != "dumb":
+        heading = f"\x1b[31m{heading}\x1b[0m"
+    return f"{heading} {message}"
 
 
 def safe_subprocess_details(text):

@@ -28,6 +28,10 @@ if mode == "crash":
 if mode == "login":
     print(json.dumps({"error": "No usable Colab credentials. Run 'colab sessions' in a terminal to sign in."}), flush=True)
     sys.exit(1)
+if mode == "unconfirmed":
+    print(json.dumps({"error": "HTTP 503: Colab service unavailable"}), flush=True)
+    print(json.dumps({"error": "Could not confirm allocation; check 'colab sessions'.", "unconfirmed": True}), flush=True)
+    sys.exit(1)
 if mode == "cancel":
     print(json.dumps({"label": "Waiting to retry…", "detail": "TEST_BACKOFF_STARTED", "deadline": time.monotonic() + 40}), flush=True)
     if ready := os.environ.get("TEST_ALLOCATION_READY"):

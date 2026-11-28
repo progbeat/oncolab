@@ -12,9 +12,19 @@ import termios
 from prompt_toolkit.utils import get_cwidth
 import time
 import unittest
+from unittest.mock import patch
+
+from oncolab.diagnostics import outcome
 
 
 class Progress(unittest.TestCase):
+    def test_outcome_only_colors_the_heading_on_a_terminal(self):
+        with patch("sys.stderr.isatty", return_value=True), patch.dict(os.environ, TERM="xterm"):
+            self.assertEqual(outcome("VM creation failed", "Unavailable.", color=True),
+                             "\x1b[31m[VM creation failed]\x1b[0m Unavailable.")
+            self.assertEqual(outcome("VM creation failed", "Unavailable.", color=False),
+                             "[VM creation failed] Unavailable.")
+
     def test_tty_setup_steps_share_elapsed_column_and_leave_no_final_row(self):
         script = """
 import asyncio
