@@ -388,48 +388,6 @@ def feed_staging(stream, data):
             pass
 
 
-async def wait_for_master(process, path):
-    while not Path(path).is_socket() and process.poll() is None:
-        await asyncio.sleep(.025)
-    return Path(path).is_socket()
-
-
-def after_staging(ready, failure, action, *args, **kwargs):
-    if ready is not None and not ready.result():
-        return failure
-    return action(*args, **kwargs)
-
-
-async def wait_setup_listener(process):
-    loop = asyncio.get_running_loop()
-    fd = process.stdout.fileno()
-    pending = loop.create_future()
-    partial = b""
-
-    def read():
-        nonlocal partial
-        if pending.done():
-            return
-        try:
-            data = os.read(fd, 65536)
-            if not data:
-                pending.set_result(False)
-            else:
-                partial += data
-                if ssh_pipeline.SETUP_LISTENING in partial.splitlines(keepends=True):
-                    pending.set_result(True)
-                elif len(partial) > 65536:
-                    pending.set_result(False)
-        except OSError as exc:
-            pending.set_exception(exc)
-
-    loop.add_reader(fd, read)
-    try:
-        return await pending
-    finally:
-        loop.remove_reader(fd)
-
-
 def embedded_gate(protocol, render_source):
     return "\n".join((*render_source, protocol, "raise SystemExit(command_gate_main(progress))"))
 
@@ -522,7 +480,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
     with (TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp,
-          ThreadPoolExecutor(4 if parallel else 2) as transfers,
+          ThreadPoolExecutor(3 if parallel else 2) as transfers,
           (TemporaryFile() if parallel else nullcontext()) as owner_errors):
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
@@ -557,7 +515,6 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             pending = []  # The setup owner directly claims its staged files.
         master_closed = False
         owner = None
-        ready = None
 
         def close_master():
             nonlocal master_closed
@@ -595,7 +552,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     transfers.submit(feed_staging, owner.stdin, staged_input)
 
                     async def wait_owner():
-                        return await wait_for_master(owner, f"{tmp}/ssh")
+                        # Opening the second SSH session before the initial
+                        # exec is admitted can fail on the Colab transport.
+                        # The listener is published before parsing staging or
+                        # running setup, so the channels still overlap.
+                        return await wait_setup_listener(owner)
 
                     if not run_step(CONNECTING, wait_owner, terminal_connect, color, labels=labels):
                         owner_errors.seek(0)
@@ -605,8 +566,6 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                         no_owner = any(marker in text for marker in ("Permission denied", "Host key verification failed",
                                                                      "no SSH public key found"))
                         return owner.poll() or 1, no_owner
-                    if sources or groups:
-                        ready = transfers.submit(lambda: asyncio.run(wait_setup_listener(owner)))
                 else:
                     connected = run_step(CONNECTING, lambda: sp.run(
                         [*ssh, *connect_options, target, stage],
@@ -618,11 +577,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if live_payload:
                 show_remote_handoff(color)
             attempted.set()
-            unavailable = "SSH setup runner stopped before staging was ready"
-            transfer = transfers.submit(after_staging, ready, (unavailable, False), upload,
-                                        ssh, target, result, sources, targets, debug=debug) if sources else None
-            task_upload = transfers.submit(after_staging, ready, [unavailable], upload_tasks,
-                                           ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
+            transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
+            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
             # Keep native SSH errors separate from the command's stderr.
             # Mux and payload failures can both return 255; only a captured
             # SSH error is evidence for reporting a connection failure.
