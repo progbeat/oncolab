@@ -69,8 +69,9 @@ def allocation_hint(name, store):
     return "check 'colab sessions' for the VM"
 
 
-def release(name, terminal, color, store=None):
+def release(name, terminal, color, store=None, *, debug=False):
     hint = allocation_hint(name, store)
+    details = []
     with without_echo(terminal):
         try:
             result = run_step("Releasing Colab VM…", lambda: sp.run(
@@ -79,9 +80,18 @@ def release(name, terminal, color, store=None):
             ), terminal, color, timed=False)
             if result.returncode == 0 and b"Session terminated." in result.stdout:
                 return
-        except (OSError, sp.TimeoutExpired):
-            pass
+            if debug:
+                details.append(f"  colab stop exited with status {result.returncode}")
+                text = (result.stderr or b"").decode(errors="replace")
+                details.extend(safe_subprocess_details(text))
+        except sp.TimeoutExpired:
+            details.append("  colab stop timed out")
+        except OSError as exc:
+            details.append(f"  {type(exc).__name__} starting colab stop")
     write_diagnostic(f"oncolab: could not confirm release; {hint}", optional=True)
+    if debug:
+        for detail in details:
+            write_diagnostic(detail, optional=True)
 
 
 def allocate(args, terminal, color, store, labels):
@@ -99,7 +109,7 @@ def allocate(args, terminal, color, store, labels):
         if (cancellation.requested or status != 0) and store.is_file():
             cleanup_handler = signal(SIGINT, SIG_IGN)
             try:
-                release(name, terminal, color, store)
+                release(name, terminal, color, store, debug=args.debug)
             finally:
                 signal(SIGINT, cleanup_handler)
         if cancellation.requested or status == 130:
@@ -628,7 +638,7 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
                                        args.forward_agent, terminal, color, attempted, copies=copies,
                                        store=store, debug=args.debug, task_copies=task_groups)
         if fallback:
-            release(name, terminal, color, store)
+            release(name, terminal, color, store, debug=args.debug)
         if attempted.is_set() and (status == 255 or status < 0):
             print(f"oncolab: SSH status is ambiguous; {allocation_hint(name, store)}", file=sys.stderr)
         return status if status >= 0 else 128 - status
@@ -639,7 +649,7 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
         if name and not attempted.is_set():
             previous = signal(SIGINT, SIG_IGN)
             try:
-                release(name, terminal, color, store)
+                release(name, terminal, color, store, debug=args.debug)
             finally:
                 signal(SIGINT, previous)
         elif name:
@@ -654,7 +664,7 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
             debug_internal(exc)
     name = name or stored_session_name(store)
     if name and not attempted.is_set():
-        release(name, terminal, color, store)
+        release(name, terminal, color, store, debug=args.debug)
     elif name:
         print(f"oncolab: {allocation_hint(name, store)} if it is still running", file=sys.stderr)
     return 1

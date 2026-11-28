@@ -144,7 +144,7 @@ class Protocol(unittest.TestCase):
                   patch.object(cli, "run_allocator", return_value=0),
                   patch.object(cli, "release") as release,
                   patch.object(cli, "cancel_footer")):
-                self.assertEqual(cli.allocate(None, False, False, store, ()), (None, 130))
+                self.assertEqual(cli.allocate(SimpleNamespace(debug=False), False, False, store, ()), (None, 130))
             release.assert_called_once()
 
 

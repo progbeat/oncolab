@@ -16,7 +16,7 @@ assert sys.argv[1] == "-I" and sys.argv[2].endswith("/allocation_worker.py")
 mode = os.environ.get("TEST_ALLOCATION", "success")
 if mode == "crash":
     print("Traceback (most recent call last):", file=sys.stderr)
-    print('  File "/fake/auth.py", line 12, in open_session', file=sys.stderr)
+    print("│ /fake/auth.py:12 in open_session │", file=sys.stderr)
     print("RuntimeError: secret-token", file=sys.stderr, flush=True)
     sys.exit(2)
 if mode == "login":

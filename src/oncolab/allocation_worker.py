@@ -177,7 +177,7 @@ class Allocation:
     def cleanup(self):
         if not self.endpoint and not self.uncertain:
             return
-        emit(label="Checking for an allocated Colab VM…")
+        emit(label="Checking Colab VM…", detail="checking whether allocation completed")
         if not self.endpoint:
             # Allow late allocation to become visible, then reserve time
             # for both release calls inside the supervisor's 11-second grace.
