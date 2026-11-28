@@ -388,6 +388,36 @@ def feed_staging(stream, data):
             pass
 
 
+async def wait_setup_listener(process):
+    loop = asyncio.get_running_loop()
+    fd = process.stdout.fileno()
+    pending = loop.create_future()
+    partial = b""
+
+    def read():
+        nonlocal partial
+        if pending.done():
+            return
+        try:
+            data = os.read(fd, 65536)
+            if not data:
+                pending.set_result(False)
+            else:
+                partial += data
+                if ssh_pipeline.SETUP_LISTENING in partial.splitlines(keepends=True):
+                    pending.set_result(True)
+                elif len(partial) > 65536:
+                    pending.set_result(False)
+        except OSError as exc:
+            pending.set_exception(exc)
+
+    loop.add_reader(fd, read)
+    try:
+        return await pending
+    finally:
+        loop.remove_reader(fd)
+
+
 def embedded_gate(protocol, render_source):
     return "\n".join((*render_source, protocol, "raise SystemExit(command_gate_main(progress))"))
 
