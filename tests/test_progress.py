@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
 from oncolab.duration import format_duration
-from oncolab.cli import needs_summary_relay, read_setup_summary
+from oncolab.cli import read_setup_summary
 from oncolab.progress import SetupTimeline, display_label, setup_summary_socket
 from oncolab.remote import Lifecycle
 
@@ -143,15 +143,6 @@ class Progress(unittest.TestCase):
         finally:
             os.close(reader)
             os.close(writer)
-
-    def test_summary_uses_local_relay_for_a_pty_or_piped_stderr(self):
-        self.assertTrue(needs_summary_relay("-t"))
-        reader, writer = os.pipe()
-        try:
-            with os.fdopen(writer, "w") as stderr, patch("sys.stderr", stderr):
-                self.assertTrue(needs_summary_relay("-T"))
-        finally:
-            os.close(reader)
 
     def test_control_characters_in_job_labels_stay_on_one_line(self):
         self.assertEqual(display_label("line 1\nline 2\tfoo\x1b[31m"), "line 1 line 2 foo\\x1b[31m")

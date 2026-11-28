@@ -9,7 +9,6 @@ import re
 import secrets
 import shlex
 import socket
-import stat
 import subprocess as sp
 import sys
 import termios
@@ -494,19 +493,6 @@ def feed_staging(stream, data):
             pass
 
 
-def needs_summary_relay(tty):
-    # A PTY combines remote stdout and stderr even when both local fds name
-    # the same device. For pipes/sockets, keep remote SSH free of diagnostics
-    # it could be unable to drain into the actual local stderr.
-    if tty == "-t":
-        return True
-    try:
-        mode = os.fstat(sys.stderr.fileno()).st_mode
-        return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
-    except (OSError, ValueError):
-        return False
-
-
 def read_setup_summary(path, stop, labels, color):
     while not stop.is_set():
         try:
@@ -632,7 +618,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
     verbose = verbose and sys.stderr is not None
-    summary_path = drive_stage + "-summary.sock" if verbose and needs_summary_relay(tty) else None
+    summary_path = drive_stage + "-summary.sock" if verbose else None
     if summary_path:
         config["summary_path"] = summary_path
     config.update(debug=debug, verbose=verbose, progress_labels=labels, recovery_hint=allocation_hint(name, store))

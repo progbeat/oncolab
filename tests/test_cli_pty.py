@@ -31,6 +31,11 @@ if "-O" in argv:
     raise SystemExit(0)
 if "-M" in argv:
     root = Path(os.environ["XDG_CONFIG_HOME"])
+    for i, arg in enumerate(argv[:-1]):
+        if arg == "-L":
+            local, remote = argv[i + 1].split(":", 1)
+            if local.endswith("/summary.sock"):
+                Path(local).symlink_to(root / "remote-summary")
     if os.environ.get("TEST_SSH_HANG"):
         # Model a wedged client plus a proxy that inherited SSH's stderr.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -114,6 +119,8 @@ assert parts[-1] == "arg with $ and spaces"
 source, stage, color, plan, *_ = parts[5:]
 config = json.loads(plan)
 config["workdir"] = str(root)
+if config.get("summary_path"):
+    config["summary_path"] = str(root / "remote-summary")
 if os.environ.get("TEST_TTY_SETUP_FAILURE"):
     config["setup"] = {
         "fail": {"description": "Failing test hook", "needs": [],
@@ -275,7 +282,7 @@ raise SystemExit(namespace["main"]())
                                                  "Check 'colab sessions' for the VM.\n").encode())
 
     def test_delayed_ssh_handoff(self):
-        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure"):
+        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure", "verbose"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 oncolab, env = self.fake_commands(root)
@@ -288,10 +295,26 @@ raise SystemExit(namespace["main"]())
                     env["TEST_TTY_SETUP_FAILURE"] = "1"
                 if outcome == "success":
                     env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root), PYTHONIOENCODING="ascii")
+                if outcome == "verbose":
+                    import socket
+
+                    with socket.socket(socket.AF_UNIX) as probe:
+                        try:
+                            probe.bind(str(root / "socket-test"))
+                        except OSError as exc:
+                            if exc.errno in (errno.EPERM, errno.EACCES):
+                                self.skipTest("sandbox does not allow Unix sockets")
+                            raise
                 pid, fd = pty.fork()
                 if not pid:
                     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-                    os.execve(oncolab, [oncolab, "--", "example", "arg with $ and spaces"], env)
+                    extra = []
+                    if outcome == "verbose":
+                        stderr = os.open(root / "diagnostics", os.O_WRONLY | os.O_CREAT, 0o600)
+                        os.dup2(stderr, 2)
+                        os.close(stderr)
+                        extra = ["--verbose"]
+                    os.execve(oncolab, [oncolab, *extra, "--", "example", "arg with $ and spaces"], env)
                 output = bytearray()
                 deadline = time.monotonic() + 12
                 answered = False
@@ -331,13 +354,19 @@ raise SystemExit(namespace["main"]())
                     pid = None
                     self.assertTrue(saw_handoff, output)
                     expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19,
-                                "setup-failure": 7}[outcome]
+                                "setup-failure": 7, "verbose": 0}[outcome]
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
                         self.assertIn(b"o Waiting for remote setup to start...\r\n", output)
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
+                    elif outcome == "verbose":
+                        self.assertIn(b"PTY_ROUND_TRIP_OK", output)
+                        self.assertNotIn("✓".encode(), output)
+                        diagnostics = (root / "diagnostics").read_text()
+                        for phase in ("Creating Colab VM…", "Connecting via SSH…", "Setting up…"):
+                            self.assertIn("✓ " + phase, diagnostics)
                     elif outcome == "failure":
                         self.assertIn("\x1b[37m⠛\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
                     elif outcome == "setup-failure":

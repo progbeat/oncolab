@@ -102,8 +102,6 @@ class SetupTimeline:
 def completed_steps(rows, labels, color):
     """Write the retained transcript apart from both live UI and stdout."""
     import os
-    import socket
-    import stat
     from contextlib import suppress
 
     try:
@@ -127,9 +125,6 @@ def completed_steps(rows, labels, color):
     except (AttributeError, OSError, ValueError):
         fd = None
     with suppress(OSError, ValueError, sp.TimeoutExpired):
-        mode = os.fstat(fd).st_mode if fd is not None else 0
-        bounded = stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)
-        sock = stat.S_ISSOCK(mode)
         lines = bytearray()
         for indent, label, started, ended in rows:
             duration = format_duration(ended - started)
@@ -155,28 +150,11 @@ def completed_steps(rows, labels, color):
                 stream.write(line)
                 stream.flush()
                 continue
-            data = line.encode("utf-8")
-            if bounded:
-                lines.extend(data)
-                continue
-            # A failed buffered write would be retried by Python at shutdown
-            # and could replace a legitimate command exit code with 120.
-            pending = memoryview(data)
-            while pending:
-                if sock:
-                    peer = socket.socket(fileno=fd)
-                    try:
-                        written = peer.send(pending, socket.MSG_DONTWAIT)
-                    finally:
-                        peer.detach()  # stderr is borrowed, not owned.
-                else:
-                    written = os.write(fd, pending)
-                if not written:
-                    return
-                pending = pending[written:]
+            lines.extend(line.encode("utf-8"))
         if lines:
-            # Pipes and terminals may stop draining at any moment. Bound
-            # the write without changing the caller's shared fd flags.
+            # Any diagnostic sink can stop draining. Bound the write
+            # without changing the caller's shared file descriptor flags
+            # or buffering data Python would retry at process shutdown.
             sp.run(["/bin/cat"], input=bytes(lines), stdout=fd, stderr=sp.DEVNULL, timeout=.2)
 
 
