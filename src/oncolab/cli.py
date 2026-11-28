@@ -495,15 +495,16 @@ def feed_staging(stream, data):
 
 
 def needs_summary_relay(tty):
-    # A PTY combines the remote streams. A pipe can also back up inside
-    # OpenSSH, where the remote writer cannot see local stderr backpressure.
+    # A PTY combines remote stdout and stderr even when both local fds name
+    # the same device. For pipes/sockets, keep remote SSH free of diagnostics
+    # it could be unable to drain into the actual local stderr.
+    if tty == "-t":
+        return True
     try:
-        stderr = os.fstat(sys.stderr.fileno())
-        if stat.S_ISFIFO(stderr.st_mode) or stat.S_ISSOCK(stderr.st_mode):
-            return True
-        return tty == "-t" and not os.path.samestat(stderr, os.fstat(sys.stdout.fileno()))
+        mode = os.fstat(sys.stderr.fileno()).st_mode
+        return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
     except (OSError, ValueError):
-        return tty == "-t"
+        return False
 
 
 def read_setup_summary(path, stop, labels, color):

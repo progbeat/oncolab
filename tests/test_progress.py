@@ -125,7 +125,8 @@ class Progress(unittest.TestCase):
             )
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
-    def test_piped_stderr_uses_local_relay_even_without_a_pty(self):
+    def test_summary_uses_local_relay_for_a_pty_or_piped_stderr(self):
+        self.assertTrue(needs_summary_relay("-t"))
         reader, writer = os.pipe()
         try:
             with os.fdopen(writer, "w") as stderr, patch("sys.stderr", stderr):
