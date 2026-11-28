@@ -484,11 +484,17 @@ target = "/mnt/work"
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
 
-    def test_colab_400_ssh_rejections_are_permanent_and_masked(self):
+    def test_definitive_colab_ssh_rejections_are_permanent_and_masked(self):
         for diagnostic in (
             b"[colab] Server rejected pubkey: unsupported key type. fixture-secret",
             b"[colab] Server rejected pubkey (HTTP 400): fixture-secret",
             b"[colab] Server rejected request: missing pubkey header. fixture-secret",
+            b"[colab] Endpoint not found (HTTP 404): fixture-secret",
+            b"[colab] --identity /fixture-secret: file not found.",
+            b"[colab] ssh-keygen produced no key for fixture-secret.",
+            b"Unable to negotiate with fixture-secret port 22: no matching host key type found.",
+            b"To authorize colab-cli, visit this URL in any browser:\nhttps://fixture-secret",
+            b"No valid default credentials found. fixture-secret",
         ):
             with self.subTest(diagnostic=diagnostic):
                 failure = cli.SSHBootstrapError(255, diagnostic)

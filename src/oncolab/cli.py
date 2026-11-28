@@ -662,12 +662,16 @@ def ssh_failure_reason(text):
     permanent = (
         ("no SSH public key found", "No SSH public key was found; create one with ssh-keygen -t ed25519."),
         ("[colab] failed to derive public key", "Colab could not read the SSH public key; check your SSH key."),
+        ("[colab] ssh-keygen produced no key for ", "Colab could not read the SSH public key; check your SSH key."),
         ("[colab] Server rejected request: missing pubkey header", "Colab did not receive an SSH public key."),
         ("[colab] Server rejected pubkey: unsupported key type", "Colab rejected your SSH key type; use Ed25519 or ECDSA."),
         ("[colab] Server rejected pubkey:", "Colab rejected your public key; check your SSH key."),
         ("[colab] Server rejected pubkey (HTTP 400)", "Colab rejected your public key; check your SSH key."),
         ("[colab] Authentication failed (HTTP 401)", "Colab rejected the connection credentials for this VM."),
+        ("To authorize colab-cli, visit this URL in any browser:", "Sign in to Colab with 'colab sessions' and try again."),
+        ("No valid default credentials found.", "Sign in to Colab with 'colab sessions' and try again."),
         ("[colab] Forbidden (HTTP 403)", "Colab did not authorize SSH access to this VM."),
+        ("[colab] Endpoint not found (HTTP 404)", "This Colab runtime does not expose an SSH endpoint."),
         ("[colab] Error: No active sessions found.", "Colab no longer has an active session for this VM."),
         ("Host key verification failed", "SSH host key verification failed; check the trusted host key."),
         ("REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH host key changed; verify it before reconnecting."),
@@ -679,6 +683,10 @@ def ssh_failure_reason(text):
     for marker, message in permanent:
         if marker in text:
             return message, True
+    if re.search(r"(?m)^\[colab\] --identity [^\n]+: file not found\.", text):
+        return "Colab could not find the configured SSH key.", True
+    if re.search(r"(?mi)^Unable to negotiate with [^\n]*: no matching (?:host key type|key exchange method|cipher|MAC) found", text):
+        return "OpenSSH and the VM could not agree on an SSH algorithm.", True
     if re.search(r"(?mi)^\[colab\] session '[^'\n]+' not found\.", text):
         return "Colab no longer has an active session for this VM.", True
     # A ProxyCommand may itself report a generic permission error; only
