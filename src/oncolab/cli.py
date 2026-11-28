@@ -81,7 +81,7 @@ def release(name, terminal, color, store=None):
                 return
         except (OSError, sp.TimeoutExpired):
             pass
-    print(f"oncolab: could not confirm release; {hint}", file=sys.stderr)
+    write_diagnostic(f"oncolab: could not confirm release; {hint}", optional=True)
 
 
 def allocate(args, terminal, color, store, labels):
@@ -120,7 +120,7 @@ def cancel_footer(echo, color):
         print_formatted_text(FormattedText([("", prefix), ("class:aborting", "[cancelled]")]),
                              file=sys.stderr, flush=True)
     else:
-        write_diagnostic(prefix + "[cancelled]")
+        write_diagnostic(prefix + "[cancelled]", optional=True)
 
 
 def ssh_options(name, store=None):
@@ -506,6 +506,8 @@ def show_ssh_error(stderr, debug):
             print(f"oncolab: staging exception: {stage[1]}", file=sys.stderr)
         return
     reasons = (
+        ("Already-active SSH session", "Colab only allows one SSH connection to this VM; disconnect the other connection."),
+        ("no SSH public key found", "No SSH public key was found; create one with ssh-keygen -t ed25519."),
         ("Address already in use", "A local port is already in use; choose a different port with -p."),
         ("Could not request local forwarding", "SSH could not set up local port forwarding."),
         ("Permission denied", "SSH permission denied; check your SSH key."),
@@ -576,7 +578,7 @@ def parse_args():
     args = parser.parse_args()
     def retry_setting(name, parse, fallback, minimum, maximum):
         try:
-            value = parse(os.environ.get(name, fallback))
+            value = parse(os.environ.get(name) or fallback)
             if not minimum <= value <= maximum:
                 raise ValueError
             return value
@@ -584,9 +586,9 @@ def parse_args():
             parser.error(f"{name} must be between {minimum} and {maximum}")
 
     if args.attempts is None:
-        args.attempts = 1 + retry_setting("COLAB_CLI_ASSIGN_RETRIES", int, "3", 0, 10_000)
+        args.attempts = 1 + retry_setting("COLAB_CLI_ASSIGN_RETRIES", lambda x: max(0, int(x)), "3", 0, 10_000)
     args.request_timeout = retry_setting("COLAB_CLI_REQUEST_TIMEOUT", float, "120", .1, 3600)
-    args.retry_backoff = retry_setting("COLAB_CLI_RETRY_BACKOFF", float, "10", 0, 120)
+    args.retry_backoff = retry_setting("COLAB_CLI_RETRY_BACKOFF", lambda x: max(float(x), 0), "10", 0, 120)
     if args.attempts < 0:
         parser.error("--attempts must be nonnegative")
     for option, models in (("gpu", ("T4", "L4", "G4", "A100", "H100")), ("tpu", ("V5E1", "V6E1"))):

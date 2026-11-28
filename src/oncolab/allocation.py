@@ -184,6 +184,8 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
         if interrupt_at is not None and not cancellation.requested:
             diagnostics.append("oncolab: Timed out waiting for Colab. " + CHECK)
             return 124
+        elif status < 0 and cancellation.requested:
+            diagnostics.append(f"oncolab: {CHECK}")
         elif status and not (cancellation.requested or explained):
             diagnostics.append(f"oncolab: The Colab allocator exited unexpectedly (status {status}). {CHECK}")
         return status if status >= 0 else (130 if cancellation.requested else 1)
@@ -207,7 +209,7 @@ def run_allocator(args, store, name, terminal, color, cancellation, labels):
     finally:
         # Do not write diagnostics over the live prompt-toolkit renderer.
         for message in diagnostics:
-            write_diagnostic(message)
+            write_diagnostic(message, optional=cancellation.requested)
     if status == 0 and not store.is_file():
         raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
     return status

@@ -26,7 +26,11 @@ class Failure(Exception):
 
 
 def emit(**event):
-    print(json.dumps(event), flush=True)
+    try:
+        # Use unbuffered writes so a closed pipe cannot derail VM cleanup.
+        os.write(sys.stdout.fileno(), (json.dumps(event) + "\n").encode())
+    except OSError:
+        pass
 
 
 def retry_after(value):
@@ -202,6 +206,8 @@ def save_session(store, name, result, allocation):
     if not isinstance(info, dict):
         raise Failure("Google Colab did not return SSH connection details")
     url, token, duration = (info.get(k) for k in ("url", "token", "tokenExpiresInSeconds"))
+    if isinstance(duration, str) and re.fullmatch(r"[0-9]{1,5}", duration):
+        duration = int(duration)
     p = urlsplit(url) if isinstance(url, str) else None
     if (not p or p.scheme != "https" or not p.hostname or not p.hostname.endswith(".colab.dev")
             or p.username is not None or p.password is not None or not isinstance(token, str) or not token
@@ -231,13 +237,19 @@ def main():
     backend = None
     status = 1
     try:
-        emit(label="Checking Colab sign-in…")
-        read_session, write_session = connect()
-        backend = Allocation(read_session, accelerator, variant, high_mem == "1", float(timeout),
-                             write_session=write_session)
-        result = backend.run(int(attempts), float(backoff))
-        save_session(store, name, result, backend)
-        return 0
+        try:
+            emit(label="Checking Colab sign-in…")
+            read_session, write_session = connect()
+            backend = Allocation(read_session, accelerator, variant, high_mem == "1", float(timeout),
+                                 write_session=write_session)
+            result = backend.run(int(attempts), float(backoff))
+            save_session(store, name, result, backend)
+            status = 0
+        finally:
+            # Stop taking SIGINT before reporting an error, not after it.
+            # Otherwise a cancellation during error reporting can bypass
+            # reconciliation of a POST whose result is still uncertain.
+            signal(SIGINT, SIG_IGN)
     except KeyboardInterrupt:
         status = 130
     except Failure as exc:
@@ -246,15 +258,15 @@ def main():
     except Exception as exc:
         emit(error="Unexpected error while creating a Colab VM. Use --debug for details.")
         debug_error(exc, debug == "1")
-    if backend:
-        signal(SIGINT, SIG_IGN)
-        try:
-            backend.cleanup()
-        except Exception as exc:
-            emit(error=f"Could not verify release of VM {backend.endpoint!r}; check 'colab sessions'.")
-            debug_error(exc, debug == "1")
-        finally:
-            Path(store).unlink(missing_ok=True)
+    finally:
+        if backend and status != 0:
+            try:
+                backend.cleanup()
+            except Exception as exc:
+                emit(error=f"Could not verify release of VM {backend.endpoint!r}; check 'colab sessions'.")
+                debug_error(exc, debug == "1")
+            finally:
+                Path(store).unlink(missing_ok=True)
     return status
 
 

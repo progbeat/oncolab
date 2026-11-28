@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import subprocess
@@ -97,6 +98,33 @@ class Protocol(unittest.TestCase):
         self.assertEqual([c.args for c in request.call_args_list],
                          [("GET", "/assign")] * 3 + [("GET", "/unassign/own-vm"), ("POST", "/unassign/own-vm")])
 
+
+    def test_cleanup_is_armed_before_reporting_a_failed_post(self):
+        backend = Mock()
+        backend.run.side_effect = worker.Failure("POST timed out")
+        argv = ["worker", "/unused/sessions.json", "test", "NONE", "DEFAULT", "0", "1", "0", "120", "10"]
+        observed = []
+
+        def report(**event):
+            if "error" in event:
+                observed.append(handler.call_args.args)
+
+        with (patch.object(worker.sys, "argv", argv), patch.object(worker, "connect", return_value=(None, None)),
+              patch.object(worker, "Allocation", return_value=backend), patch.object(worker, "signal") as handler,
+              patch.object(worker, "emit", side_effect=report)):
+            self.assertEqual(worker.main(), 1)
+        self.assertEqual(observed, [(signal.SIGINT, signal.SIG_IGN)])
+        backend.cleanup.assert_called_once()
+
+    def test_session_store_is_private_and_accepts_numeric_string_ttl(self):
+        backend = worker.Allocation(None, "NONE", "DEFAULT", False)
+        backend.endpoint = "only-test-vm"
+        info = dict(url="https://test.colab.dev/", token="proxy-fixture", tokenExpiresInSeconds="3600")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "sessions.json"
+            worker.save_session(store, "only-test-session", {"runtimeProxyInfo": info}, backend)
+            self.assertEqual(store.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(store.read_text())["only-test-session"]["endpoint"], "only-test-vm")
 
     def test_sigint_at_successful_handoff_releases_vm(self):
         with tempfile.TemporaryDirectory() as tmp:
