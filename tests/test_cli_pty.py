@@ -77,6 +77,19 @@ if "-M" in argv:
             (Path(os.environ["XDG_CONFIG_HOME"]) / "waiting-for-passphrase").touch()
             assert terminal.readline() == "fixture phrase\n"
     raise SystemExit(0)
+if os.environ.get("TEST_SSH_DELAYED_OWNER"):
+    root = Path(os.environ["XDG_CONFIG_HOME"])
+    if "-T" in argv:
+        time.sleep(.45)
+        sys.stdout.write("oncolab-setup-listening\n")
+        sys.stdout.flush()
+        while not (root / "payload-entered").exists():
+            time.sleep(.02)
+        raise SystemExit(0)
+    assert "-t" in argv
+    (root / "payload-entered").touch()
+    print("PAYLOAD_STARTED")
+    raise SystemExit(0)
 if "-T" in argv:
     if shlex.split(argv[-1])[-1] == "fail-with-traceback":
         print("Traceback (most recent call last):\nRuntimeError: user failure", file=sys.stderr)
@@ -283,6 +296,47 @@ raise SystemExit(namespace["main"]())
                 self.assertEqual((result.returncode, result.stdout), (255, b""))
                 self.assertEqual(result.stderr, (f"[SSH connection failed] {explanation} "
                                                  "Check 'colab sessions' for the VM.\n").encode())
+
+    def test_verbose_ssh_finishes_before_the_remote_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oncolab, env = self.fake_commands(root)
+            env.update(ONCOLAB_PARALLEL_SETUP="1", TEST_SSH_DELAYED_OWNER="1", HOME=str(root))
+            pid, fd = pty.fork()
+            if not pid:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+                os.execve(oncolab, [oncolab, "--verbose", "--", "example"], env)
+            output = bytearray()
+            deadline = time.monotonic() + 12
+            try:
+                while time.monotonic() < deadline:
+                    if not select.select([fd], [], [], .2)[0]:
+                        continue
+                    try:
+                        chunk = os.read(fd, 8192)
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                else:
+                    self.fail(f"PTY timed out: {output!r}")
+                _, status = os.waitpid(pid, 0)
+                pid = None
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
+                before, after = output.split(b"Waiting for remote setup to start", 1)
+                complete = "✓ Connecting via SSH…".encode()
+                self.assertRegex(before, rb"Connecting via SSH[^\r\n]*SSH")
+                self.assertEqual(before.count(complete), 1, output)
+                self.assertNotIn(complete, after)
+                self.assertIn(b"PAYLOAD_STARTED", after)
+            finally:
+                os.close(fd)
+                if pid is not None:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
 
     def test_delayed_ssh_handoff(self):
         for outcome in ("success", "failure", "interrupt", "raw", "setup-failure", "verbose"):

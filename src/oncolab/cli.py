@@ -750,10 +750,41 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 return await bootstrap_ssh([*ssh, *connect_options, "-N", "-f", target], b"")
             return await bootstrap_ssh([*ssh, *connect_options, target, stage], staged_input)
 
+        owner_log = Path(tmp) / "owner-ssh.log"
+
+        async def start_owner():
+            nonlocal owner
+            # The first exec publishes its socket; setup can then overlap the
+            # config transfer and the second exec as before.
+            attempted.set()
+            try:
+                owner = sp.Popen(
+                    [*ssh, "-E", str(owner_log), "-T", "-o", "ProxyCommand=false",
+                     "-o", "ControlMaster=no", target, owner_code],
+                    stdin=sp.PIPE, stdout=sp.PIPE, stderr=owner_errors,
+                )
+            except OSError:
+                attempted.clear()
+                raise
+            transfers.submit(feed_staging, owner.stdin, staged_input)
+            try:
+                return await asyncio.wait_for(wait_setup_listener(owner), timeout=45)
+            except TimeoutError:
+                return False
+
+        async def connect_and_prepare():
+            nonlocal bootstrap_ready
+            connected = await connect()
+            if connected.returncode:
+                return connected, False
+            bootstrap_ready = True
+            return connected, await start_owner() if parallel and terminal_connect else True
+
         try:
             connect_started = monotonic()
             with without_echo(terminal_connect):
-                connected = run_step(connect_label, connect, terminal_connect, color, labels=labels)
+                connected, ready = run_step(connect_label, connect_and_prepare, terminal_connect, color,
+                                            labels=labels, started_at=connect_started)
             if connected.returncode:
                 if connected.returncode in (-SIGINT, 130):
                     raise KeyboardInterrupt
@@ -762,48 +793,17 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 if failure.rejected:
                     pending.clear()
                 raise failure
-            connect_ended = monotonic()
-            if verbose and not parallel:
-                completed_steps([(0, CONNECTING, connect_started, connect_ended)], labels, color)
             with suppress(OSError):
                 proxy_log.unlink(missing_ok=True)
-            bootstrap_ready = True
             if unclaimed is not None and not parallel:
                 unclaimed.clear()
-            if live_payload:
-                show_remote_handoff(color)
             if parallel:
-                # Keep the status visible while the first exec publishes its
-                # socket. Setup and config upload then overlap the second exec.
-                owner_log = Path(tmp) / "owner-ssh.log"
-                attempted.set()
-                try:
-                    owner = sp.Popen(
-                        [*ssh, "-E", str(owner_log), "-T", "-o", "ProxyCommand=false",
-                         "-o", "ControlMaster=no", target, owner_code],
-                        stdin=sp.PIPE, stdout=sp.PIPE, stderr=owner_errors,
-                    )
-                except OSError:
-                    attempted.clear()
-                    if live_payload:
-                        erase_remote_handoff()
-                    raise
-                transfers.submit(feed_staging, owner.stdin, staged_input)
-
-                async def wait_owner():
-                    return await asyncio.wait_for(wait_setup_listener(owner), timeout=45)
-
-                try:
-                    ready = asyncio.run(wait_owner())
-                except TimeoutError:
-                    ready = False
-                except KeyboardInterrupt:
-                    if live_payload:
-                        erase_remote_handoff()
-                    raise
+                if not terminal_connect:
+                    # Native prompts own the terminal during authentication.
+                    # Once they are done, continue the same SSH phase.
+                    ready = run_step(connect_label, start_owner, live_payload, color,
+                                     labels=labels, started_at=connect_started)
                 if not ready:
-                    if live_payload:
-                        erase_remote_handoff()
                     log = log_tail(owner_log)
                     try:
                         status = owner.wait(timeout=1) or 255
@@ -823,12 +823,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                             return 127, True
                         show_ssh_error(log, debug, recovery=allocation_hint(name, store), status=status)
                     return status, False
-                if verbose:
-                    if live_payload:
-                        erase_remote_handoff()
-                    completed_steps([(0, CONNECTING, connect_started, connect_ended)], labels, color)
-                    if live_payload:
-                        show_remote_handoff(color)
+            if verbose:
+                completed_steps([(0, CONNECTING, connect_started, monotonic())], labels, color)
+            if live_payload:
+                show_remote_handoff(color)
             if local_summary:
                 summary_reader = Thread(target=read_setup_summary,
                                         args=(local_summary, summary_stop, labels, color), daemon=True)

@@ -471,5 +471,5 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
         return result
 
 
-def run_step(label, command, live, color, *, labels=(), timed=True):
-    return progress(lambda run: run(label, command), live, color, labels=labels, timed=timed)
+def run_step(label, command, live, color, *, labels=(), timed=True, started_at=None):
+    return progress(lambda run: run(label, command, started_at=started_at), live, color, labels=labels, timed=timed)
