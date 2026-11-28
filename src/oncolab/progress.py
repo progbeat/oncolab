@@ -102,7 +102,6 @@ class SetupTimeline:
 def completed_steps(rows, labels, color):
     """Write the retained transcript apart from both live UI and stdout."""
     import os
-    import select
     import socket
     import stat
     from contextlib import suppress
@@ -127,10 +126,11 @@ def completed_steps(rows, labels, color):
         fd = stream.fileno()
     except (AttributeError, OSError, ValueError):
         fd = None
-    with suppress(OSError, ValueError):
+    with suppress(OSError, ValueError, sp.TimeoutExpired):
         mode = os.fstat(fd).st_mode if fd is not None else 0
         pipe = stat.S_ISFIFO(mode)
         sock = stat.S_ISSOCK(mode)
+        lines = bytearray()
         for indent, label, started, ended in rows:
             duration = format_duration(ended - started)
             padding = width - indent - get_cwidth(label)
@@ -155,9 +155,13 @@ def completed_steps(rows, labels, color):
                 stream.write(line)
                 stream.flush()
                 continue
+            data = line.encode("utf-8")
+            if pipe:
+                lines.extend(data)
+                continue
             # A failed buffered write would be retried by Python at shutdown
             # and could replace a legitimate command exit code with 120.
-            pending = memoryview(line.encode("utf-8"))
+            pending = memoryview(data)
             while pending:
                 if sock:
                     peer = socket.socket(fileno=fd)
@@ -166,12 +170,14 @@ def completed_steps(rows, labels, color):
                     finally:
                         peer.detach()  # stderr is borrowed, not owned.
                 else:
-                    if pipe and not select.select([], [fd], [], .05)[1]:
-                        return  # A blocked diagnostic sink must not block the command.
-                    written = os.write(fd, pending[:select.PIPE_BUF] if pipe else pending)
+                    written = os.write(fd, pending)
                 if not written:
                     return
                 pending = pending[written:]
+        if lines:
+            # Another writer may fill the pipe after a readiness check.
+            # Bound the entire write without changing the shared fd flags.
+            sp.run(["/bin/cat"], input=bytes(lines), stdout=fd, stderr=sp.DEVNULL, timeout=.2)
 
 
 def setup_summary_socket(path):
