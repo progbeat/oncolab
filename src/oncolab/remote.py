@@ -922,7 +922,14 @@ def main():
             released = False
     if not released and (hint := plan.get("recovery_hint")):
         report("Check VM state", f"{hint}.")
-    final_status = (status if status >= 0 else 128 - status) if released else 125
+    def release_vm():
+        if released:
+            try:
+                unassign()
+            except OSError:
+                return 125
+        return (status if status >= 0 else 128 - status) if released else 125
+
     if gate is not None:
         try:
             if owner_reports is not None:
@@ -938,24 +945,36 @@ def main():
                         break
                     gate.peer.settimeout(left)
                     gate.send("diag", base64.b64encode(data).decode())
-                gate.peer.settimeout(max(.05, deadline - time.monotonic()))
-                gate.send("status", final_status)
             elif owner_reports is not None:
                 shutil.copyfileobj(owner_reports, sys.stderr.buffer)
+        except OSError:
+            pass
+        # Queue VM release only after forwarding teardown diagnostics, but
+        # before acknowledging success. Never skip release on a broken sink.
+        try:
+            final_status = release_vm()
+            if gate.peer is not None:
+                gate.peer.settimeout(.5)
+                if final_status == 125 and released:
+                    hint = plan.get("recovery_hint", "Check 'colab sessions' for the VM")
+                    gate.send("diag", base64.b64encode(
+                        (outcome("VM release unconfirmed", hint + ".", color=_ONCOLAB_COLOR) + "\n").encode()
+                    ).decode())
+                gate.send("status", final_status)
         except OSError:
             pass
         finally:
             gate.close()
             if owner_reports is not None:
                 owner_reports.close()
+    else:
+        final_status = release_vm()
+        if final_status == 125 and released:
+            report("VM release unconfirmed", plan.get("recovery_hint", "Check 'colab sessions' for the VM") + ".")
     if control_dir is not None:
         shutil.rmtree(control_dir, ignore_errors=True)
-    try:
-        if released:
-            unassign()
-    finally:
-        for number, handler in previous.items():
-            signal(number, handler)
+    for number, handler in previous.items():
+        signal(number, handler)
     return final_status
 
 

@@ -53,7 +53,12 @@ async def tracked_accept(self):
 remote.SetupGate.accept = tracked_accept
 remote.DriveMounts = FakeDrive
 remote.command_result = run
-remote.unassign = lambda: (root / "unassigned").touch()
+def unassign():
+    if (root / "fail-release").exists():
+        raise OSError("unassign unavailable")
+    (root / "unassigned").touch()
+
+remote.unassign = unassign
 raise SystemExit(remote.main())
 '''
 
@@ -79,9 +84,14 @@ class ParallelSSH(unittest.TestCase):
     def test_sigterm_to_setup_owner_stops_running_piped_command(self):
         self.run_pipeline(cancel_owner=True)
 
-    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False):
+    def test_vm_release_start_failure_is_reported_to_command_client(self):
+        self.run_pipeline(release_fails=True)
+
+    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, release_fails=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
+            if release_fails:
+                (root / "fail-release").touch()
             with socket.socket(socket.AF_UNIX) as probe:
                 try:
                     probe.bind(str(root / "probe"))
@@ -156,15 +166,19 @@ class ParallelSSH(unittest.TestCase):
                     self.assertFalse((root / "command-escaped").exists())
                     return
                 out, err = client.communicate(b"untouched stdin\n", timeout=15)
-                if setup_fails:
+                if release_fails:
+                    self.assertEqual((client.returncode, out), (125, b"untouched stdin\n"))
+                    self.assertIn(b"[VM release unconfirmed]", err)
+                elif setup_fails:
                     self.assertEqual((client.returncode, out), (7, b""))
                     self.assertIn(b"[Setup failed] Independent setup (exit 7).", err)
                 else:
                     self.assertEqual((client.returncode, out, err), (255, b"untouched stdin\n", b""))
                 _, err = owner.communicate(timeout=10)
-                self.assertEqual((owner.returncode, err), (7 if setup_fails else 255, b""))
+                expected = 125 if release_fails else (7 if setup_fails else 255)
+                self.assertEqual((owner.returncode, err), (expected, b""))
                 self.assertTrue((root / "owner-cleaned").exists())
-                self.assertTrue((root / "unassigned").exists())
+                self.assertEqual((root / "unassigned").exists(), not release_fails)
             finally:
                 for process in (client, owner):
                     if process is not None:

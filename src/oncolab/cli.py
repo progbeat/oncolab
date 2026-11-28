@@ -636,6 +636,15 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     ssh_error = b""
                 if error := ssh_transport_error(ssh_error):
                     show_ssh_error(error, debug, recovery=allocation_hint(name, store))
+            if owner is not None:
+                try:
+                    owner_status = owner.wait(timeout=2)
+                except sp.TimeoutExpired:
+                    owner_status = None
+                if owner_status != status:
+                    write_diagnostic(outcome("SSH setup outcome unconfirmed",
+                                             allocation_hint(name, store) + ".", color=color))
+                    status = status or 125
             if owner is not None and status:
                 # The runner can fail before the display channel connects.
                 # Never replay raw first-channel ProxyCommand diagnostics.
