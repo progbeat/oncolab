@@ -35,9 +35,9 @@ def emit(**event):
 
 def retry_after(value):
     if value.isascii() and value.isdigit():
-        return min(86400, int(value[:10])) if len(value) <= 10 else 86400
+        return int(value) if len(value) <= 12 else math.inf
     try:
-        return min(86400, max(0, math.ceil(parsedate_to_datetime(value).timestamp() - datetime.now().timestamp())))
+        return max(0, math.ceil(parsedate_to_datetime(value).timestamp() - datetime.now().timestamp()))
     except (TypeError, ValueError, OverflowError):
         return 0
 
@@ -84,7 +84,7 @@ class Allocation:
 
     def request(self, method, path, *, params=None, token=None, timeout=None):
         from google.auth.exceptions import RefreshError, TransportError
-        from requests.exceptions import ConnectionError, Timeout
+        from requests.exceptions import ChunkedEncodingError, ConnectionError, ProxyError, SSLError, Timeout
 
         timeout = self.request_timeout if timeout is None else timeout
         headers = {"Accept": "application/json", "X-Colab-Client-Agent": "colab-cli"}
@@ -97,7 +97,12 @@ class Allocation:
                                             allow_redirects=False)
         except RefreshError:
             raise Failure(LOGIN, uncertain=method == "POST") from None
-        except (Timeout, ConnectionError, TransportError) as exc:
+        except SSLError:
+            raise Failure("Could not establish secure TLS with Colab; check the trusted certificates.",
+                          uncertain=method == "POST") from None
+        except (Timeout, ConnectionError, TransportError, ChunkedEncodingError) as exc:
+            if isinstance(exc, ProxyError) and "407" in str(exc):
+                raise Failure("Your network proxy requires authentication; check its configuration.") from None
             message = "Colab request timed out" if isinstance(exc, Timeout) else "Could not reach Google Colab"
             raise Failure(message, retry=True, uncertain=method == "POST",
                           detail="time out" if isinstance(exc, Timeout) else "network error") from None
@@ -112,6 +117,9 @@ class Allocation:
                 reason = f"Colab rejected {self.params['accelerator']}; try another accelerator or omit --gpu/--tpu"
             retry_details = {502: "502 gateway error", 503: "503 unavailable", 504: "504 gateway timeout"}
             delay = retry_after(response.headers.get("Retry-After", ""))
+            if not math.isfinite(delay):
+                raise Failure(f"HTTP {code}: {reason}; server holdoff is too large to schedule",
+                              uncertain=method == "POST" and code >= 500)
             if code == 429 or delay > 120:
                 reason += f"; retry after {delay}s" if delay else "; wait before trying again"
             # Respect a long server holdoff without making a normal command
@@ -172,6 +180,10 @@ class Allocation:
                     raise
                 delay = max(exc.delay, min(120, backoff * 2 ** min(number - 1, 16)))
                 emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay)
+                # Keep each platform sleep well within its system time range.
+                while delay > 3600:
+                    sleep(3600)
+                    delay -= 3600
                 sleep(delay)
 
     def cleanup(self):

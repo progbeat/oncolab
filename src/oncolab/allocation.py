@@ -148,7 +148,7 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
                 diagnostics.append(f"oncolab: Timed out waiting for Colab. {CHECK}")
                 return 124
             deadline = hard_deadline if interrupt_at is None else interrupt_at + 11
-            ready = selector.select(max(0, deadline - monotonic()))
+            ready = selector.select(min(3600, max(0, deadline - monotonic())))
             if not ready:
                 continue
             if any(key.fd == cancellation.read for key, _ in ready):

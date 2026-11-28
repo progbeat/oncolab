@@ -40,13 +40,24 @@ class Protocol(unittest.TestCase):
             pass
         exceptions = SimpleNamespace(RefreshError=type("RefreshError", (Exception,), {}),
                                      TransportError=NetworkException)
-        requests = SimpleNamespace(Timeout=TimeoutError, ConnectionError=ConnectionError)
+        class TruncatedResponse(Exception):
+            pass
+        class CertificateError(ConnectionError):
+            pass
+        class ProxyError(ConnectionError):
+            pass
+        requests = SimpleNamespace(Timeout=TimeoutError, ConnectionError=ConnectionError,
+                                   ChunkedEncodingError=TruncatedResponse, ProxyError=ProxyError,
+                                   SSLError=CertificateError)
         with patch.dict(sys.modules, {"google.auth.exceptions": exceptions, "requests.exceptions": requests}):
             session = Mock()
             session.request.side_effect = [
                 SimpleNamespace(status_code=503, headers={"Retry-After": "9"}),
                 SimpleNamespace(status_code=400, headers={}),
                 TimeoutError(),
+                TruncatedResponse(),
+                CertificateError("certificate verify failed"),
+                ProxyError("Tunnel connection failed: 407 Proxy Authentication Required"),
             ]
             backend = worker.Allocation(session, "T4", "GPU", True)
             with self.assertRaises(worker.Failure) as refusal:
@@ -61,9 +72,16 @@ class Protocol(unittest.TestCase):
                 backend.request("POST", "/assign")
             self.assertFalse(refusal.exception.retry)
             self.assertIn("rejected T4", str(refusal.exception))
-            with self.assertRaises(worker.Failure) as refusal:
-                backend.request("POST", "/assign")
-            self.assertTrue(refusal.exception.uncertain)
+            for _ in range(2):
+                with self.assertRaises(worker.Failure) as refusal:
+                    backend.request("POST", "/assign")
+                self.assertTrue(refusal.exception.uncertain)
+                self.assertTrue(refusal.exception.retry)
+
+            for hint in ("trusted certificates", "proxy requires authentication"):
+                with self.assertRaisesRegex(worker.Failure, hint) as refusal:
+                    backend.request("POST", "/assign")
+                self.assertFalse(refusal.exception.retry)
 
     def test_uncertain_post_reconciles_same_id_before_retry(self):
         backend = worker.Allocation(None, "A100", "GPU", True)
@@ -76,6 +94,9 @@ class Protocol(unittest.TestCase):
         self.assertEqual(len({c.kwargs["params"]["nbh"] for c in request.call_args_list}), 1)
         self.assertEqual(backend.params["shape"], "hm")
         self.assertTrue(any("Waiting to retry" in c.kwargs["label"] for c in emit.call_args_list))
+
+    def test_retry_after_preserves_multi_day_delay(self):
+        self.assertEqual(worker.retry_after("172800"), 172800)
 
     def test_long_server_holdoff_is_waited_only_when_unlimited(self):
         backend = worker.Allocation(None, "NONE", "DEFAULT", False)
