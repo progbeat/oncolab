@@ -1,7 +1,28 @@
 import subprocess as sp
 import sys
 
-def progress(work, live, color, *, capture=False):
+ALLOCATING = "Creating Colab VM…"
+CHECKING_LOGIN = "Checking Colab sign-in…"
+WAITING = "Waiting to retry…"
+CONNECTING = "Connecting via SSH…"
+COPYING = "Copying files…"
+DRIVE_PREPARATION = ("Preparing FUSE…", "Preparing rclone…", "Starting Drive mounts…")
+
+
+def preparation_labels(plan, has_copy=False):
+    labels = [ALLOCATING, CHECKING_LOGIN, WAITING, CONNECTING]
+    if has_copy:
+        labels.append(COPYING)
+    setup = plan.get("setup", {})
+    labels.extend(step["description"] for step in setup.values())
+    if mounts := plan.get("mounts"):
+        labels.extend(DRIVE_PREPARATION)
+        claimed = {step.get("mount") for step in setup.values()}
+        labels.extend(f"Mounting {name.removeprefix('mounts.')}…" for name in mounts if name not in claimed)
+    return labels
+
+
+def progress(work, live, color, *, capture=False, labels=(), timed=True):
     import asyncio
     from contextlib import ExitStack
     from inspect import iscoroutinefunction
@@ -17,9 +38,9 @@ def progress(work, live, color, *, capture=False):
             from prompt_toolkit.input import create_pipe_input
             from prompt_toolkit.output.vt100 import Vt100_Output
             from prompt_toolkit.shortcuts import ProgressBar
-            from prompt_toolkit.shortcuts.progress_bar import Formatter, SpinningWheel, Text
+            from prompt_toolkit.shortcuts.progress_bar import Formatter, ProgressBarCounter, SpinningWheel, Text
             from prompt_toolkit.styles import Style
-            from time import monotonic, time as wall_clock
+            from time import monotonic
 
             class Dots(SpinningWheel):
                 frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -28,7 +49,7 @@ def progress(work, live, color, *, capture=False):
                     frame = self.frames[int(monotonic() / .3) % len(self.frames)]
                     return [("class:spinning-wheel", frame)]
 
-            planned_width = 1
+            planned_width = max((get_cwidth(label) for label in labels), default=1)
 
             def clipped(value, width):
                 if get_cwidth(value) <= width:
@@ -44,7 +65,12 @@ def progress(work, live, color, *, capture=False):
 
             class ActiveLabel(Formatter):
                 def get_width(self, progress_bar):
-                    available = output.get_size().columns - 5 - timer.get_width(progress_bar).preferred
+                    remaining = output.get_size().columns - 3
+                    if timed:
+                        remaining -= timer.get_width(progress_bar).preferred + 2
+                    if any(hasattr(c.label, "detail") for c in progress_bar.counters):
+                        remaining -= min(28, max(0, remaining // 2))
+                    available = remaining
                     return Dimension.exact(max(1, min(planned_width, available)))
 
                 def format(self, progress_bar, counter, width):
@@ -57,7 +83,7 @@ def progress(work, live, color, *, capture=False):
 
                 @staticmethod
                 def value(counter):
-                    return f"{wall_clock() - counter.start_time.timestamp():.1f}s"
+                    return f"{monotonic() - counter.started:.1f}s"
 
                 def get_width(self, progress_bar):
                     self.width = max([self.width, *(len(self.value(c)) for c in progress_bar.counters)])
@@ -66,12 +92,23 @@ def progress(work, live, color, *, capture=False):
                 def format(self, progress_bar, counter, width):
                     return [("class:timer", self.value(counter).rjust(width))]
 
+            class Details(Formatter):
+                def get_width(self, progress_bar):
+                    if any(hasattr(c.label, "detail") for c in progress_bar.counters):
+                        return Dimension(min=0, weight=1)
+                    return Dimension.exact(0)
+
+                def format(self, progress_bar, counter, width):
+                    detail = getattr(counter.label, "detail", None)
+                    return [("class:label", clipped("  " + detail(), width))] if detail else []
+
             timer = Timer()
             keys = stack.enter_context(create_pipe_input())
             output = Vt100_Output.from_pty(sys.stdout)
             output.enable_cpr = False
             bar = ProgressBar(
-                formatters=[Dots(), Text(" "), ActiveLabel(), Text("  "), timer],
+                formatters=[Dots(), Text(" "), ActiveLabel(),
+                            *([Text("  "), timer, Details()] if timed else [])],
                 style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan"} if color else {}),
                 input=keys, output=output,
             )
@@ -81,13 +118,18 @@ def progress(work, live, color, *, capture=False):
         def reserve(label):
             if bar is not None:
                 nonlocal planned_width
-                width = get_cwidth(label) if isinstance(label, str) else 72
+                width = get_cwidth(label if isinstance(label, str) else label())
                 planned_width = max(planned_width, width)
 
         async def run(label, command):
             reserve(label)
-            counter = bar(label=label, remove_when_done=True) if bar else None
-            if counter is not None:
+            counter = None
+            if bar is not None:
+                # Publish the counter only after its monotonic timestamp is
+                # initialized; the renderer runs in its own thread.
+                counter = ProgressBarCounter(bar, None, label, True, None)
+                counter.started = monotonic()
+                bar.counters.append(counter)
                 bar.invalidate()
             try:
                 if iscoroutinefunction(command):
@@ -117,5 +159,5 @@ def progress(work, live, color, *, capture=False):
         return asyncio.run(work(run))
 
 
-def run_step(label, command, live, color):
-    return progress(lambda run: run(label, command), live, color)
+def run_step(label, command, live, color, *, labels=(), timed=True):
+    return progress(lambda run: run(label, command), live, color, labels=labels, timed=timed)

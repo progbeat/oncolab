@@ -129,7 +129,7 @@ def plan(path, *, cli_mounts=(), cli_ports=()):
     if path is None:
         root, base = {}, Path.cwd()
     else:
-        path = path.expanduser()
+        path = local_path(str(path), Path(), "--config")
         with path.open("rb") as file:
             root = tomllib.load(file)
         base = path.absolute().parent

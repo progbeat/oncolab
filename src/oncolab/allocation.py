@@ -9,9 +9,10 @@ import subprocess as sp
 import sys
 from importlib.resources import files
 from pathlib import Path
+from signal import SIGINT
 from time import monotonic
 
-from .progress import run_step
+from .progress import CHECKING_LOGIN, WAITING, run_step
 
 CHECK = "Check 'colab sessions' for an unconfirmed VM."
 
@@ -21,14 +22,17 @@ class AllocationError(Exception):
 
 
 class AllocationLabel:
-    text = "Checking Colab sign-in…"
-    deadline = None
+    state = (CHECKING_LOGIN, "", None)
 
     def __call__(self):
-        if self.deadline is None:
-            return self.text
+        return self.state[0]
+
+    def detail(self):
+        _, detail, deadline = self.state
+        if deadline is None:
+            return detail
         from math import ceil
-        return f"Retry in {max(0, ceil(self.deadline - monotonic()))}s · {self.text}"
+        return f"{max(0, ceil(deadline - monotonic()))}s · {detail}"
 
 
 def colab_python():
@@ -50,19 +54,20 @@ def colab_python():
     raise AllocationError("Cannot identify the Colab CLI's Python. Install it with 'uv tool install google-colab-cli'.")
 
 
-def launch(argv, label, cancelled, *, debug):
+def launch(argv, label, cancelled, *, debug, live):
     with sp.Popen(argv, stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.DEVNULL,
                   start_new_session=True, bufsize=0) as proc, selectors.DefaultSelector() as selector:
         selector.register(proc.stdout, selectors.EVENT_READ)
         hard_deadline = monotonic() + 45
         interrupt_at = None
+        explained = False
         data = b""
         while selector.get_map():
             now = monotonic()
             if (cancelled() or now >= hard_deadline) and interrupt_at is None:
                 interrupt_at = now
-                label.text, label.deadline = "Cancelling allocation… checking Colab", None
-                proc.send_signal(2)
+                label.state = ("Cancelling allocation…", "checking Colab", None)
+                proc.send_signal(SIGINT)
             if interrupt_at is not None and now - interrupt_at >= 11:
                 proc.kill()
                 print(f"oncolab: {CHECK}", file=sys.stderr)
@@ -80,10 +85,16 @@ def launch(argv, label, cancelled, *, debug):
                     event = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(event, dict):
+                    continue
                 if message := event.get("label"):
-                    label.text, label.deadline = message, event.get("deadline")
-                    hard_deadline = (label.deadline or monotonic()) + 45
+                    deadline = event.get("deadline")
+                    label.state = (message, event.get("detail", ""), deadline)
+                    hard_deadline = (deadline or monotonic()) + 45
+                    if not live and message == WAITING:
+                        print(f"oncolab: {message} {label.detail()}", file=sys.stderr, flush=True)
                 if message := event.get("error"):
+                    explained = True
                     print(f"oncolab: {message}", file=sys.stderr, flush=True)
                 if debug and (message := event.get("debug")):
                     print(message, file=sys.stderr)
@@ -95,16 +106,21 @@ def launch(argv, label, cancelled, *, debug):
             return 130 if cancelled() else 1
         if interrupt_at is not None and not cancelled():
             print("oncolab: Timed out waiting for Colab. " + CHECK, file=sys.stderr)
-        if status < 0 and not cancelled():
-            print("oncolab: The Colab allocator exited unexpectedly. " + CHECK, file=sys.stderr)
+            return 124
+        elif status and not (cancelled() or explained):
+            print(f"oncolab: The Colab allocator exited unexpectedly (status {status}). {CHECK}", file=sys.stderr)
         return status if status >= 0 else (130 if cancelled() else 1)
 
 
-def run_allocator(args, store, name, terminal, color, cancelled):
+def run_allocator(args, store, name, terminal, color, cancelled, labels):
     script = str(files("oncolab").joinpath("allocation_worker.py"))
     accelerator = args.gpu or args.tpu or "NONE"
     variant = "GPU" if args.gpu else "TPU" if args.tpu else "DEFAULT"
     argv = [*colab_python(), "-I", script, str(store), name, accelerator, variant,
             str(int(args.high_mem)), str(args.attempts), str(int(args.debug))]
     label = AllocationLabel()
-    return run_step(label, lambda: launch(argv, label, cancelled, debug=args.debug), terminal, color)
+    status = run_step(label, lambda: launch(argv, label, cancelled, debug=args.debug, live=terminal),
+                      terminal, color, labels=labels)
+    if status == 0 and not store.is_file():
+        raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
+    return status

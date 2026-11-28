@@ -684,7 +684,8 @@ def main():
         if work:
             os.environ["COLAB_DRIVE"] = work["target"]
         lifecycle.environment = os.environ | setup_env
-        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1", capture=True)
+        options = {"labels": plan["progress_labels"]} if "progress_labels" in plan else {}
+        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1", capture=True, **options)
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:

@@ -44,6 +44,10 @@ def connect():
     except ImportError:
         raise Failure("Cannot load Colab CLI authentication. Install or update 'google-colab-cli' with uv.") from None
 
+    return credential_session(auth, AuthorizedSession)
+
+
+def credential_session(auth, authorized_session):
     def need_login(*args, **kwargs):
         raise Failure(LOGIN)
 
@@ -53,7 +57,7 @@ def connect():
     auth._run_remote_flow = need_login
     try:
         session = auth.get_credentials()
-        return AuthorizedSession(session.credentials, max_refresh_attempts=0)
+        return authorized_session(session.credentials, max_refresh_attempts=0)
     finally:
         auth._run_remote_flow = original
 
@@ -77,7 +81,7 @@ class Allocation:
         if token:
             headers["X-Goog-Colab-Token"] = token
         try:
-            response = self.session.request(method, API + path, params=params, headers=headers,
+            response = self.session.request(method, API + path, params={"authuser": "0", **(params or {})}, headers=headers,
                                             timeout=(min(4, timeout), timeout), max_allowed_time=timeout,
                                             allow_redirects=False)
         except RefreshError:
@@ -140,20 +144,20 @@ class Allocation:
         while True:
             number += 1
             count = f"{number}/{attempts}" if attempts else str(number)
-            emit(label=f"Creating Colab VM… {self.target} · attempt {count}")
+            emit(label="Creating Colab VM…", detail=f"{self.target} · attempt {count}")
             try:
                 return self.attempt()
             except Failure as exc:
                 if not exc.retry or (attempts and number >= attempts):
                     raise
                 delay = max(exc.delay, min(30, 2 ** min(number + 1, 5)))
-                emit(label=f"Waiting to retry · {exc}", deadline=monotonic() + delay)
+                emit(label="Waiting to retry…", detail=str(exc), deadline=monotonic() + delay)
                 sleep(delay)
 
     def cleanup(self):
         if not self.endpoint and not self.uncertain:
             return
-        emit(label="Cancelling allocation… checking Colab")
+        emit(label="Checking for an allocated Colab VM…")
         if not self.endpoint:
             for _ in range(2):
                 try:
@@ -188,8 +192,10 @@ def save_session(store, name, result, allocation):
                  token_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=duration)).isoformat(),
                  variant=allocation.params["variant"], accelerator=allocation.params["accelerator"],
                  machine_shape="HIGH_RAM" if allocation.params.get("shape") == "hm" else "STANDARD")
-    with os.fdopen(os.open(store, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
+    pending = Path(store).with_suffix(".tmp")
+    with os.fdopen(os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
         json.dump({name: state}, out)
+    pending.replace(store)
 
 
 def debug_error(exc, debug):
@@ -224,8 +230,10 @@ def main():
         try:
             backend.cleanup()
         except Exception as exc:
-            emit(error="Could not verify release of the allocated VM; check 'colab sessions'.")
+            emit(error=f"Could not verify release of VM {backend.endpoint!r}; check 'colab sessions'.")
             debug_error(exc, debug == "1")
+        finally:
+            Path(store).unlink(missing_ok=True)
     return status
 
 

@@ -492,7 +492,7 @@ target = "/mnt/work"
     def test_internal_exception_is_quiet_unless_debugging(self):
         for debug in (False, True):
             argv = ["oncolab", *(["--debug"] if debug else []), "--", "true"]
-            with (patch("sys.argv", argv), patch.object(cli, "allocate", side_effect=RuntimeError("secret")),
+            with (patch("sys.argv", argv), patch.object(cli, "plan", side_effect=RuntimeError("secret")),
                   patch("sys.stderr", new_callable=io.StringIO) as stderr):
                 self.assertEqual(cli.main(), 1)
                 self.assertIn("Unexpected internal error", stderr.getvalue())

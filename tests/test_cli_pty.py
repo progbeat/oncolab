@@ -28,6 +28,9 @@ if "-M" in argv:
     assert not sys.stdin.buffer.read(), "SSH bootstrap consumed payload stdin"
     raise SystemExit(0)
 if "-T" in argv:
+    if shlex.split(argv[-1])[-1] == "fail-with-traceback":
+        print("Traceback (most recent call last):\nRuntimeError: user failure", file=sys.stderr)
+        raise SystemExit(19)
     sys.stdout.buffer.write(sys.stdin.buffer.read())
     raise SystemExit(0)
 assert "-t" in argv and os.isatty(0) and os.isatty(1)
@@ -49,6 +52,14 @@ print("PTY_ROUND_TRIP_OK")
                                     capture_output=True, timeout=12)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, data)
+
+    def test_command_traceback_passes_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            oncolab, env = self.fake_commands(Path(tmp))
+            result = subprocess.run([oncolab, "--", "fail-with-traceback"], env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=12)
+            self.assertEqual(result.returncode, 19)
+            self.assertEqual(result.stderr, b"Traceback (most recent call last):\nRuntimeError: user failure\n")
 
     def test_installed_cli_preserves_pty_and_argument_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
