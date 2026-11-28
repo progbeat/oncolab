@@ -421,6 +421,15 @@ async def bootstrap_ssh(argv, data):
         raise
 
 
+def log_tail(path):
+    try:
+        with path.open("rb") as log:
+            log.seek(max(0, path.stat().st_size - 16_384))
+            return log.read(16_384)
+    except OSError:
+        return b""
+
+
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
                 copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None):
     proxy, identity, public = ssh_options(name, store)
@@ -494,10 +503,15 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
     with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
+        # ControlPersist can hide ProxyCommand stderr before SSH exits,
+        # including Colab's definitive authentication diagnostics.
+        proxy_log = Path(tmp) / "proxy-ssh.log"
+        proxy_log.touch(mode=0o600)
+        proxy_command = f"{shlex.join(proxy)} 2> {shlex.quote(str(proxy_log))}"
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
                            "-o", "ConnectTimeout=30", "-o", "ConnectionAttempts=1",
                            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                           "-o", "ProxyCommand=" + shlex.join(proxy).replace("%", "%%"), *trust]
+                           "-o", "ProxyCommand=" + proxy_command.replace("%", "%%"), *trust]
         endpoint = f"{tmp}/stdin.sock" if any(source is not None for _, source in groups.values()) else None
         if ports or endpoint:
             connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
@@ -565,12 +579,17 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if connected.returncode:
                 if connected.returncode in (-SIGINT, 130):
                     raise KeyboardInterrupt
-                failure = SSHBootstrapError(connected.returncode, connected.stderr)
+                diagnostic = (connected.stderr or b"") + b"\n" + log_tail(proxy_log)
+                failure = SSHBootstrapError(connected.returncode, diagnostic)
                 if failure.rejected:
                     # Authentication, trust and local forwarding errors happen
                     # before SSH can send the stage command.
                     pending.clear()
                 raise failure
+            # The proxy stays alive for the mux; its private diagnostics are
+            # not needed after the authenticated bootstrap succeeded.
+            with suppress(OSError):
+                proxy_log.unlink(missing_ok=True)
             bootstrap_ready = True
             if unclaimed is not None:
                 unclaimed.clear()
@@ -593,13 +612,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status == 255:
-                try:
-                    with ssh_log.open("rb") as log:
-                        log.seek(max(0, ssh_log.stat().st_size - 16_384))
-                        ssh_error = log.read(16_384)
-                except OSError:
-                    ssh_error = b""
-                if error := ssh_transport_error(ssh_error):
+                if error := ssh_transport_error(log_tail(ssh_log)):
                     show_ssh_error(error, debug, recovery=allocation_hint(name, store))
             if status == 0:
                 pending.clear()

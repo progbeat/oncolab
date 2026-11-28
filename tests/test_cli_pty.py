@@ -41,7 +41,8 @@ if "-M" in argv:
     if mode := os.environ.get("TEST_SSH_RETRY"):
         log = root / "bootstrap-stores"
         count = len(log.read_text().splitlines()) if log.exists() else 0
-        store = shlex.split(next(arg for arg in argv if arg.startswith("ProxyCommand=")))[2]
+        proxy = shlex.split(next(arg for arg in argv if arg.startswith("ProxyCommand=")))
+        store = proxy[2]
         with log.open("a") as stream:
             print(store, file=stream)
         if count < 2 and mode in {"transient", "unknown"}:
@@ -54,6 +55,13 @@ if "-M" in argv:
             raise SystemExit(255)
         if mode == "gone":
             print("[colab] Error: No active sessions found. Create one with 'colab new'.", file=sys.stderr)
+            raise SystemExit(255)
+        if mode == "proxy-auth":
+            assert proxy[-2] == "2>"
+            log_path = Path(proxy[-1])
+            assert log_path.stat().st_mode & 0o777 == 0o600
+            log_path.write_text("x" * 50000 + "\n[colab] Server rejected pubkey: fixture-secret\n")
+            print("kex_exchange_identification: Connection closed by remote host", file=sys.stderr)
             raise SystemExit(255)
     if os.environ.get("TEST_SSH_FAILURE"):
         raise SystemExit(255)
@@ -157,6 +165,7 @@ raise SystemExit(namespace["main"]())
             ("transient", "2", 2, False, b"The SSH connection closed."),
             ("auth", "0", 1, False, b"check your SSH key"),
             ("gone", "0", 1, False, b"Colab no longer has an active session"),
+            ("proxy-auth", "0", 1, False, b"Colab rejected your public key"),
         ):
             with self.subTest(mode=mode, attempts=attempts), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -175,6 +184,7 @@ raise SystemExit(namespace["main"]())
                     self.assertEqual(result.stderr, b"")
                 else:
                     self.assertIn(message, result.stderr)
+                self.assertNotIn(b"fixture-secret", result.stderr)
 
     def test_ctrl_c_during_unlimited_ssh_backoff_releases_vm(self):
         with tempfile.TemporaryDirectory() as tmp:
