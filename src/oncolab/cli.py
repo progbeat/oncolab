@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import socket
+import stat
 import subprocess as sp
 import sys
 import termios
@@ -493,13 +494,16 @@ def feed_staging(stream, data):
             pass
 
 
-def tty_merges_separate_stderr(tty):
-    if tty != "-t":
-        return False
+def needs_summary_relay(tty):
+    # A PTY combines the remote streams. A pipe can also back up inside
+    # OpenSSH, where the remote writer cannot see local stderr backpressure.
     try:
-        return not os.path.samestat(os.fstat(sys.stdout.fileno()), os.fstat(sys.stderr.fileno()))
+        stderr = os.fstat(sys.stderr.fileno())
+        if stat.S_ISFIFO(stderr.st_mode) or stat.S_ISSOCK(stderr.st_mode):
+            return True
+        return tty == "-t" and not os.path.samestat(stderr, os.fstat(sys.stdout.fileno()))
     except (OSError, ValueError):
-        return True
+        return tty == "-t"
 
 
 def read_setup_summary(path, stop, labels, color):
@@ -627,7 +631,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
     verbose = verbose and sys.stderr is not None
-    summary_path = drive_stage + "-summary.sock" if verbose and tty_merges_separate_stderr(tty) else None
+    summary_path = drive_stage + "-summary.sock" if verbose and needs_summary_relay(tty) else None
     if summary_path:
         config["summary_path"] = summary_path
     config.update(debug=debug, verbose=verbose, progress_labels=labels, recovery_hint=allocation_hint(name, store))
