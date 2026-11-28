@@ -14,6 +14,7 @@ import time
 
 
 SETUP_LISTENING = b"oncolab-setup-listening\n"
+SETUP_CANCEL = b'["cancelled",null]\n'
 CONTROL_LIMIT = 16 * 1024 * 1024
 
 
@@ -65,6 +66,7 @@ class SetupGate:
         buffer = bytearray()
         child = None
         exited = False
+        interactive_admitted = False
         cancel_at = None
         try:
             while True:
@@ -77,8 +79,14 @@ class SetupGate:
                 if data is None:
                     continue
                 kind, value = data
+                if kind == "cancelled" and child is None:
+                    return 130
                 if kind == "started" and child is None:
-                    child = CommandHandle(value)
+                    pid, interactive = value
+                    if type(interactive) is not bool:
+                        raise ValueError("Invalid command terminal state")
+                    child = CommandHandle(pid)
+                    interactive_admitted = interactive and cancel_at is None
                     self.send("go" if cancel_at is None else "cancel")
                 elif kind == "exit" and type(value) is int and 0 <= value <= 255:
                     exited = True
@@ -92,6 +100,10 @@ class SetupGate:
                 try:
                     if not exited:
                         child.stop()
+                        if interactive_admitted:
+                            # Killing the shell's group does not establish
+                            # that other terminal job-control groups stopped.
+                            raise CommandStateUnknown("Could not confirm that the interactive command stopped")
                 finally:
                     child.close()
 
@@ -213,6 +225,23 @@ def pipeline_stderr(data):
         pass
 
 
+def receive_cleanup(peer, buffer, *, deadline=None, cancelling=False):
+    while True:
+        left = None if deadline is None else max(0, deadline - time.monotonic())
+        event = receive(peer, buffer, left)
+        if event is None:
+            raise TimeoutError("Setup did not acknowledge cancellation")
+        kind, *fields = event
+        if kind == "status":
+            return fields[0]
+        if kind == "diag":
+            pipeline_stderr(base64.b64decode(fields[0]))
+        elif kind == "end-diagnostics":
+            peer.sendall(packet("drained"))
+        elif not cancelling:
+            raise ValueError("Invalid cleanup result")
+
+
 COMMAND_ENTRY = r"""
 import json, os, sys
 with os.fdopen(int(sys.argv[1]), "rb") as admission:
@@ -272,7 +301,7 @@ def gated_command(peer, buffer, workdir, environment, command):
                          cwd="/", env={"PATH": os.defpath}, pass_fds=(read_fd,), process_group=0)
         os.close(read_fd)
         read_fd = -1
-        peer.sendall(packet("started", child.pid))
+        peer.sendall(packet("started", [child.pid, sys.stdin.isatty()]))
         reply = receive(peer, buffer)
         if reply == ["cancel"]:
             return 130
@@ -339,9 +368,16 @@ def command_gate(path, plan, color, command, render, takeover):
 
         if not live:
             takeover()
-        output, result = render(lambda run: observe_setup(run, peer, buffer), live, color,
-                                labels=plan.get("progress_labels", ()),
-                                idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False))
+        try:
+            output, result = render(lambda run: observe_setup(run, peer, buffer), live, color,
+                                    labels=plan.get("progress_labels", ()),
+                                    idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False))
+        except KeyboardInterrupt:
+            takeover()
+            pipeline_stderr(b"[cancelled]\n")
+            peer.setblocking(True)
+            peer.sendall(SETUP_CANCEL)
+            return receive_cleanup(peer, buffer, deadline=time.monotonic() + 10, cancelling=True)
         peer.setblocking(True)
         for data in output:
             pipeline_stderr(base64.b64decode(data))
@@ -358,13 +394,7 @@ def command_gate(path, plan, color, command, render, takeover):
         elif kind != "failed":
             raise ValueError("Invalid setup result")
         # Keep the channel alive until the setup owner has completed cleanup.
-        while True:
-            kind, data = receive(peer, buffer)
-            if kind == "status":
-                return data
-            if kind != "diag":
-                raise ValueError("Invalid cleanup result")
-            pipeline_stderr(base64.b64decode(data))
+        return receive_cleanup(peer, buffer)
 
 
 def command_gate_main(render):

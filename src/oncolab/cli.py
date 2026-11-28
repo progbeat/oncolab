@@ -274,6 +274,17 @@ def erase_remote_handoff():
     sys.stdout.flush()
 
 
+def show_owner_errors(stream):
+    stream.seek(0)
+    shown = False
+    for line in stream.read(16_384).decode(errors="replace").splitlines():
+        if line.startswith(("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]",
+                            "[VM left running]", "[VM release unconfirmed]")):
+            write_diagnostic(line)
+            shown = True
+    return shown
+
+
 def session_open_refused(log):
     # OpenSSH reports this MUX_S_FAILURE before sending the remote command.
     # A broken pipe or missing reply does not establish that boundary.
@@ -578,7 +589,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                                            if name not in ("env.json", "rclone.conf")}
                                      for path, entries in staging.items()})
         owner_code = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config)])
-        staged_input = ssh_pipeline.packet(env, command_env)
+        # The setup channel is detached; mirror the TERM that OpenSSH sends
+        # on the command's PTY without overriding a profile value.
+        setup_env = {"TERM": os.environ.get("TERM", "dumb"), **env} if tty == "-t" else env
+        staged_input = ssh_pipeline.packet(setup_env, command_env)
         if rclone_ini is not None:
             data = rclone_ini.encode() if isinstance(rclone_ini, str) else rclone_ini
             staged_input += (json.dumps(base64.b64encode(data).decode()) + "\n").encode()
@@ -729,13 +743,15 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     if live_payload:
                         erase_remote_handoff()
                     log = log_tail(owner_log)
-                    status = owner.poll() or 255
+                    try:
+                        status = owner.wait(timeout=1) or 255
+                    except sp.TimeoutExpired:
+                        status = 255
                     if session_open_refused(log):
                         attempted.clear()
                         raise SSHBootstrapError(status, log)
-                    owner_errors.seek(0)
-                    errors = owner_errors.read(16_384)
-                    show_ssh_error(log or errors, debug, recovery=allocation_hint(name, store))
+                    if not show_owner_errors(owner_errors):
+                        show_ssh_error(log, debug, recovery=allocation_hint(name, store))
                     return status, False
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
@@ -774,10 +790,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if owner is not None and status:
                 # The runner can fail before the display channel connects.
                 # Never replay raw first-channel ProxyCommand diagnostics.
-                owner_errors.seek(0)
-                for line in owner_errors.read(16_384).decode(errors="replace").splitlines():
-                    if line.startswith(("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]")):
-                        write_diagnostic(line)
+                show_owner_errors(owner_errors)
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):

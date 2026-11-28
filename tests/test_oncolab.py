@@ -441,7 +441,6 @@ target = "/mnt/work"
                     self.assertNotIn("Traceback", stderr.getvalue())
                     allocate.assert_not_called()
 
-    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
     def test_whole_default_rclone_config_uses_only_private_bootstrap_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -464,7 +463,8 @@ target = "/mnt/work"
                 return subprocess.CompletedProcess(argv, 0)
 
             with (patch("sys.argv", args), patch.object(cli, "allocate", return_value=("test-session", 0)),
-                  patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp}, clear=True),
+                  patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp, "ONCOLAB_PARALLEL_SETUP": "0"},
+                             clear=True),
                   patch("oncolab.config.which", return_value=None),
                   patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
                   patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: run(argv, input=data)),

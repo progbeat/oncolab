@@ -6,6 +6,7 @@ import os
 import pty
 from pathlib import Path
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -76,6 +77,18 @@ def wait_file(path):
 
 
 class ParallelSSH(unittest.TestCase):
+    def test_gate_loss_after_pty_admission_does_not_confirm_cleanup(self):
+        gate = Mock()
+        child = Mock()
+        with (patch.object(ssh_pipeline, "receive",
+                           side_effect=[["started", [123, True]], ConnectionError("gate disappeared")]),
+              patch.object(ssh_pipeline, "CommandHandle", return_value=child),
+              self.assertRaises(ssh_pipeline.CommandStateUnknown)):
+            ssh_pipeline.SetupGate.receive_status(gate, lambda: False)
+        gate.send.assert_called_once_with("go")
+        child.stop.assert_called_once()
+        child.close.assert_called_once()
+
     def test_command_channel_retries_only_a_confirmed_pre_dispatch_refusal(self):
         refused = b"mux_client_request_session: session request failed: Session open refused by peer\n"
         lost = b"mux_client_request_session: read from master failed: Broken pipe\n"
@@ -176,6 +189,9 @@ class ParallelSSH(unittest.TestCase):
     def test_command_disconnect_cancels_setup_and_releases_vm(self):
         self.run_pipeline(disconnect=True)
 
+    def test_sigint_during_setup_cancels_both_channels_with_status_130(self):
+        self.run_pipeline(cancel_client=True)
+
     def test_failed_setup_skips_command_and_unassigns(self):
         self.run_pipeline(setup_fails=True)
 
@@ -191,8 +207,15 @@ class ParallelSSH(unittest.TestCase):
     def test_payload_exit_125_does_not_report_vm_release_failure(self):
         self.run_pipeline(payload_status=125)
 
-    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, release_fails=False,
-                     native_env=False, payload_status=255):
+    def test_teardown_output_survives_backpressure_before_vm_release(self):
+        self.run_pipeline(slow_stderr=True, payload_status=0)
+
+    def test_workdir_error_does_not_publish_the_setup_gate(self):
+        self.run_pipeline(preflight_fails=True)
+
+    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, cancel_client=False,
+                     release_fails=False, native_env=False, slow_stderr=False, payload_status=255,
+                     preflight_fails=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             if release_fails:
@@ -216,12 +239,27 @@ class ParallelSSH(unittest.TestCase):
                 "setup": {"independent": {"description": "Independent setup", "needs": [],
                                            "argv": [sys.executable, "-c", mark]}},
             }
+            if slow_stderr:
+                config["setup"]["independent"]["teardown"] = [
+                    sys.executable, "-c",
+                    'import sys; from pathlib import Path; Path("teardown").touch(); '
+                    'sys.stderr.buffer.write(b"x" * (1024 * 1024))',
+                ]
+            if preflight_fails:
+                (root / "file").touch()
+                config["workdir"] = str(root / "file" / "child")
             owner = subprocess.Popen(
                 [sys.executable, "-c", DRIVE_FIXTURE, drive, "0", json.dumps(config), "unused"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             client = None
             try:
+                if preflight_fails:
+                    out, err = owner.communicate(timeout=5)
+                    self.assertNotIn(SETUP_LISTENING, out)
+                    self.assertIn(b"[Remote preparation failed]", err)
+                    self.assertTrue((root / "unassigned").exists())
+                    return
                 self.assertTrue(select.select([owner.stdout], [], [], 10)[0])
                 self.assertEqual(owner.stdout.readline(), SETUP_LISTENING)
                 spawn = (
@@ -252,6 +290,15 @@ class ParallelSSH(unittest.TestCase):
                 wait_file(root / "prerequisites")
                 self.assertFalse((root / "mount-started").exists())
                 self.assertIsNone(client.poll())
+                if cancel_client:
+                    wait_file(root / "control-attached")
+                    client.send_signal(signal.SIGINT)
+                    self.assertEqual(client.communicate(timeout=10), (b"", b"[cancelled]\n"))
+                    owner.wait(timeout=10)
+                    self.assertEqual((client.returncode, owner.returncode), (130, 130))
+                    self.assertTrue((root / "unassigned").exists())
+                    self.assertFalse((root / "mount-started").exists())
+                    return
                 if disconnect:
                     wait_file(root / "control-attached")
                     client.kill()
@@ -274,7 +321,18 @@ class ParallelSSH(unittest.TestCase):
                     time.sleep(.9)
                     self.assertFalse((root / "command-escaped").exists())
                     return
-                out, err = client.communicate(b"untouched stdin\n", timeout=15)
+                if slow_stderr:
+                    client.stdin.write(b"untouched stdin\n")
+                    client.stdin.close()
+                    client.stdin = None
+                    wait_file(root / "teardown")
+                    time.sleep(3.2)
+                    self.assertFalse((root / "unassigned").exists())
+                    out, err = client.communicate(timeout=15)
+                    self.assertEqual(err, b"x" * (1024 * 1024))
+                    err = b""
+                else:
+                    out, err = client.communicate(b"untouched stdin\n", timeout=15)
                 if release_fails:
                     self.assertEqual((client.returncode, out), (125, b"untouched stdin\n"))
                     self.assertIn(b"[VM release unconfirmed]", err)

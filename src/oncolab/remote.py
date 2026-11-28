@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess as sp
 import sys
@@ -16,8 +17,8 @@ from tempfile import TemporaryFile
 if __package__:
     from .diagnostics import outcome, safe_subprocess_details
     from .progress import progress
-    from .ssh_pipeline import (SETUP_LISTENING, CommandStateUnknown, SetupGate,
-                               stdin_packets, staging_directories)
+    from .ssh_pipeline import (SETUP_CANCEL, SETUP_LISTENING, CommandStateUnknown, SetupGate,
+                               receive, stdin_packets, staging_directories)
 
 
 _ONCOLAB_COLOR = False
@@ -750,9 +751,15 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
             descriptor = gate.peer.fileno()
 
             def disconnected():
-                # The command channel sends nothing before setup ends.
-                if not os.read(descriptor, 1):
-                    loop.remove_reader(descriptor)
+                # Only a cancellation can arrive before setup hands off.
+                peek = gate.peer.recv(len(SETUP_CANCEL), socket.MSG_PEEK)
+                if peek and SETUP_CANCEL.startswith(peek) and peek != SETUP_CANCEL:
+                    return
+                loop.remove_reader(descriptor)
+                if peek == SETUP_CANCEL:
+                    gate.peer.recv(len(SETUP_CANCEL))
+                    lifecycle.interrupt(SIGINT, None)
+                else:
                     lifecycle.interrupt(SIGTERM, None)
 
             loop.add_reader(descriptor, disconnected)
@@ -815,8 +822,6 @@ def main():
             owner_reports = TemporaryFile(dir=control_dir)
             saved_stderr = os.dup(sys.stderr.fileno())
             os.dup2(owner_reports.fileno(), sys.stderr.fileno())
-            sys.stdout.buffer.write(SETUP_LISTENING)
-            sys.stdout.buffer.flush()
             lifecycle.setup_output = []
         if plan["mounts"]:
             path = Path(directory)
@@ -857,6 +862,10 @@ def main():
         if live:
             lifecycle.setup_output = []
         if owner:
+            # The command side must never connect to a setup gate whose
+            # synchronous preflight already failed.
+            sys.stdout.buffer.write(SETUP_LISTENING)
+            sys.stdout.buffer.flush()
             status, command_env = progress(lambda run: pipeline_setup(run, lifecycle, plan, drive, gate),
                                            False, False, capture=True)
             send_setup_output(gate, lifecycle)
@@ -939,17 +948,17 @@ def main():
                 os.close(saved_stderr)
                 owner_reports.seek(0)
             if gate.peer is not None:
-                deadline = time.monotonic() + 3
                 while owner_reports is not None and (data := owner_reports.read(65536)):
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        break
-                    gate.peer.settimeout(left)
                     gate.send("diag", base64.b64encode(data).decode())
+                # Teardown writes to the user's stderr. Respect its
+                # backpressure and do not release the VM while it is writing.
+                gate.send("end-diagnostics")
+                if receive(gate.peer, bytearray()) != ["drained"]:
+                    raise ValueError("Invalid teardown acknowledgement")
             elif owner_reports is not None:
                 shutil.copyfileobj(owner_reports, sys.stderr.buffer)
                 sys.stderr.buffer.flush()
-        except OSError:
+        except (OSError, ValueError):
             pass
         # Queue VM release only after forwarding teardown diagnostics, but
         # before acknowledging success. Never skip release on a broken sink.
