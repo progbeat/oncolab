@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import select
+import signal as signals
 import subprocess as sp
 import sys
 import time
@@ -36,7 +38,6 @@ class SetupGate:
         except BaseException:
             self.listener.close()
             raise
-        self.stream = None
         self.peer = None
         self.pending = []
 
@@ -44,7 +45,6 @@ class SetupGate:
         loop = asyncio.get_running_loop()
         self.peer, _ = await asyncio.wait_for(loop.sock_accept(self.listener), 20)
         self.peer.setblocking(True)
-        self.stream = self.peer.makefile("rb")
         for item in self.pending:
             self.peer.sendall(item)
         self.pending.clear()
@@ -58,19 +58,101 @@ class SetupGate:
 
     def close(self):
         self.listener.close()
-        if self.stream is not None:
-            self.stream.close()
         if self.peer is not None:
             self.peer.close()
 
-    def receive_status(self):
-        line = self.stream.readline(128)
-        if not line:
-            raise ConnectionError("SSH command channel closed")
-        kind, status = json.loads(line)
-        if kind != "exit" or type(status) is not int or not 0 <= status <= 255:
-            raise ValueError("Invalid command status")
-        return status
+    def receive_status(self, interrupted):
+        buffer = bytearray()
+        child = None
+        exited = False
+        cancel_at = None
+        try:
+            while True:
+                if interrupted() and cancel_at is None:
+                    cancel_at = time.monotonic()
+                    self.send("cancel")
+                if cancel_at is not None and time.monotonic() - cancel_at >= 4:
+                    raise ConnectionError("SSH command did not acknowledge cancellation")
+                data = receive(self.peer, buffer, .1)
+                if data is None:
+                    continue
+                kind, value = data
+                if kind == "started" and child is None:
+                    child = CommandHandle(value)
+                    self.send("go" if cancel_at is None else "cancel")
+                elif kind == "exit" and type(value) is int and 0 <= value <= 255:
+                    exited = True
+                    return (128 + interrupted()) if interrupted() else value
+                else:
+                    raise ValueError("Invalid command status")
+        finally:
+            if child is not None:
+                try:
+                    if not exited:
+                        child.stop()
+                finally:
+                    child.close()
+
+
+class CommandStateUnknown(RuntimeError):
+    """Do not release mounts or the VM while a command might still be using them."""
+
+
+class CommandHandle:
+    def __init__(self, pid):
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("Invalid command process")
+        self.fd = None
+        self.gone = False
+        try:
+            self.fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            self.gone = True
+        except (AttributeError, OSError):
+            # Non-Linux tests or a kernel lacking pidfds: don't guess about
+            # process identity if the supervising channel disappears.
+            pass
+
+    def stop(self):
+        if self.gone:
+            return
+        if self.fd is None:
+            raise CommandStateUnknown("Could not confirm that the command stopped")
+        for signum in (signals.SIGTERM, signals.SIGKILL):
+            try:
+                signals.pidfd_send_signal(self.fd, signum)
+            except ProcessLookupError:
+                return
+            except OSError as exc:
+                raise CommandStateUnknown("Could not confirm that the command stopped") from exc
+            try:
+                if select.select([self.fd], [], [], 2)[0]:
+                    return
+            except OSError as exc:
+                raise CommandStateUnknown("Could not confirm that the command stopped") from exc
+        raise CommandStateUnknown("Could not confirm that the command stopped")
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+def receive(peer, buffer, timeout=None):
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while b"\n" not in buffer:
+        remaining = None if deadline is None else max(0, deadline - time.monotonic())
+        if not select.select([peer], [], [], remaining)[0]:
+            return None
+        block = peer.recv(65536)
+        if not block:
+            raise ConnectionError("SSH setup control socket closed")
+        buffer.extend(block)
+        if len(buffer) > CONTROL_LIMIT:
+            raise ValueError("SSH setup message too large")
+    i = buffer.index(b"\n")
+    line = bytes(buffer[:i])
+    del buffer[:i+1]
+    return json.loads(line)
 
 
 async def observe_setup(run, peer, buffer):
@@ -127,6 +209,68 @@ def pipeline_stderr(data):
         pass
 
 
+COMMAND_ENTRY = r"""
+import os, sys
+fd = int(sys.argv[1])
+try:
+    ready = os.read(fd, 1)
+finally:
+    os.close(fd)
+if not ready:
+    raise SystemExit(130)
+args = sys.argv[2:]
+try:
+    os.execvpe(args[0], args, os.environ)
+except OSError as exc:
+    print(f"[Command could not start] {args[0]}: {exc.strerror}.", file=sys.stderr)
+    raise SystemExit(127 if isinstance(exc, FileNotFoundError) else 126) from None
+"""
+
+
+def stop_gate_command(child):
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=1)
+        except sp.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def gated_command(peer, buffer, workdir, environment, command):
+    read_fd, write_fd = os.pipe()
+    child = None
+    try:
+        child = sp.Popen([sys.executable, "-c", COMMAND_ENTRY, str(read_fd), *command],
+                         cwd=workdir, env=environment, pass_fds=(read_fd,))
+        os.close(read_fd)
+        read_fd = -1
+        peer.sendall(packet("started", child.pid))
+        reply = receive(peer, buffer)
+        if reply == ["cancel"]:
+            return 130
+        if reply != ["go"]:
+            raise ValueError("SSH setup owner did not admit the command")
+        os.write(write_fd, b"1")
+        while child.poll() is None:
+            try:
+                event = receive(peer, buffer, .1)
+                if event == ["cancel"]:
+                    return 130
+                if event is not None:
+                    raise ValueError("Invalid command control request")
+            except KeyboardInterrupt:
+                # A native PTY delivers Ctrl+C to the command itself too.
+                continue
+        return child.returncode if child.returncode >= 0 else 128 - child.returncode
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
+        os.close(write_fd)
+        if child is not None:
+            stop_gate_command(child)
+
+
 def command_gate(path, plan, color, command, render):
     with socket.socket(socket.AF_UNIX) as peer:
         deadline = time.monotonic() + 20
@@ -157,41 +301,33 @@ def command_gate(path, plan, color, command, render):
         kind, *args = result
         if kind == "run":
             workdir, env = args
-            status = 1
-            try:
-                os.chdir(workdir)
-                environment = {k: v for k, v in (os.environ | env).items() if v is not None}
-                with sp.Popen(command, env=environment) as child:
-                    try:
-                        status = child.wait()
-                    except KeyboardInterrupt:
-                        # The native SSH PTY sends Ctrl+C to the command too.
-                        status = child.wait()
-                if status < 0:
-                    status = 128 - status
-            except OSError as exc:
-                pipeline_stderr(f"[Command could not start] {command[0]}: {exc.strerror}.\n".encode())
-                status = 127 if isinstance(exc, FileNotFoundError) else 126
+            environment = {k: v for k, v in (os.environ | env).items() if v is not None}
+            status = gated_command(peer, buffer, workdir, environment, command)
             peer.sendall(packet("exit", status))
         elif kind != "failed":
             raise ValueError("Invalid setup result")
         # Keep the channel alive until the setup owner has completed cleanup.
-        with peer.makefile("rb") as stream:
-            pending = bytes(buffer)
-            while True:
-                line, separator, pending = pending.partition(b"\n")
-                if not separator:
-                    rest = stream.readline(CONTROL_LIMIT)
-                    if not rest:
-                        break
-                    line += rest
-                kind, data = json.loads(line)
-                if kind == "status":
-                    return data
-                if kind != "diag":
-                    raise ValueError("Invalid cleanup result")
-                pipeline_stderr(base64.b64decode(data))
-        raise ConnectionError("SSH setup owner exited before reporting cleanup")
+        while True:
+            kind, data = receive(peer, buffer)
+            if kind == "status":
+                return data
+            if kind != "diag":
+                raise ValueError("Invalid cleanup result")
+            pipeline_stderr(base64.b64decode(data))
+
+
+def command_gate_main(render):
+    path, color, raw_plan, *command = sys.argv[1:]
+    plan = json.loads(raw_plan)
+    try:
+        return command_gate(path, plan, color == "1", command, render)
+    except KeyboardInterrupt:
+        pipeline_stderr(b"[cancelled]\n")
+        return 130
+    except (OSError, ValueError):
+        hint = plan.get("recovery_hint", "Setup runner disconnected")
+        pipeline_stderr(f"[Setup channel closed] {hint}.\n".encode())
+        return 1
 
 
 def staging_directories(directories):

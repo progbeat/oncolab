@@ -430,6 +430,10 @@ async def wait_setup_listener(process):
         loop.remove_reader(fd)
 
 
+def embedded_gate(protocol, render_source):
+    return "\n".join((*render_source, protocol, "raise SystemExit(command_gate_main(progress))"))
+
+
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
                 copies=(), task_copies=None, store=None, debug=False):
     proxy, identity, public = ssh_options(name, store)
@@ -481,11 +485,6 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             config["setup"][task]["stdin_result"] = f"{directory}/copy-result"
             groups[key] = ((), source)
     # The bootstrap channel must never read the command's stdin.
-    staged_input = json.dumps({
-        directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
-                    for name, value in entries.items()}
-        for directory, entries in staging.items()
-    }).encode() if staging else b""
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
     config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
@@ -498,18 +497,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         control = drive_stage + "-gate/control.sock"
         protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
         remote = protocol + "\n" + remote
-        gate_code = "\n".join((*render_source, protocol, """
-directory, color, raw_plan, *command = sys.argv[1:]
-try:
-    raise SystemExit(command_gate(directory, json.loads(raw_plan), color == "1", command, progress))
-except KeyboardInterrupt:
-    print("[cancelled]", file=sys.stderr)
-    raise SystemExit(130) from None
-except (OSError, ValueError):
-    print("[Setup channel closed] " + json.loads(raw_plan).get("recovery_hint", "Setup runner disconnected") + ".",
-          file=sys.stderr)
-    raise SystemExit(1) from None
-"""))
+        gate_code = embedded_gate(protocol, render_source)
         command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint") if key in config}
         command_plan.update(pipeline_role="command")
         payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
@@ -519,12 +507,17 @@ except (OSError, ValueError):
                       pipeline_dirs={path: {name: value for name, value in entries.items()
                                            if name not in ("env.json", "rclone.conf")}
                                      for path, entries in staging.items()})
-        owner_code = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config), *command])
+        owner_code = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config)])
         staged_input = ssh_pipeline.packet(env, command_env)
         if rclone_ini is not None:
             data = rclone_ini.encode() if isinstance(rclone_ini, str) else rclone_ini
             staged_input += (json.dumps(base64.b64encode(data).decode()) + "\n").encode()
     else:
+        staged_input = json.dumps({
+            directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
+                        for name, value in entries.items()}
+            for directory, entries in staging.items()
+        }).encode() if staging else b""
         payload = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
@@ -643,6 +636,13 @@ except (OSError, ValueError):
                     ssh_error = b""
                 if error := ssh_transport_error(ssh_error):
                     show_ssh_error(error, debug, recovery=allocation_hint(name, store))
+            if owner is not None and status:
+                # The runner can fail before the display channel connects.
+                # Never replay raw first-channel ProxyCommand diagnostics.
+                owner_errors.seek(0)
+                for line in owner_errors.read(16_384).decode(errors="replace").splitlines():
+                    if line.startswith(("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]")):
+                        write_diagnostic(line)
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):

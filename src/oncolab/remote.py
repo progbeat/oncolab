@@ -16,7 +16,8 @@ from tempfile import TemporaryFile
 if __package__:
     from .diagnostics import outcome, safe_subprocess_details
     from .progress import progress
-    from .ssh_pipeline import SETUP_LISTENING, SetupGate, command_gate, stdin_packets, staging_directories
+    from .ssh_pipeline import (SETUP_LISTENING, CommandStateUnknown, SetupGate,
+                               stdin_packets, staging_directories)
 
 
 _ONCOLAB_COLOR = False
@@ -783,21 +784,13 @@ def main():
     directory, color, raw_plan, *command = sys.argv[1:]
     _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
-    if plan.get("pipeline_role") == "command":
-        try:
-            return command_gate(directory, plan, _ONCOLAB_COLOR, command, progress)
-        except KeyboardInterrupt:
-            print("[cancelled]", file=sys.stderr)
-            return 130
-        except (OSError, ValueError):
-            report("Setup channel closed", plan.get("recovery_hint", "The setup runner disconnected.") + ".")
-            return 1
     owner = plan.get("pipeline_role") == "setup"
     control_dir = Path(plan["pipeline_control"]).parent if owner else None
     gate = None
     owner_reports = None
     saved_stderr = None
     sent_result = False
+    command_stopped = True
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     handoff = plan.get("terminal_handoff")
 
@@ -884,7 +877,7 @@ def main():
                 if owner:
                     gate.send("run", os.getcwd(), command_env)
                     sent_result = True
-                    status = gate.receive_status()
+                    status = gate.receive_status(lambda: lifecycle.interrupted)
                 else:
                     takeover()
                     with sp.Popen(argv, env=environment) as cmd:
@@ -892,11 +885,17 @@ def main():
                         code = cmd.wait()
                     status = code if code >= 0 else 128 - code
             except OSError as exc:
+                if owner:
+                    raise
                 report("Command could not start", f"{argv[0]}: {exc.strerror}.")
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
         takeover()
-        report("Remote preparation failed", str(exc))
+        if owner and isinstance(exc, CommandStateUnknown):
+            command_stopped = False
+            report("VM left running", str(exc))
+        else:
+            report("Remote preparation failed", str(exc))
         status = status or 1
     except Exception as exc:
         takeover()
@@ -912,8 +911,8 @@ def main():
             except (OSError, ValueError):
                 pass
         try:
-            released = lifecycle.cleanup(drive)
-            if jobdir:
+            released = command_stopped and lifecycle.cleanup(drive)
+            if jobdir and command_stopped:
                 shutil.rmtree(jobdir, ignore_errors=True)
         except OSError as exc:
             report("VM left running", f"Cleanup failed: {exc.strerror}.")
@@ -921,12 +920,6 @@ def main():
         except Exception as exc:
             internal_error("remote cleanup; leaving the VM running", exc, plan.get("debug"))
             released = False
-        try:
-            if released:
-                unassign()
-        finally:
-            for number, handler in previous.items():
-                signal(number, handler)
     if not released and (hint := plan.get("recovery_hint")):
         report("Check VM state", f"{hint}.")
     final_status = (status if status >= 0 else 128 - status) if released else 125
@@ -938,8 +931,14 @@ def main():
                 os.close(saved_stderr)
                 owner_reports.seek(0)
             if gate.peer is not None:
+                deadline = time.monotonic() + 3
                 while owner_reports is not None and (data := owner_reports.read(65536)):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    gate.peer.settimeout(left)
                     gate.send("diag", base64.b64encode(data).decode())
+                gate.peer.settimeout(max(.05, deadline - time.monotonic()))
                 gate.send("status", final_status)
             elif owner_reports is not None:
                 shutil.copyfileobj(owner_reports, sys.stderr.buffer)
@@ -951,6 +950,12 @@ def main():
                 owner_reports.close()
     if control_dir is not None:
         shutil.rmtree(control_dir, ignore_errors=True)
+    try:
+        if released:
+            unassign()
+    finally:
+        for number, handler in previous.items():
+            signal(number, handler)
     return final_status
 
 

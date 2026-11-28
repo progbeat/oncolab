@@ -1,4 +1,5 @@
 import errno
+import inspect
 import json
 from pathlib import Path
 import select
@@ -9,6 +10,10 @@ import tempfile
 import time
 import unittest
 
+from oncolab import ssh_pipeline
+from oncolab.cli import embedded_gate
+from oncolab.duration import format_duration
+from oncolab.progress import progress
 from oncolab.ssh_pipeline import SETUP_LISTENING, packet
 
 
@@ -71,7 +76,10 @@ class ParallelSSH(unittest.TestCase):
     def test_failed_setup_skips_command_and_unassigns(self):
         self.run_pipeline(setup_fails=True)
 
-    def run_pipeline(self, *, disconnect=False, setup_fails=False):
+    def test_sigterm_to_setup_owner_stops_running_piped_command(self):
+        self.run_pipeline(cancel_owner=True)
+
+    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             with socket.socket(socket.AF_UNIX) as probe:
@@ -110,8 +118,13 @@ class ParallelSSH(unittest.TestCase):
                     'assert os.environ["COLAB_DRIVE"] == "/mock/drive"; '
                     'print(sys.stdin.read(), end=""); raise SystemExit(255)'
                 )
+                if cancel_owner:
+                    spawn = ('import pathlib, time; pathlib.Path("command-active").touch(); '
+                             'time.sleep(60); pathlib.Path("command-escaped").touch()')
+                gate = embedded_gate(inspect.getsource(ssh_pipeline),
+                                     (inspect.getsource(format_duration), inspect.getsource(progress)))
                 client = subprocess.Popen(
-                    [sys.executable, "-m", "oncolab.remote", control, "0", '{"pipeline_role":"command"}',
+                    [sys.executable, "-c", gate, control, "0", "{}",
                      sys.executable, "-c", spawn],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
@@ -132,6 +145,16 @@ class ParallelSSH(unittest.TestCase):
                     return
                 owner.stdin.write(b'"cHJpdmF0ZSBjb25maWd1cmF0aW9u"\n')
                 owner.stdin.flush()
+                if cancel_owner:
+                    wait_file(root / "command-active")
+                    owner.terminate()
+                    _, err = client.communicate(timeout=8)
+                    self.assertEqual((client.returncode, err), (143, b""))
+                    owner.wait(timeout=8)
+                    self.assertEqual(owner.returncode, 143)
+                    self.assertTrue((root / "unassigned").exists())
+                    self.assertFalse((root / "command-escaped").exists())
+                    return
                 out, err = client.communicate(b"untouched stdin\n", timeout=15)
                 if setup_fails:
                     self.assertEqual((client.returncode, out), (7, b""))
