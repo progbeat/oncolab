@@ -59,6 +59,8 @@ class SetupTimeline:
             raise ValueError("Invalid setup progress event")
 
     def candidates(self):
+        if any(status for _, status in self.ends.values()):
+            return set()  # No completed job can belong to a successful setup.
         def blockers(keys):
             # An unfinished prerequisite necessarily becomes ready no earlier
             # than the observed completed ones. At a resolved join, the last

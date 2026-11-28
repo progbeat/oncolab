@@ -138,6 +138,8 @@ class Progress(unittest.TestCase):
         self.assertEqual(timeline.rows(False), [])
         event("setup-finish", 9, 130)
         self.assertEqual(timeline.rows(True), [])
+        event("setup-done", "git", 8, 7)
+        self.assertEqual(timeline.candidates(), set())
 
     def test_tty_setup_has_a_parent_in_both_modes_and_retains_only_verbose_checks(self):
         script = """

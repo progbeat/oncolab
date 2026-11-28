@@ -175,6 +175,7 @@ def receive(peer, buffer, timeout=None):
 async def observe_setup(run, peer, buffer, live):
     loop = asyncio.get_running_loop()
     output = []
+    finished = None
 
     async def read():
         while b"\n" not in buffer:
@@ -191,7 +192,9 @@ async def observe_setup(run, peer, buffer, live):
 
     while True:
         kind, *fields = await read()
-        if kind.startswith("setup-"):
+        if kind == "setup-finish":
+            finished = fields
+        elif kind.startswith("setup-"):
             run.setup_event(kind, *fields)
         elif kind == "diag":
             if live:
@@ -199,7 +202,11 @@ async def observe_setup(run, peer, buffer, live):
             else:
                 pipeline_stderr(base64.b64decode(fields[0]))
         elif kind == "end-output":
-            return output, await read()
+            result = await read()
+            if finished is not None:
+                ended, status = finished
+                run.setup_event("setup-finish", ended, status if result[0] == "run" else status or 1)
+            return output, result
         else:
             raise ValueError("Invalid setup event")
 
