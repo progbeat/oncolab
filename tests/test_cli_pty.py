@@ -30,6 +30,21 @@ argv = sys.argv[1:]
 if "-O" in argv:
     raise SystemExit(0)
 if "-M" in argv:
+    root = Path(os.environ["XDG_CONFIG_HOME"])
+    if mode := os.environ.get("TEST_SSH_RETRY"):
+        log = root / "bootstrap-stores"
+        count = len(log.read_text().splitlines()) if log.exists() else 0
+        store = shlex.split(next(arg for arg in argv if arg.startswith("ProxyCommand=")))[2]
+        with log.open("a") as stream:
+            print(store, file=stream)
+        if count < 2 and mode in {"transient", "unknown"}:
+            diagnosis = ("kex_exchange_identification: Connection closed by remote host"
+                         if mode == "transient" else "redact me: token=secret-fixture")
+            print(diagnosis, file=sys.stderr)
+            raise SystemExit(255)
+        if mode == "auth":
+            print("root@colab-runtime: Permission denied (publickey).", file=sys.stderr)
+            raise SystemExit(255)
     if os.environ.get("TEST_SSH_FAILURE"):
         raise SystemExit(255)
     assert not sys.stdin.buffer.read(), "SSH bootstrap consumed payload stdin"
@@ -118,12 +133,62 @@ raise SystemExit(namespace["main"]())
             reader, writer = os.pipe()
             os.close(reader)
             try:
-                result = subprocess.run([oncolab, "--", "true"], env=env, stdin=subprocess.DEVNULL,
+                result = subprocess.run([oncolab, "--attempts", "1", "--", "true"], env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=writer, timeout=8)
             finally:
                 os.close(writer)
             self.assertEqual(result.returncode, 255)
             self.assertTrue(released.is_file())
+
+    def test_ssh_retry_uses_same_vm_and_auth_errors_stop(self):
+        for mode, attempts, expected_calls, succeeded, message in (
+            ("transient", "0", 3, True, b""),
+            ("unknown", "0", 3, True, b""),
+            ("transient", "2", 2, False, b"The SSH connection closed."),
+            ("auth", "0", 1, False, b"check your SSH key"),
+        ):
+            with self.subTest(mode=mode, attempts=attempts), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                oncolab, env = self.fake_commands(root)
+                released = root / "released"
+                env.update(TEST_SSH_RETRY=mode, COLAB_CLI_RETRY_BACKOFF="0", TEST_RELEASE_MARKER=str(released))
+                result = subprocess.run([oncolab, "--attempts", attempts, "--", "cat"], env=env, input=b"hello\n",
+                                        capture_output=True, timeout=20)
+                self.assertEqual(result.returncode, 0 if succeeded else 255, result.stderr)
+                self.assertEqual(result.stdout, b"hello\n" if succeeded else b"")
+                self.assertIs(released.is_file(), not succeeded)
+                stores = (root / "bootstrap-stores").read_text().splitlines()
+                self.assertEqual(len(stores), expected_calls)
+                self.assertEqual(len(set(stores)), 1)
+                if succeeded:
+                    self.assertEqual(result.stderr, b"")
+                else:
+                    self.assertIn(message, result.stderr)
+
+    def test_ctrl_c_during_unlimited_ssh_backoff_releases_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oncolab, env = self.fake_commands(root)
+            released = root / "released"
+            env.update(TEST_SSH_RETRY="unknown", TEST_SSH_FAILURE="1", COLAB_CLI_RETRY_BACKOFF="120",
+                       TEST_RELEASE_MARKER=str(released))
+            with subprocess.Popen([oncolab, "--attempts", "0", "--", "true"], env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                try:
+                    log = root / "bootstrap-stores"
+                    stop = time.monotonic() + 4
+                    while not log.exists() and proc.poll() is None and time.monotonic() < stop:
+                        time.sleep(.02)
+                    self.assertTrue(log.exists())
+                    time.sleep(.3)  # Let the fake SSH exit and the retry backoff begin.
+                    proc.send_signal(signal.SIGINT)
+                    output, errors = proc.communicate(timeout=5)
+                    self.assertEqual((proc.returncode, output, errors), (130, b"", b"[cancelled]\n"))
+                    self.assertTrue(released.is_file())
+                    self.assertEqual(len(log.read_text().splitlines()), 1)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
 
     def test_command_traceback_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,7 +212,7 @@ raise SystemExit(namespace["main"]())
         ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 oncolab, env = self.fake_commands(Path(tmp))
-                result = subprocess.run([oncolab, "--", name], env=env,
+                result = subprocess.run([oncolab, "--attempts", "0", "--", name], env=env,
                                         stdin=subprocess.DEVNULL, capture_output=True, timeout=12)
                 self.assertEqual((result.returncode, result.stdout), (255, b""))
                 self.assertEqual(result.stderr, (f"[SSH connection failed] {explanation} "

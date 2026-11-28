@@ -101,7 +101,10 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   `--attempts` overrides the last one.
 - Interactive preparation is transient and disappears before the command starts. If OpenSSH may
   need a key passphrase or password, it owns the terminal during authentication. With redirected
-  stdout there is no live display. `oncolab` explains its own failures separately, without
+  stdout there is no live display. After allocation, SSH connection failures without a definite
+  cause are retried against the same VM, with a fresh `--attempts` budget. Key or host verification
+  failures stop immediately. After starting remote execution, `oncolab` never reruns your command
+  on a connection loss. `oncolab` explains its own failures separately, without
   adding a completion message for the remote command. Use `--debug` for internal diagnostic
   locations without raw credential data. The main command's output is unchanged. Configured setup
   commands report captured output only on failure, service and readiness output stays quiet, and

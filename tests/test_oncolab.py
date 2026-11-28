@@ -379,6 +379,36 @@ target = "/mnt/work"
                 self.assertEqual(operations[1:], ["recover", "close"])
                 self.assertEqual("Could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
 
+    def test_reconnecting_reclaims_staging_from_previous_unconfirmed_attempt(self):
+        attempts = []
+
+        def ssh(argv, **kwargs):
+            if "-M" in argv:
+                attempts.append((argv[argv.index("-S") + 1], json.loads(kwargs["input"])))
+                if len(attempts) == 1:
+                    return subprocess.CompletedProcess(argv, 255, stderr=b"unrecognized SSH failure")
+            elif shlex.split(argv[-1])[:2] == ["rm", "-f"]:
+                return subprocess.CompletedProcess(argv, 255)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = {"setup": {}, "mounts": {}, "workdir": "/content", "env": {"TEST": "masked"}}
+        with (patch("sys.argv", ["oncolab", "--attempts", "0", "--", "true"]),
+              patch.dict(os.environ, {"COLAB_CLI_RETRY_BACKOFF": "0"}),
+              patch.object(cli, "plan", return_value=(config, None, None)),
+              patch.object(cli, "allocate", return_value=("session", 0)) as allocate,
+              patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+              patch.object(cli.sp, "run", side_effect=ssh),
+              patch.object(cli.sp, "call", return_value=0) as run_payload,
+              patch("sys.stderr", new_callable=io.StringIO) as stderr):
+            self.assertEqual(cli.main(), 0)
+        allocate.assert_called_once()
+        run_payload.assert_called_once()
+        (first_socket, first_files), (second_socket, (clear, second_files)) = attempts
+        self.assertNotEqual(first_socket, second_socket)
+        self.assertEqual(clear, [f"{directory}/env.json" for directory in first_files])
+        self.assertFalse(first_files.keys() & second_files.keys())
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_missing_or_disabled_rclone_config_fails_before_allocation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -441,8 +471,11 @@ target = "/mnt/work"
             [(directory, files)] = json.loads(envelope).items()
             self.assertTrue(directory.startswith("/dev/shm/oncolab-"))
             target = root / "private"
+            abandoned = root / "abandoned"
+            abandoned.write_bytes(raw)
             subprocess.run([sys.executable, "-c", cli.STAGE],
-                           input=json.dumps({str(target): files}).encode(), check=True)
+                           input=json.dumps([[str(abandoned)], {str(target): files}]).encode(), check=True)
+            self.assertFalse(abandoned.exists())
             staged = target / "rclone.conf"
             self.assertEqual(staged.read_bytes(), raw)
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)

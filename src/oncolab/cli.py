@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import base64
 import inspect
 import json
@@ -18,15 +19,16 @@ from pathlib import Path
 from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
+from time import monotonic
 
 from . import diagnostics
-from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
+from .allocation import AllocationError, AllocationLabel, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .diagnostics import outcome, safe_subprocess_details
 from .duration import format_duration
 from .env import parse_env
-from .progress import CONNECTING, STARTING_RUNNER, preparation_labels, progress, run_step
+from .progress import CONNECTING, STARTING_RUNNER, WAITING, preparation_labels, progress, run_step
 
 
 @contextmanager
@@ -155,7 +157,12 @@ STAGE = """import base64, json, os, sys
 from pathlib import Path
 os.umask(0o077)
 try:
-    for directory, entries in json.load(sys.stdin).items():
+    staging = json.load(sys.stdin)
+    if isinstance(staging, list):
+        clear, staging = staging
+        for file in clear:
+            Path(file).unlink(missing_ok=True)
+    for directory, entries in staging.items():
         path = Path(directory)
         path.mkdir(mode=0o700)
         for name, encoded in entries.items():
@@ -380,7 +387,7 @@ def prepare_copies(config, specs, explicit):
 
 
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
-                copies=(), task_copies=None, store=None, debug=False):
+                copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None):
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
@@ -430,11 +437,17 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             config["setup"][task]["stdin_result"] = f"{directory}/copy-result"
             groups[key] = ((), source)
     # The bootstrap channel must never read the command's stdin.
-    staged_input = json.dumps({
+    encoded_staging = {
         directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
                     for name, value in entries.items()}
         for directory, entries in staging.items()
-    }).encode() if staging else b""
+    }
+    if unclaimed:
+        # A previous attempt may have lost its acknowledgement after writing
+        # credentials. Retry with fresh names and scrub only those old names.
+        staged_input = json.dumps([sorted(unclaimed), encoded_staging]).encode()
+    else:
+        staged_input = json.dumps(encoded_staging).encode() if staging else b""
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
     config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
@@ -447,6 +460,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
+                           "-o", "ConnectTimeout=30", "-o", "ConnectionAttempts=1",
                            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                            "-o", "ProxyCommand=" + shlex.join(proxy).replace("%", "%%"), *trust]
         endpoint = f"{tmp}/stdin.sock" if any(source is not None for _, source in groups.values()) else None
@@ -475,6 +489,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         pending = [f"{directory}/{file}" for directory, file in
                    ((drive_stage, "rclone.conf"), (jobdir, "env.json")) if file in staging.get(directory, {})]
         master_closed = False
+        bootstrap_ready = False
 
         def close_master():
             nonlocal master_closed
@@ -494,24 +509,39 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     except (OSError, sp.TimeoutExpired):
                         confirmed = False
                     if not confirmed:
-                        write_diagnostic(outcome("VM cleanup unconfirmed",
-                                                 f"Could not confirm cleanup of unclaimed credentials for {name!r}.",
-                                                 color=color))
+                        if not bootstrap_ready and unclaimed is not None:
+                            unclaimed.update(pending)
+                        else:
+                            unclaimed_credentials(name, color)
             finally:
-                sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                try:
+                    sp.run([*ssh, "-O", "exit", target], stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=5)
+                except (OSError, sp.TimeoutExpired):
+                    pass
 
-        stage = shlex.join(["python3", "-c", STAGE]) if staging else "true"
+        stage = shlex.join(["python3", "-c", STAGE]) if staged_input else "true"
         try:
             with without_echo(terminal_connect):
-                connected = run_step(CONNECTING, lambda: sp.run(
+                connected = run_step(connect_label, lambda: sp.run(
                     [*ssh, *connect_options, target, stage],
                     input=staged_input, capture_output=True,
                 ), terminal_connect, color, labels=labels)
             if connected.returncode:
-                show_ssh_error(connected.stderr, debug)
-                return connected.returncode, True
+                if connected.returncode in (-SIGINT, 130):
+                    raise KeyboardInterrupt
+                failure = SSHBootstrapError(connected.returncode, connected.stderr)
+                if failure.rejected:
+                    # Authentication, trust and local forwarding errors happen
+                    # before SSH can send the stage command.
+                    pending.clear()
+                raise failure
+            bootstrap_ready = True
+            if unclaimed is not None:
+                unclaimed.clear()
             if live_payload:
                 show_remote_handoff(color)
+            # No replay after dispatch becomes possible: a lost mux response
+            # does not establish whether the remote runner launched.
             attempted.set()
             transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
             task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
@@ -573,33 +603,78 @@ def ssh_transport_error(log):
                       if not line.startswith(b"debug") and any(marker in line for marker in errors))
 
 
-def show_ssh_error(stderr, debug, *, recovery=None):
-    text = (stderr or b"").decode(errors="replace")
-    # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
-    # the staging protocol can be reported without exposing URLs or tokens.
-    if stage := re.search(r"^oncolab-stage: ([A-Za-z]+)$", text, re.MULTILINE):
-        write_diagnostic(outcome("Setup could not start", "Could not stage setup files on the Colab VM."))
-        if debug:
-            write_diagnostic(f"oncolab: staging exception: {stage[1]}")
-        return
-    reasons = (
-        ("Already-active SSH session", "Colab only allows one SSH connection to this VM; disconnect the other connection."),
+def unclaimed_credentials(name, color):
+    write_diagnostic(outcome("VM cleanup unconfirmed",
+                             f"Could not confirm cleanup of unclaimed credentials for {name!r}.",
+                             color=color))
+
+
+def ssh_failure_reason(text):
+    permanent = (
         ("no SSH public key found", "No SSH public key was found; create one with ssh-keygen -t ed25519."),
-        ("Address already in use", "A local port is already in use; choose a different port with -p."),
-        ("Could not request local forwarding", "SSH could not set up local port forwarding."),
-        ("Permission denied", "SSH permission denied; check your SSH key."),
+        ("[colab] failed to derive public key", "Colab could not read the SSH public key; check your SSH key."),
+        ("[colab] Server rejected pubkey (HTTP 400)", "Colab rejected your public key; check your SSH key."),
+        ("[colab] Authentication failed (HTTP 401)", "Colab rejected the connection credentials for this VM."),
+        ("[colab] Forbidden (HTTP 403)", "Colab did not authorize SSH access to this VM."),
         ("Host key verification failed", "SSH host key verification failed; check the trusted host key."),
         ("REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH host key changed; verify it before reconnecting."),
+        ("Address already in use", "A local port is already in use; choose a different port with -p."),
+        ("Could not request local forwarding", "SSH could not set up local port forwarding."),
+        ("Bad configuration option:", "OpenSSH rejected a local connection option."),
+        ("Too many authentication failures", "SSH permission denied; check your SSH key."),
+    )
+    for marker, message in permanent:
+        if marker in text:
+            return message, True
+    # A ProxyCommand may itself report a generic permission error; only
+    # recognize a positive OpenSSH authentication rejection here.
+    if re.search(r"(?m)^(?:[^\s]+: )?Permission denied(?:[.!]?$| \(|, please try again)", text):
+        return "SSH permission denied; check your SSH key.", True
+    transient = (
+        ("Already-active SSH session", "Colab already has an active SSH connection to this VM."),
+        ("SSH session limit reached", "This VM has reached the Colab SSH session limit."),
+        ("Bad gateway (HTTP 502)", "Colab could not reach the VM's SSH server."),
         ("Connection timed out", "SSH connection timed out."),
         ("Connection refused", "SSH connection was refused."),
+        ("Connection reset", "The SSH connection was reset."),
         ("Connection closed", "The SSH connection closed."),
         ("mux_client_request_session:", "The SSH session could not be opened."),
         ("mux_client_request_session():", "The SSH session could not be opened."),
         ("mux_client_read_packet:", "The SSH connection closed."),
         ("Control master terminated unexpectedly", "The SSH connection closed before reporting an exit status."),
     )
-    hint = next((message for marker, message in reasons if marker in text), None)
-    message = hint or ("OpenSSH could not complete the session." if recovery else "Check your SSH key and Colab session.")
+    return next((message for marker, message in transient if marker in text), None), False
+
+
+def staging_error(text):
+    return re.search(r"^oncolab-stage: ([A-Za-z]+)$", text, re.MULTILINE)
+
+
+class SSHBootstrapError(Exception):
+    def __init__(self, status, stderr):
+        self.status = status
+        self.stderr = stderr
+        text = (stderr or b"").decode(errors="replace")
+        self.reason, self.rejected = ssh_failure_reason(text)
+        # Non-255 positive exits report a remote stage failure. A generic
+        # 255 gives no such evidence; reconnect to the same allocated VM.
+        self.retry = (status == 255 or status < 0) and not self.rejected and not staging_error(text)
+
+
+def show_ssh_error(stderr, debug, *, recovery=None, status=255):
+    text = (stderr or b"").decode(errors="replace")
+    # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
+    # the staging protocol can be reported without exposing URLs or tokens.
+    stage = staging_error(text)
+    if stage or 0 < status < 255:
+        message = ("Could not stage setup files on the Colab VM." if stage
+                   else f"The SSH bootstrap command on the Colab VM exited with status {status}.")
+        write_diagnostic(outcome("Setup could not start", message))
+        if debug and stage:
+            write_diagnostic(f"oncolab: staging exception: {stage[1]}")
+        return
+    hint, _ = ssh_failure_reason(text)
+    message = hint or "OpenSSH could not complete the session."
     if recovery:
         message += " " + recovery + "."
     write_diagnostic(outcome("SSH connection failed", message))
@@ -653,7 +728,7 @@ def parse_args():
     hardware.add_argument("--tpu", metavar="MODEL",
                           help="Request a TPU: V5E1, V6E1 (subject to availability)")
     parser.add_argument("--attempts", type=int, metavar="N",
-                        help="Total VM allocation attempts for temporary failures (default 4; 0 until cancelled)")
+                        help="Attempts per VM allocation and SSH connection (default 4; 0 until cancelled)")
     parser.add_argument("--debug", action="store_true", help="Show internal diagnostic details")
     parser.add_argument("--high-mem", action="store_true", help="Request a high-memory VM")
     parser.add_argument("-A", "--forward-agent", action="store_true", help="Forward the local SSH agent")
@@ -700,6 +775,44 @@ def command_line(parser, args, command):
                        terminal, color, Path(directory) / "sessions.json")
 
 
+def retry_ssh(name, args, config, ini, known_hosts, command, copies, task_groups, terminal, color, store, attempted):
+    labels = preparation_labels(config, bool(copies))
+    unclaimed = set()
+    connection = AllocationLabel()
+    wait = AllocationLabel()
+    number = 0
+    try:
+        while True:
+            number += 1
+            count = f"{number}/{args.attempts}" if args.attempts else str(number)
+            prefix = f"SSH · attempt {count}"
+            connection.state = (CONNECTING, "", None, prefix)
+            try:
+                return run_session(name, config, ini, known_hosts, command,
+                                   args.forward_agent, terminal, color, attempted, copies=copies,
+                                   store=store, debug=args.debug, task_copies=task_groups,
+                                   connect_label=connection, unclaimed=unclaimed)
+            except SSHBootstrapError as exc:
+                if attempted.is_set():
+                    raise
+                if not exc.retry or (args.attempts and number >= args.attempts):
+                    show_ssh_error(exc.stderr, args.debug, status=exc.status)
+                    return exc.status, True
+                delay = min(120, args.retry_backoff * 2 ** min(number - 1, 16))
+                if delay:
+                    reason = exc.reason or "OpenSSH could not complete the session."
+                    wait.state = (WAITING, reason, monotonic() + delay, prefix)
+
+                    async def backoff():
+                        await asyncio.sleep(delay)
+
+                    with without_echo(terminal):
+                        run_step(wait, backoff, terminal, color, labels=labels)
+    finally:
+        if unclaimed:
+            unclaimed_credentials(name, color)
+
+
 def execute(args, command, config, ini, known_hosts, copies, task_groups, terminal, color, store):
     name = None
     attempted = Event()
@@ -707,9 +820,8 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
         name, status = allocate(args, terminal, color, store, preparation_labels(config, bool(copies)))
         if not name:
             return status
-        status, fallback = run_session(name, config, ini, known_hosts, command,
-                                       args.forward_agent, terminal, color, attempted, copies=copies,
-                                       store=store, debug=args.debug, task_copies=task_groups)
+        status, fallback = retry_ssh(name, args, config, ini, known_hosts, command, copies,
+                                     task_groups, terminal, color, store, attempted)
         if fallback:
             release(name, terminal, color, store, debug=args.debug)
         # OpenSSH's positive 255 is indistinguishable from a legitimate
