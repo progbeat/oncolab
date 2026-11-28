@@ -288,6 +288,22 @@ class RemoteMounts(unittest.IsolatedAsyncioTestCase):
 
 
 class CLI(unittest.TestCase):
+    def test_managed_install_failure_hides_raw_traceback(self):
+        from oncolab.progress import progress
+
+        fault = b'Traceback (most recent call last):\n  File "/fixture/install.py", line 9, in build\nRuntimeError: private fixture'
+        for debug in (False, True):
+            drive = Mock()
+            drive.socket.exists.return_value = False
+            with (patch.object(remote, "command_result", new=AsyncMock(return_value=subprocess.CompletedProcess(
+                       [], 23, b"", fault))), patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                status = progress(lambda run: remote.setup_all(run, {"setup": {}, "mounts": {}, "debug": debug}, drive),
+                                  False, False, capture=True)
+            self.assertEqual(status, 23)
+            self.assertIn("Preparing FUSE", stderr.getvalue())
+            self.assertNotIn("private fixture", stderr.getvalue())
+            self.assertEqual("install.py:9 in build" in stderr.getvalue(), debug)
+
     def test_legacy_mount_profile_never_reads_or_forwards_shared_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -331,6 +347,7 @@ target = "/mnt/work"
             self.assertIn("loop", stderr.getvalue())
             allocate.assert_not_called()
 
+    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
     def test_ambiguous_ssh_recovery_removes_only_pending_before_closing_master(self):
         for cleanup_status in (0, 255):
             with self.subTest(cleanup_status=cleanup_status):
@@ -354,6 +371,7 @@ target = "/mnt/work"
                     return subprocess.CompletedProcess(argv, 0)
 
                 with (patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+                      patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: run(argv, input=data)),
                       patch.object(cli.sp, "run", side_effect=run), patch.object(cli.sp, "call", return_value=255),
                       patch("sys.stderr", new_callable=io.StringIO) as stderr):
                     result = cli.run_session("failed-session", {"setup": {}, "env": {"TEST_SECRET": "fixture"}},
@@ -361,7 +379,39 @@ target = "/mnt/work"
                                              ["true"], False, False, False, Event())
                 self.assertEqual(result, (255, False))
                 self.assertEqual(operations[1:], ["recover", "close"])
-                self.assertEqual("could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
+                self.assertEqual("Could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
+
+    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
+    def test_reconnecting_reclaims_staging_from_previous_unconfirmed_attempt(self):
+        attempts = []
+
+        def ssh(argv, **kwargs):
+            if "-M" in argv:
+                attempts.append((argv[argv.index("-S") + 1], json.loads(kwargs["input"])))
+                if len(attempts) == 1:
+                    return subprocess.CompletedProcess(argv, 255, stderr=b"unrecognized SSH failure")
+            elif shlex.split(argv[-1])[:2] == ["rm", "-f"]:
+                return subprocess.CompletedProcess(argv, 255)
+            return subprocess.CompletedProcess(argv, 0)
+
+        config = {"setup": {}, "mounts": {}, "workdir": "/content", "env": {"TEST": "masked"}}
+        with (patch("sys.argv", ["oncolab", "--attempts", "0", "--", "true"]),
+              patch.dict(os.environ, {"COLAB_CLI_RETRY_BACKOFF": "0"}),
+              patch.object(cli, "plan", return_value=(config, None, None)),
+              patch.object(cli, "allocate", return_value=("session", 0)) as allocate,
+              patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+              patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: ssh(argv, input=data)),
+              patch.object(cli.sp, "run", side_effect=ssh),
+              patch.object(cli.sp, "call", return_value=0) as run_payload,
+              patch("sys.stderr", new_callable=io.StringIO) as stderr):
+            self.assertEqual(cli.main(), 0)
+        allocate.assert_called_once()
+        run_payload.assert_called_once()
+        (first_socket, first_files), (second_socket, (clear, second_files)) = attempts
+        self.assertNotEqual(first_socket, second_socket)
+        self.assertEqual(clear, [f"{directory}/env.json" for directory in first_files])
+        self.assertFalse(first_files.keys() & second_files.keys())
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_missing_or_disabled_rclone_config_fails_before_allocation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,9 +463,11 @@ target = "/mnt/work"
                 return subprocess.CompletedProcess(argv, 0)
 
             with (patch("sys.argv", args), patch.object(cli, "allocate", return_value=("test-session", 0)),
-                  patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp}, clear=True),
+                  patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp, "ONCOLAB_PARALLEL_SETUP": "0"},
+                             clear=True),
                   patch("oncolab.config.which", return_value=None),
                   patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+                  patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: run(argv, input=data)),
                   patch.object(cli.sp, "run", side_effect=run),
                   patch.object(cli.sp, "call", side_effect=lambda argv: run(argv).returncode),
                   patch("sys.stderr", new_callable=io.StringIO) as stderr):
@@ -425,12 +477,33 @@ target = "/mnt/work"
             [(directory, files)] = json.loads(envelope).items()
             self.assertTrue(directory.startswith("/dev/shm/oncolab-"))
             target = root / "private"
+            abandoned = root / "abandoned"
+            abandoned.write_bytes(raw)
             subprocess.run([sys.executable, "-c", cli.STAGE],
-                           input=json.dumps({str(target): files}).encode(), check=True)
+                           input=json.dumps([[str(abandoned)], {str(target): files}]).encode(), check=True)
+            self.assertFalse(abandoned.exists())
             staged = target / "rclone.conf"
             self.assertEqual(staged.read_bytes(), raw)
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_definitive_colab_ssh_rejections_are_permanent_and_masked(self):
+        for diagnostic in (
+            b"[colab] Server rejected pubkey: unsupported key type. fixture-secret",
+            b"[colab] Server rejected pubkey (HTTP 400): fixture-secret",
+            b"[colab] Server rejected request: missing pubkey header. fixture-secret",
+            b"[colab] Endpoint not found (HTTP 404): fixture-secret",
+            b"[colab] --identity /fixture-secret: file not found.",
+            b"[colab] ssh-keygen produced no key for fixture-secret.",
+            b"Unable to negotiate with fixture-secret port 22: no matching host key type found.",
+            b"To authorize colab-cli, visit this URL in any browser:\nhttps://fixture-secret",
+            b"No valid default credentials found. fixture-secret",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                failure = cli.SSHBootstrapError(255, diagnostic)
+                self.assertFalse(failure.retry)
+                self.assertTrue(failure.rejected)
+                self.assertNotIn("fixture-secret", failure.reason)
 
     def test_named_copy_and_cli_copy_reject_overlapping_destinations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -465,7 +538,7 @@ target = "/mnt/work"
         with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, None, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \
                 patch("sys.argv", ["oncolab", "--", "test", "spaces and $metacharacters"]):
-            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, copies):
+            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, copies, **kwargs):
                 self.assertEqual(command, ["test", "spaces and $metacharacters"])
                 attempted.set()
                 return 255, False
@@ -489,9 +562,12 @@ target = "/mnt/work"
         result = subprocess.run([*config["entrypoint"], *payload], capture_output=True)
         self.assertEqual((result.returncode, result.stdout), (0, b"hello world\na b $c\n"))
 
-    def test_recognizes_wrapped_colab_service_unavailable(self):
-        self.assertTrue(cli.allocation_unavailable(
-            b"Trail\nColabRequestError: Failed to issue request POST \r\n"
-            b"https://colab.research.google.com/tun/m/assign?nbh=ab\r\nc&variant=DEFAULT:"
-            b"\r\n Service Unavailable\r\n"))
-        self.assertFalse(cli.allocation_unavailable(b"ColabRequestError: Unrelated Service Unavailable"))
+    def test_internal_exception_is_quiet_unless_debugging(self):
+        for debug in (False, True):
+            argv = ["oncolab", *(["--debug"] if debug else []), "--", "true", "--debug"]
+            with (patch("sys.argv", argv), patch.object(cli, "plan", side_effect=RuntimeError("secret")),
+                  patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                self.assertEqual(cli.main(), 1)
+                self.assertIn("Unexpected internal error", stderr.getvalue())
+                self.assertNotIn("secret", stderr.getvalue())
+                self.assertEqual("RuntimeError" in stderr.getvalue(), debug)

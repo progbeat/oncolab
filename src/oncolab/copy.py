@@ -1,4 +1,5 @@
 """One-way file staging over a separate SSH channel."""
+import json
 import errno
 import fcntl
 import os
@@ -192,6 +193,18 @@ def notify_failure(result):
         # The runner already left setup and cleaned its private staging directory.
 
 
+def copy_diagnostic(message, exc=None):
+    # A separate protocol lets the caller distinguish helper diagnostics
+    # from SSH and interpreter output on the managed transfer channel.
+    message = str(message)
+    if exc is not None and globals().get("_ONCOLAB_DEBUG"):
+        from traceback import extract_tb
+        stack = " > ".join(f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
+                           for frame in extract_tb(exc.__traceback__))
+        message += f" ({type(exc).__name__}: {stack})"
+    print("oncolab-copy: " + json.dumps(message), file=sys.stderr)
+
+
 def copy_receiver(result, targets, modes=None):
     result = Path(result)
     try:
@@ -206,7 +219,9 @@ def copy_receiver(result, targets, modes=None):
         receive_archive(sys.stdin.buffer, targets, modes, cancelled=cancelled)
         status = "ok"
     except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
-        print(exc, file=sys.stderr)
+        copy_diagnostic(exc)
+    except Exception as exc:
+        copy_diagnostic("Unexpected copy receiver error", exc)
     try:
         publish_result(result, status)
     except FileNotFoundError:
@@ -281,9 +296,9 @@ def input_receiver(result, stdin=None, stopping=None):
                 or (exc.errno == errno.ENOENT and (cancelled.exists() or not result.parent.is_dir()))):
             status = "short"
         else:
-            print(exc, file=sys.stderr)
+            copy_diagnostic(exc)
     except ValueError as exc:
-        print(exc, file=sys.stderr)
+        copy_diagnostic(exc)
     finally:
         if writer is not None:
             os.close(writer)
@@ -398,15 +413,22 @@ def transfer_broker(jobdir, groups):
             endpoint.unlink(missing_ok=True)
 
 
-if __name__ == "__main__":
-    import json
-
+def main():
     if sys.argv[1] == "--broker":
         transfer_broker(sys.argv[2], json.loads(sys.argv[3]))
     elif sys.argv[2] == "--failed":
         notify_failure(sys.argv[1])
     elif sys.argv[2] == "--stdin":
-        raise SystemExit(input_receiver(sys.argv[1]))
+        return input_receiver(sys.argv[1])
     else:
-        raise SystemExit(copy_receiver(sys.argv[1], json.loads(sys.argv[2]),
-                                       json.loads(sys.argv[3]) if len(sys.argv) > 3 else None))
+        return copy_receiver(sys.argv[1], json.loads(sys.argv[2]),
+                             json.loads(sys.argv[3]) if len(sys.argv) > 3 else None)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        copy_diagnostic("Unexpected internal file transfer error", exc)
+        raise SystemExit(1) from None

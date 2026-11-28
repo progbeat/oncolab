@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import fcntl
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess as sp
 import sys
@@ -10,6 +12,25 @@ import time
 from functools import partial
 from pathlib import Path
 from signal import SIGHUP, SIGINT, SIGKILL, SIGTERM, signal
+from tempfile import TemporaryFile
+
+if __package__:
+    from .diagnostics import outcome, safe_subprocess_details
+    from .progress import progress
+    from .ssh_pipeline import (SETUP_CANCEL, SETUP_LISTENING, CommandStateUnknown, SetupGate,
+                               receive, stdin_packets, staging_directories)
+
+
+_ONCOLAB_COLOR = False
+_ONCOLAB_TERMINAL = None
+
+
+def remote_outcome(label, message):
+    return outcome(label, message, color=_ONCOLAB_COLOR, terminal=_ONCOLAB_TERMINAL)
+
+
+def report(label, message):
+    print(remote_outcome(label, message), file=sys.stderr)
 
 
 def unassign():
@@ -151,7 +172,7 @@ class DriveMounts:
         target = Path(target)
         if target in self.attached:
             if sp.call(["umount", "--", target]):
-                print(f"oncolab: could not unmount {target}; leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Could not unmount {target}.")
                 return False
             self.attached.remove(target)
         return True
@@ -160,7 +181,7 @@ class DriveMounts:
         self.seal()
         results = [self.detach(path) for path in reversed(self.attached[:]) if path not in preserve]
         if self.uncertain:
-            print("oncolab: Drive mount state is uncertain; leaving the VM and daemon running", file=sys.stderr)
+            report("VM left running", "Drive mount state is uncertain; the mount daemon is still running.")
         if not all(results) or self.attached or keep_daemon or self.uncertain:
             return False
         if self.server is not None:
@@ -262,7 +283,7 @@ def stop_process(proc):
         try:
             proc.wait(timeout=5)
         except sp.TimeoutExpired:
-            print(f"oncolab: could not stop process {proc.pid}", file=sys.stderr)
+            report("Process still running", f"Could not stop process {proc.pid}.")
             return False
     # A shell may exit before its process group. Do not leave descendants alive.
     try:
@@ -380,6 +401,38 @@ class Lifecycle:
         self.nodes = {}
         self.began = set()
         self.services = {}
+        self.setup_output = None
+        self.setup_sink = None
+
+    def write_setup_output(self, data):
+        if self.setup_sink is not None:
+            self.setup_sink(data)
+        elif self.setup_output is not None:
+            self.setup_output.append(data)
+        elif isinstance(data, bytes):
+            sys.stderr.buffer.write(data)
+        else:
+            print(data, file=sys.stderr, flush=True)
+
+    def flush_setup_output(self):
+        deferred, self.setup_output = self.setup_output, None
+        if deferred:
+            try:
+                fd = sys.stderr.fileno()
+                for data in deferred:
+                    if isinstance(data, str):
+                        data = (data + "\n").encode(sys.stderr.encoding or "utf-8",
+                                                     sys.stderr.errors or "backslashreplace")
+                    pending = memoryview(data)
+                    while pending:
+                        written = os.write(fd, pending)
+                        if not written:
+                            return
+                        pending = pending[written:]
+            except (OSError, ValueError):
+                # Do not poison Python's buffered stderr on a closed sink:
+                # it can replace an already known exit code at shutdown.
+                pass
 
     def interrupt(self, number, _):
         if not self.interrupted:
@@ -389,12 +442,12 @@ class Lifecycle:
             elif self.command is not None and number != SIGINT:
                 self.command.send_signal(number)
 
-    async def prepare(self, run, plan, drive):
+    async def prepare(self, run, plan, drive, drive_config=None):
         self.setup = asyncio.current_task()
         try:
             if self.interrupted:
                 return 128 + self.interrupted
-            return await setup_all(run, plan, drive, self)
+            return await setup_all(run, plan, drive, self, drive_config)
         except asyncio.CancelledError:
             if not self.interrupted:
                 raise
@@ -462,8 +515,8 @@ class Lifecycle:
                     Path(result).with_name("cancelled").touch()
                     archives[name] = result
                 except OSError as exc:
-                    print(f"oncolab: could not cancel copy for {self.nodes[name][0]['description']}: "
-                          f"{exc.strerror}; leaving the VM running", file=sys.stderr)
+                    report("VM left running", f"Could not cancel copy for {self.nodes[name][0]['description']}: "
+                           f"{exc.strerror}.")
                     hold(name)
                     failed = True
         deadline = time.monotonic() + 5
@@ -473,8 +526,7 @@ class Lifecycle:
             except OSError:
                 idle = False
             if not idle:
-                print(f"oncolab: copy for {self.nodes[name][0]['description']} did not stop; "
-                      "leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Copy for {self.nodes[name][0]['description']} did not stop.")
                 hold(name)
                 failed = True
 
@@ -492,10 +544,9 @@ class Lifecycle:
                     ok = drive.detach(target)
                 if ok:
                     continue
-                print(f"oncolab: teardown of {step['description']} failed; leaving the VM running", file=sys.stderr)
+                report("VM left running", f"Teardown of {step['description']} failed.")
             except OSError as exc:
-                print(f"oncolab: teardown of {step['description']} failed: {exc.strerror}; leaving the VM running",
-                      file=sys.stderr)
+                report("VM left running", f"Teardown of {step['description']} failed: {exc.strerror}.")
             failed = True
             hold(name)
         preserve = {Path(step["mount_target"]) for name, (step, _) in self.nodes.items()
@@ -504,7 +555,7 @@ class Lifecycle:
         return released and not failed
 
 
-async def setup_all(run, plan, drive, lifecycle=None):
+async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
     lifecycle = lifecycle or Lifecycle()
     tasks = {}
 
@@ -513,6 +564,9 @@ async def setup_all(run, plan, drive, lifecycle=None):
         if "description" not in step:
             step = {**step, "description": description}
         lifecycle.nodes[name] = (step, dependencies)
+        reserve = getattr(run, "reserve", None)
+        if reserve is not None:
+            reserve(description)
 
         async def execute():
             results = await asyncio.gather(*(tasks[dep] for dep in dependencies))
@@ -521,12 +575,21 @@ async def setup_all(run, plan, drive, lifecycle=None):
             lifecycle.began.add(name)
             result = await run(description, command)
             if result is not None and result.returncode:
-                if result.stdout:
-                    sys.stderr.buffer.write(result.stdout)
-                if result.stderr:
-                    sys.stderr.buffer.write(result.stderr)
+                if name in ("fuse", "rclone"):
+                    # Built-in installers are managed commands, not profile
+                    # hooks. Their free-form output may contain internal traces.
+                    if plan.get("debug"):
+                        text = b"\n".join((result.stdout or b"", result.stderr or b"")).decode(errors="replace")
+                        for detail in safe_subprocess_details(text):
+                            lifecycle.write_setup_output(detail)
+                else:
+                    if result.stdout:
+                        lifecycle.write_setup_output(result.stdout)
+                    if result.stderr:
+                        lifecycle.write_setup_output(result.stderr)
                 if name != "copy":  # The local transfer reports its concrete error.
-                    print(f"oncolab: {description} failed (exit {result.returncode})", file=sys.stderr)
+                    lifecycle.write_setup_output(remote_outcome("Setup failed",
+                                                                f"{description} (exit {result.returncode})."))
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
@@ -552,7 +615,14 @@ async def setup_all(run, plan, drive, lifecycle=None):
 
         submit("fuse", "Preparing FUSE…", install(FUSE), *workdir_ready)
         submit("rclone", "Preparing rclone…", install(RCLONE), *workdir_ready)
-        submit("rcd", "Starting Drive mounts…", drive.start, "fuse", "rclone")
+        drive_dependencies = ("fuse", "rclone")
+        if drive_config is not None:
+            async def receive_config():
+                await drive_config
+
+            submit("drive-config", "Receiving Drive config…", receive_config)
+            drive_dependencies += ("drive-config",)
+        submit("rcd", "Starting Drive mounts…", drive.start, *drive_dependencies)
         drive_tasks.extend(("fuse", "rclone", "rcd"))
         setup_mounts = {step.get("mount") for step in plan["setup"].values()}
         for name, mount in plan["mounts"].items():
@@ -622,7 +692,9 @@ async def setup_all(run, plan, drive, lifecycle=None):
                         except RuntimeError:
                             if not (any(mount_results) or lifecycle.interrupted):
                                 raise
-                            print("oncolab: could not detach rclone from its staging path", file=sys.stderr)
+                            lifecycle.write_setup_output(remote_outcome(
+                                "Drive cleanup incomplete", "Could not detach rclone from its staging path.",
+                            ))
             finally:
                 drive.seal()
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -637,10 +709,118 @@ async def setup_all(run, plan, drive, lifecycle=None):
     return next((result for result in results if result), 0)
 
 
+def send_setup_diag(gate, data):
+    if isinstance(data, str):
+        data = (data + "\n").encode("utf-8", "backslashreplace")
+    for offset in range(0, len(data), 65536):
+        gate.send("diag", base64.b64encode(data[offset:offset + 65536]).decode())
+
+
+def send_setup_output(gate, lifecycle):
+    messages, lifecycle.setup_output = lifecycle.setup_output or [], None
+    lifecycle.setup_sink = None
+    for data in messages:
+        send_setup_diag(gate, data)
+    gate.send("end-output")
+
+
+async def pipeline_setup(run, lifecycle, plan, drive, gate):
+    accepted = asyncio.create_task(gate.accept())
+    stream, transport = await stdin_packets()
+    staged_config = None
+    loop = asyncio.get_running_loop()
+    watching = None
+    descriptor = None
+    try:
+        setup_env, command_env = json.loads(await stream.readline())
+        lifecycle.environment = os.environ | setup_env
+
+        async def receive_drive():
+            raw = base64.b64decode(json.loads(await stream.readline()), validate=True)
+            with os.fdopen(os.open(drive.config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
+                file.write(raw)
+
+        if drive is not None:
+            staged_config = asyncio.create_task(receive_drive())
+        counter = 0
+
+        async def event_run(label, invoke):
+            nonlocal counter
+            key = counter
+            counter += 1
+            gate.send("start", key, label, time.monotonic())
+            try:
+                return await run(label, invoke)
+            finally:
+                gate.send("done", key)
+
+        async def detect_disconnect():
+            nonlocal descriptor
+            try:
+                await accepted
+            except (OSError, TimeoutError):
+                lifecycle.interrupt(SIGTERM, None)
+                return
+            descriptor = gate.peer.fileno()
+
+            def disconnected():
+                # Only a cancellation can arrive before setup hands off.
+                peek = gate.peer.recv(len(SETUP_CANCEL), socket.MSG_PEEK)
+                if peek and SETUP_CANCEL.startswith(peek) and peek != SETUP_CANCEL:
+                    return
+                loop.remove_reader(descriptor)
+                if peek == SETUP_CANCEL:
+                    gate.peer.recv(len(SETUP_CANCEL))
+                    lifecycle.interrupt(SIGINT, None)
+                else:
+                    lifecycle.interrupt(SIGTERM, None)
+
+            loop.add_reader(descriptor, disconnected)
+
+        watching = asyncio.create_task(detect_disconnect())
+        status = await lifecycle.prepare(event_run, plan, drive, staged_config)
+        await accepted
+        inherited = {key: value for key, value in os.environ.items()
+                     if key in ("PATH", "COLAB_DRIVE") or key.startswith("ONCOLAB_MOUNT_")}
+        return status, inherited | setup_env | command_env
+    finally:
+        transport.close()
+        if watching is not None:
+            watching.cancel()
+            await asyncio.gather(watching, return_exceptions=True)
+        if descriptor is not None:
+            loop.remove_reader(descriptor)
+        if staged_config is not None:
+            if not staged_config.done():
+                staged_config.cancel()
+            await asyncio.gather(staged_config, return_exceptions=True)
+        if not accepted.done():
+            accepted.cancel()
+        await asyncio.gather(accepted, return_exceptions=True)
+
+
 def main():
+    global _ONCOLAB_COLOR, _ONCOLAB_TERMINAL
     directory, color, raw_plan, *command = sys.argv[1:]
+    _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
+    owner = plan.get("pipeline_role") == "setup"
+    _ONCOLAB_TERMINAL = plan.get("pipeline_terminal") if owner else None
+    control_dir = Path(plan["pipeline_control"]).parent if owner else None
+    gate = None
+    owner_reports = None
+    saved_stderr = None
+    sent_result = False
+    command_stopped = True
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+    handoff = plan.get("terminal_handoff")
+
+    def takeover(*, erase=True):
+        nonlocal handoff
+        if handoff:
+            handoff = None
+            print("\x1b[A\r" + ("\x1b[K" if erase else ""), end="", flush=True)
+
     os.environ["PATH"] = str(Path.home() / ".local/bin") + ":" + os.environ["PATH"]
     drive = None
     jobdir = Path(plan["jobdir"]) if "jobdir" in plan else None
@@ -649,13 +829,24 @@ def main():
     status = 1
     previous = {n: signal(n, lifecycle.interrupt) for n in (SIGINT, SIGHUP, SIGTERM)}
     try:
+        if owner:
+            staging_directories(plan["pipeline_dirs"])
+            control_dir.mkdir(mode=0o700)
+            gate = SetupGate(plan["pipeline_control"])
+            owner_reports = TemporaryFile(dir=control_dir)
+            saved_stderr = os.dup(sys.stderr.fileno())
+            os.dup2(owner_reports.fileno(), sys.stderr.fileno())
+            lifecycle.setup_output = []
+            if not plan.get("pipeline_terminal"):
+                lifecycle.setup_sink = partial(send_setup_diag, gate)
         if plan["mounts"]:
             path = Path(directory)
             st = path.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Drive staging directory is not private")
             drive = DriveMounts(directory)
-            (path / "rclone.conf").rename(drive.config)
+            if not owner:
+                (path / "rclone.conf").rename(drive.config)
             for name, mount in plan["mounts"].items():
                 var = name.removeprefix("mounts.").upper().replace("-", "_")
                 os.environ[f"ONCOLAB_MOUNT_{var}"] = mount["target"]
@@ -663,7 +854,7 @@ def main():
             st = jobdir.lstat()
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
                 raise RuntimeError("Job staging directory is not private")
-            if plan.get("has_env"):
+            if plan.get("has_env") and not owner:
                 claimed = jobdir / "active-env.json"
                 try:
                     (jobdir / "env.json").rename(claimed)
@@ -681,7 +872,25 @@ def main():
         if work:
             os.environ["COLAB_DRIVE"] = work["target"]
         lifecycle.environment = os.environ | setup_env
-        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1", capture=True)
+        options = {"labels": plan["progress_labels"]} if "progress_labels" in plan else {}
+        # Replaying hook diagnostics while the live renderer owns the
+        # cursor can overwrite their first line (or leave stale timer text).
+        if live:
+            lifecycle.setup_output = []
+        if owner:
+            # The command side must never connect to a setup gate whose
+            # synchronous preflight already failed.
+            sys.stdout.buffer.write(SETUP_LISTENING)
+            sys.stdout.buffer.flush()
+            status, command_env = progress(lambda run: pipeline_setup(run, lifecycle, plan, drive, gate),
+                                           False, False, capture=True)
+            send_setup_output(gate, lifecycle)
+        else:
+            try:
+                status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
+                                  capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
+            finally:
+                lifecycle.flush_setup_output()
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:
@@ -690,31 +899,124 @@ def main():
             try:
                 environment = {name: value for name, value in (lifecycle.environment | command_env).items()
                                if value is not None}
-                with sp.Popen(argv, env=environment) as cmd:
-                    lifecycle.command = cmd
-                    code = cmd.wait()
-                status = code if code >= 0 else 128 - code
+                if owner:
+                    gate.send("run", os.getcwd(), command_env)
+                    sent_result = True
+                    status = gate.receive_status(lambda: lifecycle.interrupted)
+                else:
+                    takeover()
+                    with sp.Popen(argv, env=environment) as cmd:
+                        lifecycle.command = cmd
+                        code = cmd.wait()
+                    status = code if code >= 0 else 128 - code
             except OSError as exc:
-                print(f"oncolab: {argv[0]}: {exc.strerror}", file=sys.stderr)
+                if owner:
+                    raise
+                report("Command could not start", f"{argv[0]}: {exc.strerror}.")
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
-        print(f"oncolab: {exc}", file=sys.stderr)
+        takeover()
+        if owner and isinstance(exc, CommandStateUnknown):
+            command_stopped = False
+            report("VM left running", str(exc))
+        else:
+            report("Remote preparation failed", str(exc))
+        status = status or 1
+    except Exception as exc:
+        takeover()
+        internal_error("remote preparation", exc, plan.get("debug"))
         status = status or 1
     finally:
         lifecycle.command = None
+        if gate is not None and gate.peer is not None and not sent_result:
+            try:
+                if lifecycle.setup_output is not None:
+                    send_setup_output(gate, lifecycle)
+                gate.send("failed")
+            except (OSError, ValueError):
+                pass
         try:
-            released = lifecycle.cleanup(drive)
-            if jobdir:
+            released = command_stopped and lifecycle.cleanup(drive)
+            if jobdir and command_stopped:
                 shutil.rmtree(jobdir, ignore_errors=True)
         except OSError as exc:
-            print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)
+            report("VM left running", f"Cleanup failed: {exc.strerror}.")
             released = False
+        except Exception as exc:
+            internal_error("remote cleanup; leaving the VM running", exc, plan.get("debug"))
+            released = False
+    if not released and (hint := plan.get("recovery_hint")):
+        report("Check VM state", f"{hint}.")
+    def release_vm():
         if released:
-            unassign()
-        for number, handler in previous.items():
-            signal(number, handler)
-    return (status if status >= 0 else 128 - status) if released else 125
+            try:
+                unassign()
+            except OSError:
+                return 125, False
+            return (status if status >= 0 else 128 - status), True
+        return 125, False
+
+    if gate is not None:
+        try:
+            if owner_reports is not None:
+                sys.stderr.flush()
+                os.dup2(saved_stderr, sys.stderr.fileno())
+                os.close(saved_stderr)
+                owner_reports.seek(0)
+            if gate.peer is not None:
+                while owner_reports is not None and (data := owner_reports.read(65536)):
+                    gate.send("diag", base64.b64encode(data).decode())
+                # Teardown writes to the user's stderr. Respect its
+                # backpressure and do not release the VM while it is writing.
+                gate.send("end-diagnostics")
+                if receive(gate.peer, bytearray()) != ["drained"]:
+                    raise ValueError("Invalid teardown acknowledgement")
+            elif owner_reports is not None:
+                shutil.copyfileobj(owner_reports, sys.stderr.buffer)
+                sys.stderr.buffer.flush()
+        except (OSError, ValueError):
+            pass
+        # Queue VM release only after forwarding teardown diagnostics, but
+        # before acknowledging success. Never skip release on a broken sink.
+        try:
+            final_status, release_queued = release_vm()
+            if gate.peer is not None:
+                gate.peer.settimeout(.5)
+                if released and not release_queued:
+                    hint = plan.get("recovery_hint", "Check 'colab sessions' for the VM")
+                    gate.send("diag", base64.b64encode(
+                        (remote_outcome("VM release unconfirmed", hint + ".") + "\n").encode()
+                    ).decode())
+                gate.send("status", final_status)
+        except OSError:
+            pass
+        finally:
+            gate.close()
+            if owner_reports is not None:
+                owner_reports.close()
+    else:
+        final_status, release_queued = release_vm()
+        if released and not release_queued:
+            report("VM release unconfirmed", plan.get("recovery_hint", "Check 'colab sessions' for the VM") + ".")
+    if control_dir is not None:
+        shutil.rmtree(control_dir, ignore_errors=True)
+    for number, handler in previous.items():
+        signal(number, handler)
+    return final_status
+
+
+def internal_error(operation, exc, debug):
+    report("oncolab failed", f"Unexpected internal error during {operation}. Use --debug for details.")
+    if debug:
+        from traceback import extract_tb
+        print(type(exc).__name__, file=sys.stderr)
+        for frame in extract_tb(exc.__traceback__):
+            print(f"  {Path(frame.filename).name}:{frame.lineno} in {frame.name}", file=sys.stderr)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        internal_error("remote execution", exc, globals().get("_ONCOLAB_DEBUG", False))
+        raise SystemExit(1) from None

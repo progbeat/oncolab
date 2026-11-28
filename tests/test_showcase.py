@@ -197,7 +197,7 @@ class Transfers(unittest.TestCase):
             def wait(self):
                 return 0
 
-        def archive(*_):
+        def archive(*_, debug=False):
             if not all(started.wait(1) for started in blockers):
                 return "input streams did not start", True
             archived.set()
@@ -235,12 +235,12 @@ class Transfers(unittest.TestCase):
                 return 0
 
         def printing(message, **_):
-            self.assertEqual(message, "oncolab: test stream failure")
+            self.assertEqual(message, "[Copy failed] test stream failure")
             reported.set()
 
         with (patch.object(cli.sp, "Popen", return_value=Broker()),
               patch.object(cli, "upload_stream", return_value=("test stream failure", True)),
-              patch("oncolab.cli.print", side_effect=printing, create=True) as output):
+              patch.object(cli, "write_diagnostic", side_effect=printing) as output):
             self.assertEqual(cli.upload_tasks([], "peer", "/job", {"stream": ((), Path("input"))},
                                               "/forwarded"), ["test stream failure"])
         output.assert_called_once()

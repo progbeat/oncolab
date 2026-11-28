@@ -1,7 +1,8 @@
-# 0.2.0
+# 0.3.0
 <!-- Bump: minor -->
-- Copy local files and directories to Colab with repeatable `--copy`. In a profile, set `copy` on a named `[setup.<name>]` task. Independent tasks can run in parallel, and `needs` gates the entire task, including its copy.
-- Set the VM working directory with `workdir` and share profile environment defaults via `[env]`. Override or forward variables for the command with Docker-style `-e` and `--env`.
-- Compose setup tasks with streamed stdin inputs, managed processes with readiness probes, and dependency-ordered teardown. Use `needs` and `run`; the old `depends` and `script` fields are not supported.
-- **Mount profiles need migration.** Use `mount` in a named setup task instead of `[mounts.*]`. Mounts use your local rclone config by default; set `[rclone].config` to choose another file. The entire selected file is sent to the VM without scope filtering. See [Google Drive mounts](https://github.com/progbeat/oncolab/blob/v0.2.0/docs/configuration.md#google-drive-mounts) for migration steps.
-- Use `--mount source=gdrive:work,target=/mnt/work,readonly` for one-off read-only mounts and `-p` / `--publish` for local loopback access to a VM service.
+- In an interactive terminal, see elapsed time for VM creation, SSH connection, and active setup steps. OpenSSH prompts take precedence, and preparation indicators clear before the command starts.
+- See the requested runtime, attempt number, and countdown when VM creation is retried. The retry reason is yellow in color terminals. The default is four attempts. Override it with `--attempts`, or set `--attempts 0` to retry transient failures until Ctrl+C. Colab's retry delay is never shortened; bounded runs report delays over two minutes and exit instead of waiting.
+- Retry eligible SSH connection failures on the same VM with a separate attempt budget. Definitive refusals stop retries. If the command might already have started, it is not run again.
+- Start eligible setup steps while the Drive configuration is still transferring. The command gets its own SSH channel and starts only after setup is ready. Parallel staging may reject rclone configs around 12 MiB or larger.
+- If Colab credentials are missing, run `colab sessions` to sign in. Oncolab reports its own failures without dumping internal tracebacks; use `--debug` for more detail. The command's output is unchanged, and its exit status is preserved when cleanup succeeds.
+- Cancelling allocation or setup attempts VM cleanup. If cleanup or release cannot be confirmed, check `colab sessions` for the VM endpoint and use Colab's Manage sessions view only once no writes are pending.

@@ -1,20 +1,50 @@
 import subprocess as sp
 import sys
 
-def progress(work, live, color, *, capture=False):
+from .duration import format_duration
+
+ALLOCATING = "Creating Colab VM…"
+CHECKING_LOGIN = "Checking Colab sign-in…"
+WAITING = "Waiting to retry…"
+CONNECTING = "Connecting via SSH…"
+STARTING_RUNNER = "Preparing remote command…"
+COPYING = "Copying files…"
+DRIVE_PREPARATION = ("Preparing FUSE…", "Preparing rclone…", "Starting Drive mounts…")
+
+
+def preparation_labels(plan, has_copy=False):
+    labels = [ALLOCATING, CHECKING_LOGIN, WAITING, CONNECTING, STARTING_RUNNER]
+    if has_copy:
+        labels.append(COPYING)
+    setup = plan.get("setup", {})
+    labels.extend(step["description"] for step in setup.values())
+    if mounts := plan.get("mounts"):
+        labels.extend(DRIVE_PREPARATION)
+        claimed = {step.get("mount") for step in setup.values()}
+        labels.extend(f"Mounting {name.removeprefix('mounts.')}…" for name in mounts if name not in claimed)
+    return labels
+
+
+def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None, takeover=None):
     import asyncio
     from contextlib import ExitStack
     from inspect import iscoroutinefunction
     from os import killpg
     from signal import SIGKILL
 
+    # The remote runner receives this function and the duration formatter without their modules.
+    refresh_interval = 0.1
     with ExitStack() as stack:
         bar = None
         if live:
+            from prompt_toolkit.filters import Condition
+            from prompt_toolkit.layout import ConditionalContainer, Dimension, FormattedTextControl, HSplit, Window
+            from prompt_toolkit.utils import get_cwidth
+            from prompt_toolkit.formatted_text import to_formatted_text
             from prompt_toolkit.input import create_pipe_input
             from prompt_toolkit.output.vt100 import Vt100_Output
             from prompt_toolkit.shortcuts import ProgressBar
-            from prompt_toolkit.shortcuts.progress_bar import Label, SpinningWheel, Text
+            from prompt_toolkit.shortcuts.progress_bar import Formatter, ProgressBarCounter, SpinningWheel, Text
             from prompt_toolkit.styles import Style
             from time import monotonic
 
@@ -22,23 +52,165 @@ def progress(work, live, color, *, capture=False):
                 frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
                 def format(self, progress_bar, progress, width):
-                    frame = self.frames[int(monotonic() / .3) % len(self.frames)]
+                    frame = self.frames[int(monotonic() / refresh_interval) % len(self.frames)]
                     return [("class:spinning-wheel", frame)]
+
+            planned_width = max((get_cwidth(label) for label in labels), default=1)
+
+            def clipped(value, width):
+                if get_cwidth(value) <= width:
+                    return value
+                cells = 1
+                end = 0
+                for char in value:
+                    cells += get_cwidth(char)
+                    if cells > width:
+                        break
+                    end += 1
+                return value[:end] + "…" if width else ""
+
+            class ActiveLabel(Formatter):
+                def get_width(self, progress_bar):
+                    remaining = output.get_size().columns - 3
+                    if timed:
+                        remaining -= timer.get_width(progress_bar).preferred + 2
+                    return Dimension.exact(max(1, min(planned_width, remaining)))
+
+                def format(self, progress_bar, counter, width):
+                    value = "".join(t for _, t, *_ in to_formatted_text(counter.label))
+                    return [("class:label", clipped(value, width))]
+
+            class Timer(Formatter):
+                def __init__(self):
+                    self.width = 6
+
+                @staticmethod
+                def value(counter):
+                    return format_duration(monotonic() - counter.started)
+
+                def get_width(self, progress_bar):
+                    self.width = max([self.width, *(len(self.value(c)) for c in progress_bar.counters)])
+                    return Dimension.exact(self.width)
+
+                def format(self, progress_bar, counter, width):
+                    return [("class:timer", self.value(counter).rjust(width))]
+
+            timer = Timer()
+            active_label = ActiveLabel()
+
+            def detail_parts(progress_bar):
+                for counter in progress_bar.counters:
+                    if parts := getattr(counter.label, "detail_parts", None):
+                        return parts()
+                    if detail := getattr(counter.label, "detail", None):
+                        return [("class:label", detail())]
+                return []
+
+            def detail_inline(progress_bar, detail):
+                remaining = (output.get_size().columns - 3 - 2
+                             - active_label.get_width(progress_bar).preferred
+                             - timer.get_width(progress_bar).preferred)
+                cells = sum(get_cwidth(value) for _, value in detail)
+                return cells and cells + 2 <= remaining
+
+            class Details(Formatter):
+                def get_width(self, progress_bar):
+                    if detail_inline(progress_bar, detail_parts(progress_bar)):
+                        return Dimension(min=0, weight=1)
+                    return Dimension.exact(0)
+
+                def format(self, progress_bar, counter, width):
+                    parts = detail_parts(progress_bar)
+                    return [("class:label", "  "), *parts] if width else []
+
+            class PreparationBar(ProgressBar):
+                @property
+                def app(self):
+                    return self._preparation_app
+
+                @app.setter
+                def app(self, application):
+                    # ProgressBar starts the renderer immediately after assigning
+                    # its app; set the interval before it starts the refresh task.
+                    application.refresh_interval = refresh_interval
+                    application.erase_when_done = True
+                    self._preparation_app = application
+                    if timed:
+                        # ProgressBar's built-in title has a fixed one-row height.
+                        # Add a separate wrapping window without touching the
+                        # column layout or the height of the progress rows.
+                        details = ConditionalContainer(
+                            Window(FormattedTextControl(self.wrapped_detail),
+                                   dont_extend_height=True, wrap_lines=True),
+                            filter=Condition(lambda: bool(self.wrapped_detail())),
+                        )
+                        application.layout.container = HSplit([details, application.layout.container])
+
+                def wrapped_detail(self):
+                    detail = detail_parts(self)
+                    if not detail or detail_inline(self, detail):
+                        return []
+                    width = max(1, output.get_size().columns - 1)
+                    spans = []
+                    cells = 0
+                    space = False
+                    for style, value in detail:
+                        for word in value.split(" "):
+                            if not word:
+                                space = True
+                                continue
+                            length = get_cwidth(word)
+                            if cells and space:
+                                if cells + 1 + length > width:
+                                    spans.append(("class:label", "\n"))
+                                    cells = 0
+                                else:
+                                    spans.append(("class:label", " "))
+                                    cells += 1
+                            spans.append((style, word))
+                            cells += length
+                            space = True
+                    # Window can wrap a single word longer than the terminal.
+                    return spans
 
             keys = stack.enter_context(create_pipe_input())
             output = Vt100_Output.from_pty(sys.stdout)
             output.enable_cpr = False
-            bar = ProgressBar(
-                formatters=[Dots(), Text(" "), Label()],
-                style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim"} if color else {}),
+            bar = PreparationBar(
+                formatters=[Dots(), Text(" "), active_label,
+                            *([Text("  "), timer, Details()] if timed else [])],
+                style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan",
+                                       "retry-reason": "ansiyellow"} if color else {}),
                 input=keys, output=output,
             )
+            if idle:
+                # Avoid a blank first frame while the remote event loop
+                # schedules tasks, and a blank gap between task groups.
+                waiting = ProgressBarCounter(bar, None, idle, False, None)
+                waiting.started = monotonic()
+                bar.counters.append(waiting)
+            if takeover:
+                takeover()
             stack.enter_context(bar)
-            bar.app.erase_when_done = True
 
-        async def run(label, command):
-            counter = bar(label=label, remove_when_done=True) if bar else None
-            if counter is not None:
+        def reserve(label):
+            if bar is not None:
+                nonlocal planned_width
+                width = get_cwidth(label if isinstance(label, str) else label())
+                planned_width = max(planned_width, width)
+
+        async def run(label, command, *, started_at=None):
+            reserve(label)
+            counter = None
+            if bar is not None:
+                # Publish the counter only after its monotonic timestamp is
+                # initialized; the renderer runs in its own thread.
+                counter = ProgressBarCounter(bar, None, label, not idle, None)
+                counter.started = monotonic() if started_at is None else started_at
+                if idle and bar.counters == [waiting]:
+                    bar.counters[:] = [counter]
+                else:
+                    bar.counters.append(counter)
                 bar.invalidate()
             try:
                 if iscoroutinefunction(command):
@@ -62,10 +234,13 @@ def progress(work, live, color, *, capture=False):
             finally:
                 if counter is not None:
                     counter.done = True
+                    if idle:
+                        bar.counters[:] = [c for c in bar.counters if c is not counter] or [waiting]
                     bar.invalidate()
 
+        run.reserve = reserve
         return asyncio.run(work(run))
 
 
-def run_step(label, command, live, color):
-    return progress(lambda run: run(label, command), live, color)
+def run_step(label, command, live, color, *, labels=(), timed=True):
+    return progress(lambda run: run(label, command), live, color, labels=labels, timed=timed)
