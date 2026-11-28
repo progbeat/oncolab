@@ -435,8 +435,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", inspect.getsource(format_duration),
-                        inspect.getsource(progress), inspect.getsource(diagnostics),
+    render_source = (inspect.getsource(format_duration), inspect.getsource(progress))
+    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", *render_source, inspect.getsource(diagnostics),
                         files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
@@ -498,7 +498,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         control = drive_stage + "-gate/control.sock"
         protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
         remote = protocol + "\n" + remote
-        gate_code = "\n".join((inspect.getsource(progress), protocol, """
+        gate_code = "\n".join((*render_source, protocol, """
 directory, color, raw_plan, *command = sys.argv[1:]
 try:
     raise SystemExit(command_gate(directory, json.loads(raw_plan), color == "1", command, progress))

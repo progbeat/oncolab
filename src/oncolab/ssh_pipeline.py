@@ -114,6 +114,19 @@ async def observe_setup(run, peer, buffer):
         await asyncio.gather(*(task for _, task in tasks.values()))
 
 
+def pipeline_stderr(data):
+    try:
+        pending = memoryview(data)
+        fd = sys.stderr.fileno()
+        while pending:
+            written = os.write(fd, pending)
+            if not written:
+                break
+            pending = pending[written:]
+    except (OSError, ValueError):
+        pass
+
+
 def command_gate(path, plan, color, command, render):
     with socket.socket(socket.AF_UNIX) as peer:
         deadline = time.monotonic() + 20
@@ -140,12 +153,7 @@ def command_gate(path, plan, color, command, render):
                                 idle=plan.get("terminal_handoff"), takeover=take_terminal)
         peer.setblocking(True)
         for data in output:
-            data = base64.b64decode(data)
-            try:
-                sys.stderr.buffer.write(data)
-                sys.stderr.buffer.flush()
-            except OSError:
-                break
+            pipeline_stderr(base64.b64decode(data))
         kind, *args = result
         if kind == "run":
             workdir, env = args
@@ -162,7 +170,7 @@ def command_gate(path, plan, color, command, render):
                 if status < 0:
                     status = 128 - status
             except OSError as exc:
-                print(f"oncolab: {command[0]}: {exc.strerror}", file=sys.stderr)
+                pipeline_stderr(f"[Command could not start] {command[0]}: {exc.strerror}.\n".encode())
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
             peer.sendall(packet("exit", status))
         elif kind != "failed":
@@ -182,11 +190,7 @@ def command_gate(path, plan, color, command, render):
                     return data
                 if kind != "diag":
                     raise ValueError("Invalid cleanup result")
-                try:
-                    sys.stderr.buffer.write(base64.b64decode(data))
-                    sys.stderr.buffer.flush()
-                except OSError:
-                    pass
+                pipeline_stderr(base64.b64decode(data))
         raise ConnectionError("SSH setup owner exited before reporting cleanup")
 
 
