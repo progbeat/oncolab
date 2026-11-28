@@ -210,17 +210,16 @@ def pipeline_stderr(data):
 
 
 COMMAND_ENTRY = r"""
-import os, sys
-fd = int(sys.argv[1])
-try:
-    ready = os.read(fd, 1)
-finally:
-    os.close(fd)
-if not ready:
+import json, os, sys
+with os.fdopen(int(sys.argv[1]), "rb") as admission:
+    raw = admission.read()
+if not raw:
     raise SystemExit(130)
+cwd, env = json.loads(raw)
 args = sys.argv[2:]
 try:
-    os.execvpe(args[0], args, os.environ)
+    os.chdir(cwd)
+    os.execvpe(args[0], args, env)
 except OSError as exc:
     print(f"[Command could not start] {args[0]}: {exc.strerror}.", file=sys.stderr)
     raise SystemExit(127 if isinstance(exc, FileNotFoundError) else 126) from None
@@ -241,8 +240,10 @@ def gated_command(peer, buffer, workdir, environment, command):
     read_fd, write_fd = os.pipe()
     child = None
     try:
-        child = sp.Popen([sys.executable, "-c", COMMAND_ENTRY, str(read_fd), *command],
-                         cwd=workdir, env=environment, pass_fds=(read_fd,))
+        # Python and its loader must not see user variables or cwd until
+        # admission; PYTHONHOME can otherwise break non-Python commands.
+        child = sp.Popen([sys.executable, "-I", "-S", "-c", COMMAND_ENTRY, str(read_fd), *command],
+                         cwd="/", env={"PATH": os.defpath}, pass_fds=(read_fd,))
         os.close(read_fd)
         read_fd = -1
         peer.sendall(packet("started", child.pid))
@@ -251,7 +252,10 @@ def gated_command(peer, buffer, workdir, environment, command):
             return 130
         if reply != ["go"]:
             raise ValueError("SSH setup owner did not admit the command")
-        os.write(write_fd, b"1")
+        admission = os.fdopen(write_fd, "wb")
+        write_fd = -1
+        with admission:
+            admission.write(json.dumps([workdir, environment]).encode())
         while child.poll() is None:
             try:
                 event = receive(peer, buffer, .1)
@@ -266,7 +270,8 @@ def gated_command(peer, buffer, workdir, environment, command):
     finally:
         if read_fd >= 0:
             os.close(read_fd)
-        os.close(write_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
         if child is not None:
             stop_gate_command(child)
 

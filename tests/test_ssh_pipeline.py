@@ -87,7 +87,11 @@ class ParallelSSH(unittest.TestCase):
     def test_vm_release_start_failure_is_reported_to_command_client(self):
         self.run_pipeline(release_fails=True)
 
-    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, release_fails=False):
+    def test_user_environment_is_applied_after_admission(self):
+        self.run_pipeline(native_env=True)
+
+    def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, release_fails=False,
+                     native_env=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             if release_fails:
@@ -133,12 +137,16 @@ class ParallelSSH(unittest.TestCase):
                              'time.sleep(60); pathlib.Path("command-escaped").touch()')
                 gate = embedded_gate(inspect.getsource(ssh_pipeline),
                                      (inspect.getsource(format_duration), inspect.getsource(progress)))
+                command = ["/bin/sh", "-c", 'test "$PYTHONHOME" = /nonexistent && cat; exit 255'] if native_env else [
+                    sys.executable, "-c", spawn]
                 client = subprocess.Popen(
-                    [sys.executable, "-c", gate, control, "0", "{}",
-                     sys.executable, "-c", spawn],
+                    [sys.executable, "-c", gate, control, "0", "{}", *command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
-                owner.stdin.write(packet({"SETUP_VALUE": "early"}, {"COMMAND_VALUE": "late"}))
+                command_env = {"COMMAND_VALUE": "late"}
+                if native_env:
+                    command_env["PYTHONHOME"] = "/nonexistent"
+                owner.stdin.write(packet({"SETUP_VALUE": "early"}, command_env))
                 owner.stdin.flush()
                 wait_file(root / "independent")
                 wait_file(root / "prerequisites")

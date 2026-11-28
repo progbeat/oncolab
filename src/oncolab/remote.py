@@ -947,6 +947,7 @@ def main():
                     gate.send("diag", base64.b64encode(data).decode())
             elif owner_reports is not None:
                 shutil.copyfileobj(owner_reports, sys.stderr.buffer)
+                sys.stderr.buffer.flush()
         except OSError:
             pass
         # Queue VM release only after forwarding teardown diagnostics, but
