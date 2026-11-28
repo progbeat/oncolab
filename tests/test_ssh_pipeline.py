@@ -1,6 +1,8 @@
 import errno
 import inspect
 import json
+import os
+import pty
 from pathlib import Path
 import select
 import socket
@@ -72,6 +74,48 @@ def wait_file(path):
 
 
 class ParallelSSH(unittest.TestCase):
+    def test_native_pty_delivers_ctrl_c_to_admitted_foreground_group(self):
+        owner, gate = socket.socketpair()
+        pid, fd = pty.fork()
+        if pid == 0:
+            owner.close()
+            gate_fd = gate.fileno()
+            os.set_inheritable(gate_fd, True)
+            command = (
+                "import os, socket, sys; from oncolab.ssh_pipeline import gated_command; "
+                "gate = socket.socket(fileno=int(sys.argv[1])); "
+                "print('EXIT', gated_command(gate, bytearray(), '/', dict(os.environ), "
+                "[sys.executable, '-c', "
+                "'import os,time; assert os.tcgetpgrp(0) == os.getpgrp(); "
+                "print(\"command ready\",flush=True); time.sleep(60)'])); "
+            )
+            os.execv(sys.executable, [sys.executable, "-c", command, str(gate_fd)])
+        gate.close()
+        output = bytearray()
+        try:
+            owner.settimeout(6)
+            owner_input = owner.makefile("rb")
+            self.assertEqual(json.loads(owner_input.readline())[0], "started")
+            owner.sendall(packet("go"))
+            sent = False
+            deadline = time.monotonic() + 8
+            while b"EXIT 130" not in output and time.monotonic() < deadline:
+                if not select.select([fd], [], [], .1)[0]:
+                    continue
+                output.extend(os.read(fd, 65536))
+                if not sent and b"command ready" in output:
+                    os.write(fd, b"\x03")
+                    sent = True
+            self.assertIn(b"EXIT 130", output)
+        finally:
+            owner.close()
+            os.close(fd)
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+
     def test_setup_precedes_drive_config_and_command_waits(self):
         self.run_pipeline()
 
