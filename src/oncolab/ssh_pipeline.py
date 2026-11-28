@@ -87,7 +87,8 @@ class SetupGate:
                         raise ValueError("Invalid command terminal state")
                     child = CommandHandle(pid)
                     interactive_admitted = interactive and cancel_at is None
-                    self.send("go" if cancel_at is None else "cancel")
+                    if cancel_at is None:
+                        self.send("go")
                 elif kind == "exit" and type(value) is int and 0 <= value <= 255:
                     exited = True
                     return (128 + interrupted()) if interrupted() else value
@@ -225,13 +226,9 @@ def pipeline_stderr(data):
         pass
 
 
-def receive_cleanup(peer, buffer, *, deadline=None, cancelling=False):
+def receive_cleanup(peer, buffer, *, cancelling=False):
     while True:
-        left = None if deadline is None else max(0, deadline - time.monotonic())
-        event = receive(peer, buffer, left)
-        if event is None:
-            raise TimeoutError("Setup did not acknowledge cancellation")
-        kind, *fields = event
+        kind, *fields = receive(peer, buffer)
         if kind == "status":
             return fields[0]
         if kind == "diag":
@@ -243,18 +240,26 @@ def receive_cleanup(peer, buffer, *, deadline=None, cancelling=False):
 
 
 COMMAND_ENTRY = r"""
-import json, os, sys
+import json, os, signal, sys
 with os.fdopen(int(sys.argv[1]), "rb") as admission:
     raw = admission.read()
 if not raw:
     raise SystemExit(130)
-cwd, env = json.loads(raw)
+cwd, env, color = json.loads(raw)
 args = sys.argv[2:]
 try:
     os.chdir(cwd)
+    # This Python trampoline reinstalls ignored signals after Popen resets
+    # them. Restore the dispositions a direct Popen gives the user's command.
+    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+        if (signum := getattr(signal, name, None)) is not None:
+            signal.signal(signum, signal.SIG_DFL)
     os.execvpe(args[0], args, env)
 except OSError as exc:
-    print(f"[Command could not start] {args[0]}: {exc.strerror}.", file=sys.stderr)
+    heading = "[Command could not start]"
+    if color and sys.stderr.isatty():
+        heading = "\x1b[31m" + heading + "\x1b[0m"
+    print(f"{heading} {args[0]}: {exc.strerror}.", file=sys.stderr)
     raise SystemExit(127 if isinstance(exc, FileNotFoundError) else 126) from None
 """
 
@@ -288,7 +293,7 @@ def foreground_group(fd, group):
         signals.signal(signals.SIGTTOU, handler)
 
 
-def gated_command(peer, buffer, workdir, environment, command):
+def gated_command(peer, buffer, workdir, environment, command, *, color=False):
     read_fd, write_fd = os.pipe()
     child = None
     terminal = None
@@ -317,7 +322,7 @@ def gated_command(peer, buffer, workdir, environment, command):
         admission = os.fdopen(write_fd, "wb")
         write_fd = -1
         with admission:
-            admission.write(json.dumps([workdir, environment]).encode())
+            admission.write(json.dumps([workdir, environment, color]).encode())
         while child.poll() is None:
             try:
                 event = receive(peer, buffer, .1)
@@ -377,7 +382,7 @@ def command_gate(path, plan, color, command, render, takeover):
             pipeline_stderr(b"[cancelled]\n")
             peer.setblocking(True)
             peer.sendall(SETUP_CANCEL)
-            return receive_cleanup(peer, buffer, deadline=time.monotonic() + 10, cancelling=True)
+            return receive_cleanup(peer, buffer, cancelling=True)
         peer.setblocking(True)
         for data in output:
             pipeline_stderr(base64.b64decode(data))
@@ -386,7 +391,7 @@ def command_gate(path, plan, color, command, render, takeover):
             workdir, env = args
             environment = {k: v for k, v in (os.environ | env).items() if v is not None}
             try:
-                status = gated_command(peer, buffer, workdir, environment, command)
+                status = gated_command(peer, buffer, workdir, environment, command, color=color and live)
             except CommandStateUnknown:
                 peer.sendall(packet("unconfirmed", None))
             else:

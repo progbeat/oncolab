@@ -22,10 +22,15 @@ if __package__:
 
 
 _ONCOLAB_COLOR = False
+_ONCOLAB_TERMINAL = None
+
+
+def remote_outcome(label, message):
+    return outcome(label, message, color=_ONCOLAB_COLOR, terminal=_ONCOLAB_TERMINAL)
 
 
 def report(label, message):
-    print(outcome(label, message, color=_ONCOLAB_COLOR), file=sys.stderr)
+    print(remote_outcome(label, message), file=sys.stderr)
 
 
 def unassign():
@@ -580,8 +585,8 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
                     if result.stderr:
                         lifecycle.write_setup_output(result.stderr)
                 if name != "copy":  # The local transfer reports its concrete error.
-                    lifecycle.write_setup_output(outcome("Setup failed", f"{description} (exit {result.returncode}).",
-                                                         color=_ONCOLAB_COLOR))
+                    lifecycle.write_setup_output(remote_outcome("Setup failed",
+                                                                f"{description} (exit {result.returncode})."))
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
@@ -684,9 +689,9 @@ async def setup_all(run, plan, drive, lifecycle=None, drive_config=None):
                         except RuntimeError:
                             if not (any(mount_results) or lifecycle.interrupted):
                                 raise
-                            lifecycle.write_setup_output(outcome("Drive cleanup incomplete",
-                                                                 "Could not detach rclone from its staging path.",
-                                                                 color=_ONCOLAB_COLOR))
+                            lifecycle.write_setup_output(remote_outcome(
+                                "Drive cleanup incomplete", "Could not detach rclone from its staging path.",
+                            ))
             finally:
                 drive.seal()
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -787,11 +792,12 @@ async def pipeline_setup(run, lifecycle, plan, drive, gate):
 
 
 def main():
-    global _ONCOLAB_COLOR
+    global _ONCOLAB_COLOR, _ONCOLAB_TERMINAL
     directory, color, raw_plan, *command = sys.argv[1:]
     _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
     owner = plan.get("pipeline_role") == "setup"
+    _ONCOLAB_TERMINAL = plan.get("pipeline_terminal") if owner else None
     control_dir = Path(plan["pipeline_control"]).parent if owner else None
     gate = None
     owner_reports = None
@@ -969,7 +975,7 @@ def main():
                 if released and not release_queued:
                     hint = plan.get("recovery_hint", "Check 'colab sessions' for the VM")
                     gate.send("diag", base64.b64encode(
-                        (outcome("VM release unconfirmed", hint + ".", color=_ONCOLAB_COLOR) + "\n").encode()
+                        (remote_outcome("VM release unconfirmed", hint + ".") + "\n").encode()
                     ).decode())
                 gate.send("status", final_status)
         except OSError:

@@ -278,8 +278,10 @@ def show_owner_errors(stream):
     stream.seek(0)
     shown = False
     for line in stream.read(16_384).decode(errors="replace").splitlines():
-        if line.startswith(("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]",
-                            "[VM left running]", "[VM release unconfirmed]")):
+        if line.removeprefix("\x1b[31m").startswith(
+            ("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]",
+             "[VM left running]", "[VM release unconfirmed]"),
+        ):
             write_diagnostic(line)
             shown = True
     return shown
@@ -584,7 +586,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
                               *config["entrypoint"], *command])
         config.pop("terminal_handoff", None)
-        config.update(pipeline_role="setup", pipeline_control=control,
+        config.update(pipeline_role="setup", pipeline_control=control, pipeline_terminal=live_payload,
                       pipeline_dirs={path: {name: value for name, value in entries.items()
                                            if name not in ("env.json", "rclone.conf")}
                                      for path, entries in staging.items()})

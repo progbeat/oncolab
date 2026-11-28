@@ -4,11 +4,13 @@ import sys
 import re
 
 
-def outcome(label, message, *, color=None):
+def outcome(label, message, *, color=None, terminal=None):
     if color is None:
         color = not os.environ.get("NO_COLOR")
     heading = f"[{label}]"
-    if color and sys.stderr.isatty() and os.environ.get("TERM", "dumb") != "dumb":
+    if terminal is None:
+        terminal = sys.stderr.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+    if color and terminal:
         heading = f"\x1b[31m{heading}\x1b[0m"
     return f"{heading} {message}"
 

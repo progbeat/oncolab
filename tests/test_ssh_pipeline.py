@@ -77,6 +77,29 @@ def wait_file(path):
 
 
 class ParallelSSH(unittest.TestCase):
+    def test_command_trampoline_restores_default_sigpipe(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(write_fd, "wb") as admission:
+            admission.write(packet("/", {"PATH": os.defpath}, False))
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", ssh_pipeline.COMMAND_ENTRY, str(read_fd),
+                 "/bin/sh", "-c", "kill -PIPE $$; echo survived"],
+                pass_fds=(read_fd,), capture_output=True, timeout=5,
+            )
+        finally:
+            os.close(read_fd)
+        self.assertEqual((result.returncode, result.stdout), (-signal.SIGPIPE, b""))
+
+    def test_owner_sends_only_one_cancel_when_start_is_in_flight(self):
+        gate = Mock()
+        child = Mock()
+        with (patch.object(ssh_pipeline, "receive", side_effect=[["started", [123, True]], ["exit", 130]]),
+              patch.object(ssh_pipeline, "CommandHandle", return_value=child)):
+            self.assertEqual(ssh_pipeline.SetupGate.receive_status(gate, lambda: signal.SIGINT), 130)
+        gate.send.assert_called_once_with("cancel")
+        child.close.assert_called_once()
+
     def test_gate_loss_after_pty_admission_does_not_confirm_cleanup(self):
         gate = Mock()
         child = Mock()
