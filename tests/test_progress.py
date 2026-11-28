@@ -86,9 +86,62 @@ progress(lambda run: run(allocation, wait), True, True, labels=labels)
 progress(lambda run: run("Short…", wait), True, True, labels=labels)
 print("READY_FOR_COMMAND")
 """
+        rendered = self.render_progress(script, 40)
+        text = rendered.decode()
+
+        def column(label):
+            match = re.search(label + r"[^\r\n]*?(?=\x1b\[0;36m\s*\d\.\ds)", text)
+            self.assertIsNotNone(match, rendered)
+            prefix = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m[1] or 1), match[0])
+            return get_cwidth(self.without_ansi(prefix))
+
+        expected_column = get_cwidth("Long planned step with 漢") + 2
+        self.assertEqual(column("Waiting"), expected_column)
+        self.assertEqual(column("Short"), expected_column)
+        self.assertRegex(self.without_ansi(text), r"CPU · attempt 2/4 · 3\.0d · time out[^\r\n]*[\r\n]")
+        self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
+
+    def test_tty_retry_wait_wraps_target_attempt_countdown_and_reason(self):
+        script = """
+import asyncio
+from time import monotonic
+from oncolab.allocation import AllocationLabel
+from oncolab.progress import WAITING, preparation_labels, progress
+
+async def wait():
+    await asyncio.sleep(1.35)
+async def exercise(run):
+    allocation = AllocationLabel()
+    allocation.state = (WAITING, "Colab request timed out while checking the requested accelerator",
+                        monotonic() + 10.8, "CPU High-RAM · attempt 2/4")
+    await run(allocation, wait)
+progress(exercise, True, True, labels=preparation_labels({}))
+print("READY_FOR_COMMAND")
+"""
+        for width in (32, 40):
+            with self.subTest(width=width):
+                rendered = self.render_progress(script, width)
+                plain = self.without_ansi(rendered.decode())
+                lines = [line.strip() for line in plain.splitlines() if line.strip()]
+                start = next(i for i, line in enumerate(lines) if line.startswith("CPU High-RAM"))
+                end = next(i for i in range(start, len(lines)) if "accelerator" in lines[i])
+                self.assertGreaterEqual(end - start, 2, rendered)
+                self.assertRegex(" ".join(lines[start:end + 1]),
+                                 r"^CPU High-RAM · attempt 2/4 · 10\.\ds · Colab request timed out "
+                                 r"while checking the requested accelerator$")
+                # The terminal gets only changed cells in later frames.
+                self.assertRegex(plain, r"9\.\ds\b")
+                self.assertRegex(plain, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Waiting to retry…[^\r\n]*\d\.\ds")
+                self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
+
+    @staticmethod
+    def without_ansi(value):
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+
+    def render_progress(self, script, width):
         pid, fd = pty.fork()
         if not pid:
-            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, width, 0, 0))
             os.execve(sys.executable, [sys.executable, "-c", script],
                       dict(os.environ, TERM="xterm-256color"))
         output = bytearray()
@@ -112,20 +165,7 @@ print("READY_FOR_COMMAND")
             pid = None
             self.assertEqual(os.waitstatus_to_exitcode(status), 0, bytes(output))
             self.assertNotIn(b"Traceback", output)
-            rendered = bytes(output)
-            text = rendered.decode()
-            def column(label):
-                match = re.search(label + r"[^\r\n]*?(?=\x1b\[0;36m\s*\d\.\ds)", text)
-                self.assertIsNotNone(match, rendered)
-                prefix = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m[1] or 1), match[0])
-                prefix = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", prefix)
-                return get_cwidth(prefix)
-            expected_column = get_cwidth("Long planned step with 漢") + 2
-            self.assertEqual(column("Waiting"), expected_column)
-            self.assertEqual(column("Short"), expected_column)
-            plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-            self.assertRegex(plain, r"CPU · attempt 2/4 · 3\.0d · time out[^\r\n]*[\r\n]")
-            self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
+            return bytes(output)
         finally:
             os.close(fd)
             if pid is not None:

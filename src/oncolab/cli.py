@@ -804,7 +804,7 @@ def parse_args():
     if args.attempts is None:
         args.attempts = 1 + retry_setting("COLAB_CLI_ASSIGN_RETRIES", lambda x: max(0, int(x)), "3", 0, 10_000)
     args.request_timeout = retry_setting("COLAB_CLI_REQUEST_TIMEOUT", float, "120", .1, 3600)
-    args.retry_backoff = retry_setting("COLAB_CLI_RETRY_BACKOFF", lambda x: max(float(x), 0), "10", 0, 120)
+    args.retry_backoff = retry_setting("COLAB_CLI_RETRY_BACKOFF", lambda x: max(float(x), 0), "1", 0, 120)
     if args.attempts < 0:
         parser.error("--attempts must be nonnegative")
     for option, models in (("gpu", ("T4", "L4", "G4", "A100", "H100")), ("tpu", ("V5E1", "V6E1"))):

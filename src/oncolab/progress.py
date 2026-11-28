@@ -37,7 +37,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
     with ExitStack() as stack:
         bar = None
         if live:
-            from prompt_toolkit.layout import Dimension
+            from prompt_toolkit.filters import Condition
+            from prompt_toolkit.layout import ConditionalContainer, Dimension, FormattedTextControl, HSplit, Window
             from prompt_toolkit.utils import get_cwidth
             from prompt_toolkit.formatted_text import to_formatted_text
             from prompt_toolkit.input import create_pipe_input
@@ -131,19 +132,31 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                     application.refresh_interval = refresh_interval
                     application.erase_when_done = True
                     self._preparation_app = application
+                    if timed:
+                        # ProgressBar's built-in title has a fixed one-row height.
+                        # Add a separate wrapping window without touching the
+                        # column layout or the height of the progress rows.
+                        details = ConditionalContainer(
+                            Window(FormattedTextControl(self.wrapped_detail),
+                                   dont_extend_height=True, wrap_lines=True),
+                            filter=Condition(lambda: bool(self.wrapped_detail())),
+                        )
+                        application.layout.container = HSplit([details, application.layout.container])
 
-                @property
-                def title(self):
-                    # Wrap VM retry details onto their own line when they do
-                    # not fit, without moving the elapsed-time column.
-                    detail = detail_text(self) if timed else ""
-                    if detail and not detail_inline(self, detail):
-                        return [("class:label", clipped(detail, output.get_size().columns - 1))]
-                    return None
-
-                @title.setter
-                def title(self, value):
-                    pass  # ProgressBar initializes this field; the view derives it from the active row.
+                def wrapped_detail(self):
+                    detail = detail_text(self)
+                    if not detail or detail_inline(self, detail):
+                        return []
+                    width = max(1, output.get_size().columns - 1)
+                    lines = [""]
+                    for word in detail.split():
+                        line = lines[-1]
+                        if line and get_cwidth(line) + 1 + get_cwidth(word) > width:
+                            lines.append(word)
+                        else:
+                            lines[-1] = f"{line} {word}" if line else word
+                    # Window can wrap a single word longer than the terminal.
+                    return [("class:label", "\n".join(lines))]
 
             keys = stack.enter_context(create_pipe_input())
             output = Vt100_Output.from_pty(sys.stdout)

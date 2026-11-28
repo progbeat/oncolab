@@ -207,7 +207,7 @@ class Allocation:
         self.endpoint = endpoint
         return data
 
-    def run(self, attempts, backoff=10):
+    def run(self, attempts, backoff=1):
         number = 0
         while True:
             number += 1
