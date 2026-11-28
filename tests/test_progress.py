@@ -18,7 +18,12 @@ class Progress(unittest.TestCase):
     def test_tty_setup_steps_share_elapsed_column_and_leave_no_final_row(self):
         script = """
 import asyncio
-from oncolab.progress import progress
+import inspect
+import subprocess as sp
+import sys
+from oncolab.progress import progress as installed_progress
+# The VM gets only this function's source, not the installed module.
+exec(inspect.getsource(installed_progress))
 class Allocation:
     def __call__(self):
         return "Waiting…"
@@ -55,7 +60,7 @@ print("READY_FOR_COMMAND")
                 self.fail("timed progress did not exit")
             _, status = os.waitpid(pid, 0)
             pid = None
-            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0, bytes(output))
             self.assertNotIn(b"Traceback", output)
             rendered = bytes(output)
             text = rendered.decode()
