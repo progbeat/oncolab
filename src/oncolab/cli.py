@@ -589,6 +589,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 if parallel:
                     owner = sp.Popen([*ssh, *connect_options, target, owner_code], stdin=sp.PIPE,
                                      stdout=sp.PIPE, stderr=owner_errors)
+                    # From this point a runner might already own services;
+                    # never force-release the VM on an ambiguous cancellation.
+                    attempted.set()
                     transfers.submit(feed_staging, owner.stdin, staged_input)
 
                     async def wait_owner():
@@ -596,8 +599,12 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
 
                     if not run_step(CONNECTING, wait_owner, terminal_connect, color, labels=labels):
                         owner_errors.seek(0)
-                        show_ssh_error(owner_errors.read(16_384), debug)
-                        return owner.poll() or 1, True
+                        errors = owner_errors.read(16_384)
+                        show_ssh_error(errors, debug, recovery=allocation_hint(name, store))
+                        text = errors.decode(errors="replace")
+                        no_owner = any(marker in text for marker in ("Permission denied", "Host key verification failed",
+                                                                     "no SSH public key found"))
+                        return owner.poll() or 1, no_owner
                     if sources or groups:
                         ready = transfers.submit(lambda: asyncio.run(wait_setup_listener(owner)))
                 else:

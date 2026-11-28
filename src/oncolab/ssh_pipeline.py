@@ -83,6 +83,8 @@ class SetupGate:
                 elif kind == "exit" and type(value) is int and 0 <= value <= 255:
                     exited = True
                     return (128 + interrupted()) if interrupted() else value
+                elif kind == "unconfirmed":
+                    raise CommandStateUnknown("Could not confirm that the command stopped")
                 else:
                     raise ValueError("Invalid command status")
         finally:
@@ -243,7 +245,10 @@ def stop_gate_command(child):
         pass
     # Even if the group leader exited, a child could still have ignored TERM.
     signal_command_group(child.pid, signals.SIGKILL)
-    child.wait()
+    try:
+        child.wait(timeout=2)
+    except sp.TimeoutExpired as exc:
+        raise CommandStateUnknown("Could not confirm that the command stopped") from exc
 
 
 def foreground_group(fd, group):
@@ -343,8 +348,12 @@ def command_gate(path, plan, color, command, render):
         if kind == "run":
             workdir, env = args
             environment = {k: v for k, v in (os.environ | env).items() if v is not None}
-            status = gated_command(peer, buffer, workdir, environment, command)
-            peer.sendall(packet("exit", status))
+            try:
+                status = gated_command(peer, buffer, workdir, environment, command)
+            except CommandStateUnknown:
+                peer.sendall(packet("unconfirmed", None))
+            else:
+                peer.sendall(packet("exit", status))
         elif kind != "failed":
             raise ValueError("Invalid setup result")
         # Keep the channel alive until the setup owner has completed cleanup.
