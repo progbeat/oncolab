@@ -45,6 +45,9 @@ if "-M" in argv:
         if mode == "auth":
             print("root@colab-runtime: Permission denied (publickey).", file=sys.stderr)
             raise SystemExit(255)
+        if mode == "gone":
+            print("[colab] Error: No active sessions found. Create one with 'colab new'.", file=sys.stderr)
+            raise SystemExit(255)
     if os.environ.get("TEST_SSH_FAILURE"):
         raise SystemExit(255)
     assert not sys.stdin.buffer.read(), "SSH bootstrap consumed payload stdin"
@@ -146,6 +149,7 @@ raise SystemExit(namespace["main"]())
             ("unknown", "0", 3, True, b""),
             ("transient", "2", 2, False, b"The SSH connection closed."),
             ("auth", "0", 1, False, b"check your SSH key"),
+            ("gone", "0", 1, False, b"Colab no longer has an active session"),
         ):
             with self.subTest(mode=mode, attempts=attempts), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

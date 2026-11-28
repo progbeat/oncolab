@@ -616,6 +616,7 @@ def ssh_failure_reason(text):
         ("[colab] Server rejected pubkey (HTTP 400)", "Colab rejected your public key; check your SSH key."),
         ("[colab] Authentication failed (HTTP 401)", "Colab rejected the connection credentials for this VM."),
         ("[colab] Forbidden (HTTP 403)", "Colab did not authorize SSH access to this VM."),
+        ("[colab] Error: No active sessions found.", "Colab no longer has an active session for this VM."),
         ("Host key verification failed", "SSH host key verification failed; check the trusted host key."),
         ("REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH host key changed; verify it before reconnecting."),
         ("Address already in use", "A local port is already in use; choose a different port with -p."),
@@ -626,6 +627,8 @@ def ssh_failure_reason(text):
     for marker, message in permanent:
         if marker in text:
             return message, True
+    if re.search(r"(?mi)^\[colab\] session '[^'\n]+' not found\.", text):
+        return "Colab no longer has an active session for this VM.", True
     # A ProxyCommand may itself report a generic permission error; only
     # recognize a positive OpenSSH authentication rejection here.
     if re.search(r"(?m)^(?:[^\s]+: )?Permission denied(?:[.!]?$| \(|, please try again)", text):
