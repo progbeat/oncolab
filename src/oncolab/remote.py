@@ -390,6 +390,20 @@ class Lifecycle:
         self.nodes = {}
         self.began = set()
         self.services = {}
+        self.setup_output = None
+
+    def write_setup_output(self, data):
+        if self.setup_output is not None:
+            self.setup_output.append(data)
+        elif isinstance(data, bytes):
+            sys.stderr.buffer.write(data)
+        else:
+            print(data, file=sys.stderr, flush=True)
+
+    def flush_setup_output(self):
+        deferred, self.setup_output = self.setup_output, None
+        for data in deferred or ():
+            self.write_setup_output(data)
 
     def interrupt(self, number, _):
         if not self.interrupted:
@@ -538,14 +552,15 @@ async def setup_all(run, plan, drive, lifecycle=None):
                     if plan.get("debug"):
                         text = b"\n".join((result.stdout or b"", result.stderr or b"")).decode(errors="replace")
                         for detail in safe_subprocess_details(text):
-                            print(detail, file=sys.stderr)
+                            lifecycle.write_setup_output(detail)
                 else:
                     if result.stdout:
-                        sys.stderr.buffer.write(result.stdout)
+                        lifecycle.write_setup_output(result.stdout)
                     if result.stderr:
-                        sys.stderr.buffer.write(result.stderr)
+                        lifecycle.write_setup_output(result.stderr)
                 if name != "copy":  # The local transfer reports its concrete error.
-                    report("Setup failed", f"{description} (exit {result.returncode}).")
+                    lifecycle.write_setup_output(outcome("Setup failed", f"{description} (exit {result.returncode}).",
+                                                         color=_ONCOLAB_COLOR))
                 return result.returncode
             return 0
         tasks[name] = asyncio.create_task(execute())
@@ -641,7 +656,9 @@ async def setup_all(run, plan, drive, lifecycle=None):
                         except RuntimeError:
                             if not (any(mount_results) or lifecycle.interrupted):
                                 raise
-                            report("Drive cleanup incomplete", "Could not detach rclone from its staging path.")
+                            lifecycle.write_setup_output(outcome("Drive cleanup incomplete",
+                                                                 "Could not detach rclone from its staging path.",
+                                                                 color=_ONCOLAB_COLOR))
             finally:
                 drive.seal()
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -711,8 +728,15 @@ def main():
             os.environ["COLAB_DRIVE"] = work["target"]
         lifecycle.environment = os.environ | setup_env
         options = {"labels": plan["progress_labels"]} if "progress_labels" in plan else {}
-        status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
-                          capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
+        # Replaying hook diagnostics while the live renderer owns the
+        # cursor can overwrite their first line (or leave stale timer text).
+        if live:
+            lifecycle.setup_output = []
+        try:
+            status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
+                              capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
+        finally:
+            lifecycle.flush_setup_output()
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:

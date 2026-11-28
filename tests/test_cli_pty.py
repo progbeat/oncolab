@@ -81,6 +81,13 @@ assert parts[-1] == "arg with $ and spaces"
 source, stage, color, plan, *_ = parts[5:]
 config = json.loads(plan)
 config["workdir"] = str(root)
+if os.environ.get("TEST_TTY_SETUP_FAILURE"):
+    config["setup"] = {
+        "fail": {"description": "Failing test hook", "needs": [],
+                 "argv": [sys.executable, "-c", "import sys,time; time.sleep(.35); "
+                          "print('HOOK_FIRST', file=sys.stderr); print('HOOK_LAST', file=sys.stderr); "
+                          "raise SystemExit(7)"]},
+    }
 namespace = {"__name__": "fixture", "__package__": None}
 exec(source, namespace)
 namespace["unassign"] = lambda: None
@@ -147,7 +154,7 @@ raise SystemExit(namespace["main"]())
                                                  "Check 'colab sessions' for the VM.\n").encode())
 
     def test_delayed_ssh_handoff(self):
-        for outcome in ("success", "failure", "interrupt", "raw"):
+        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 oncolab, env = self.fake_commands(root)
@@ -155,6 +162,8 @@ raise SystemExit(namespace["main"]())
                     env["TEST_TTY_START_FAILURE"] = "1"
                 if outcome == "raw":
                     env["TEST_TTY_RAW_OUTPUT"] = "1"
+                if outcome == "setup-failure":
+                    env["TEST_TTY_SETUP_FAILURE"] = "1"
                 if outcome == "success":
                     env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root), PYTHONIOENCODING="ascii")
                 pid, fd = pty.fork()
@@ -199,7 +208,8 @@ raise SystemExit(namespace["main"]())
                     _, status = os.waitpid(pid, 0)
                     pid = None
                     self.assertTrue(saw_handoff, output)
-                    expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19}[outcome]
+                    expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19,
+                                "setup-failure": 7}[outcome]
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
@@ -207,6 +217,10 @@ raise SystemExit(namespace["main"]())
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
                     elif outcome == "failure":
                         self.assertRegex(output, rb"Preparing remote command[^\r\n]*\r\noops\r\n")
+                    elif outcome == "setup-failure":
+                        self.assertRegex(output, rb"Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
+                                                 rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")
+                        self.assertNotIn(b"READY_FOR_TEST", output)
                     elif outcome == "raw":
                         self.assertTrue(output.endswith(b"RAW_FIRST\r\nRAW_LAST\r\n"), output)
                     else:
