@@ -31,6 +31,11 @@ if "-O" in argv:
     raise SystemExit(0)
 if "-M" in argv:
     root = Path(os.environ["XDG_CONFIG_HOME"])
+    for i, arg in enumerate(argv[:-1]):
+        if arg == "-L":
+            local, remote = argv[i + 1].split(":", 1)
+            if local.endswith("/summary.sock"):
+                Path(local).symlink_to(root / "remote-summary")
     if os.environ.get("TEST_SSH_HANG"):
         # Model a wedged client plus a proxy that inherited SSH's stderr.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -71,6 +76,19 @@ if "-M" in argv:
         with open("/dev/tty") as terminal:
             (Path(os.environ["XDG_CONFIG_HOME"]) / "waiting-for-passphrase").touch()
             assert terminal.readline() == "fixture phrase\n"
+    raise SystemExit(0)
+if os.environ.get("TEST_SSH_DELAYED_OWNER"):
+    root = Path(os.environ["XDG_CONFIG_HOME"])
+    if "-T" in argv:
+        time.sleep(.45)
+        sys.stdout.write("oncolab-setup-listening\n")
+        sys.stdout.flush()
+        while not (root / "payload-entered").exists():
+            time.sleep(.02)
+        raise SystemExit(0)
+    assert "-t" in argv
+    (root / "payload-entered").touch()
+    print("PAYLOAD_STARTED")
     raise SystemExit(0)
 if "-T" in argv:
     if shlex.split(argv[-1])[-1] == "fail-with-traceback":
@@ -114,6 +132,8 @@ assert parts[-1] == "arg with $ and spaces"
 source, stage, color, plan, *_ = parts[5:]
 config = json.loads(plan)
 config["workdir"] = str(root)
+if config.get("summary_path"):
+    config["summary_path"] = str(root / "remote-summary")
 if os.environ.get("TEST_TTY_SETUP_FAILURE"):
     config["setup"] = {
         "fail": {"description": "Failing test hook", "needs": [],
@@ -124,7 +144,10 @@ if os.environ.get("TEST_TTY_SETUP_FAILURE"):
 namespace = {"__name__": "fixture", "__package__": None}
 exec(source, namespace)
 namespace["unassign"] = lambda: None
-script = 'assert input("READY_FOR_TEST: ") == "passed through the tty"; print("PTY_ROUND_TRIP_OK")'
+# Keep the fixture prompt on stdout. With fd 2 redirected, Python
+# can select a different input() path than it would on a real SSH PTY.
+script = ('print("READY_FOR_TEST: ", end="", flush=True); '
+          'assert input() == "passed through the tty"; print("PTY_ROUND_TRIP_OK")')
 sys.argv = ["-c", stage, color, json.dumps(config), sys.executable, "-c", script]
 raise SystemExit(namespace["main"]())
 ''')
@@ -274,8 +297,49 @@ raise SystemExit(namespace["main"]())
                 self.assertEqual(result.stderr, (f"[SSH connection failed] {explanation} "
                                                  "Check 'colab sessions' for the VM.\n").encode())
 
+    def test_timings_ssh_finishes_before_the_remote_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oncolab, env = self.fake_commands(root)
+            env.update(ONCOLAB_PARALLEL_SETUP="1", TEST_SSH_DELAYED_OWNER="1", HOME=str(root))
+            pid, fd = pty.fork()
+            if not pid:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+                os.execve(oncolab, [oncolab, "--timings", "--", "example"], env)
+            output = bytearray()
+            deadline = time.monotonic() + 12
+            try:
+                while time.monotonic() < deadline:
+                    if not select.select([fd], [], [], .2)[0]:
+                        continue
+                    try:
+                        chunk = os.read(fd, 8192)
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                else:
+                    self.fail(f"PTY timed out: {output!r}")
+                _, status = os.waitpid(pid, 0)
+                pid = None
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output)
+                before, after = output.split(b"Waiting for remote setup to start", 1)
+                complete = "✓ Connecting via SSH…".encode()
+                self.assertRegex(before, rb"Connecting via SSH[^\r\n]*SSH")
+                self.assertEqual(before.count(complete), 1, output)
+                self.assertNotIn(complete, after)
+                self.assertIn(b"PAYLOAD_STARTED", after)
+            finally:
+                os.close(fd)
+                if pid is not None:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+
     def test_delayed_ssh_handoff(self):
-        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure"):
+        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure", "timings"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 oncolab, env = self.fake_commands(root)
@@ -288,10 +352,26 @@ raise SystemExit(namespace["main"]())
                     env["TEST_TTY_SETUP_FAILURE"] = "1"
                 if outcome == "success":
                     env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root), PYTHONIOENCODING="ascii")
+                if outcome == "timings":
+                    import socket
+
+                    with socket.socket(socket.AF_UNIX) as probe:
+                        try:
+                            probe.bind(str(root / "socket-test"))
+                        except OSError as exc:
+                            if exc.errno in (errno.EPERM, errno.EACCES):
+                                self.skipTest("sandbox does not allow Unix sockets")
+                            raise
                 pid, fd = pty.fork()
                 if not pid:
                     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-                    os.execve(oncolab, [oncolab, "--", "example", "arg with $ and spaces"], env)
+                    extra = []
+                    if outcome == "timings":
+                        stderr = os.open(root / "diagnostics", os.O_WRONLY | os.O_CREAT, 0o600)
+                        os.dup2(stderr, 2)
+                        os.close(stderr)
+                        extra = ["--timings"]
+                    os.execve(oncolab, [oncolab, *extra, "--", "example", "arg with $ and spaces"], env)
                 output = bytearray()
                 deadline = time.monotonic() + 12
                 answered = False
@@ -331,17 +411,23 @@ raise SystemExit(namespace["main"]())
                     pid = None
                     self.assertTrue(saw_handoff, output)
                     expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19,
-                                "setup-failure": 7}[outcome]
+                                "setup-failure": 7, "timings": 0}[outcome]
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
                         self.assertIn(b"o Waiting for remote setup to start...\r\n", output)
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
+                    elif outcome == "timings":
+                        self.assertIn(b"PTY_ROUND_TRIP_OK", output)
+                        self.assertNotIn("✓".encode(), output)
+                        diagnostics = (root / "diagnostics").read_text()
+                        for phase in ("Creating Colab VM…", "Connecting via SSH…", "Setting up…"):
+                            self.assertIn("✓ " + phase, diagnostics)
                     elif outcome == "failure":
                         self.assertIn("\x1b[37m⠛\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
                     elif outcome == "setup-failure":
-                        self.assertRegex(output, rb"Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
+                        self.assertRegex(output, rb"(?s)Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
                                                  rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")
                         self.assertNotIn(b"READY_FOR_TEST", output)
                     elif outcome == "raw":

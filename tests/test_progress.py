@@ -6,6 +6,10 @@ import re
 import select
 import signal
 import struct
+import socket
+import tempfile
+import threading
+import subprocess
 import sys
 import termios
 
@@ -16,6 +20,8 @@ from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
 from oncolab.duration import format_duration
+from oncolab.cli import read_setup_summary
+from oncolab.progress import SetupTimeline, display_label, setup_summary_socket
 from oncolab.remote import Lifecycle
 
 
@@ -63,6 +69,200 @@ class Progress(unittest.TestCase):
             lifecycle.flush_setup_output()
         write.assert_called_once_with(2, b"fixture\n")
         self.assertIsNone(lifecycle.setup_output)
+
+    def test_closed_summary_destination_does_not_replace_command_exit(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5,
+            )
+        finally:
+            os.close(writer)
+        self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+
+    def test_completed_rows_return_to_column_zero_in_raw_and_cooked_terminals(self):
+        code = """
+from oncolab.progress import completed_steps
+completed_steps([(0, "Setting up…", 0, 2), (2, "Mounting Drive…", 1, 2)],
+                ["Setting up…", "  Mounting Drive…"], False)
+"""
+        for output_flags in (0, termios.OPOST | termios.ONLCR):
+            with self.subTest(output_flags=output_flags):
+                reader, writer = pty.openpty()
+                try:
+                    attrs = termios.tcgetattr(writer)
+                    attrs[1] = output_flags
+                    termios.tcsetattr(writer, termios.TCSANOW, attrs)
+                    process = subprocess.run([sys.executable, "-c", code], stderr=writer,
+                                             env=dict(os.environ, TERM="dumb"), timeout=5)
+                    self.assertEqual(process.returncode, 0)
+                    saved = bytearray()
+                    while select.select([reader], [], [], .1)[0]:
+                        saved.extend(os.read(reader, 8192))
+                    self.assertRegex(saved.decode(), r"^✓ Setting up… +2\.0s\r\n"
+                                                     r"  ✓ Mounting Drive… +1\.0s\r\n$")
+                finally:
+                    os.close(writer)
+                    os.close(reader)
+
+    def test_missing_standard_error_is_ignored(self):
+        from oncolab.progress import completed_steps
+
+        with patch("sys.stderr", None):
+            completed_steps([(0, "Setting up…", 0, 1)], ["Setting up…"], False)
+
+    def test_full_summary_pipe_does_not_block_command(self):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(writer, False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(writer, b"x" * 512)
+            os.set_blocking(writer, True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5,
+            )
+            self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_full_stderr_socket_does_not_block_command(self):
+        connector, sink = socket.socketpair()
+        with connector, sink:
+            sink.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    sink.send(b"x" * 512)
+            sink.setblocking(True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=sink, timeout=5,
+            )
+        self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+
+    def test_stopped_stderr_terminal_does_not_block_command(self):
+        reader, writer = pty.openpty()
+        try:
+            os.set_blocking(writer, False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(writer, b"x" * 512)
+            os.set_blocking(writer, True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5, env=dict(os.environ, TERM="xterm"),
+            )
+            self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_control_characters_in_job_labels_stay_on_one_line(self):
+        self.assertEqual(display_label("line 1\nline 2\tfoo\x1b[31m"), "line 1 line 2 foo\\x1b[31m")
+
+    def test_forwarded_setup_summary_acknowledges_after_the_local_write(self):
+        from contextlib import contextmanager
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory(prefix="oc-summary-", dir="/tmp") as directory:
+            path = directory + "/summary.sock"
+            with socket.socket(socket.AF_UNIX) as probe:
+                try:
+                    probe.bind(directory + "/probe")
+                except OSError as exc:
+                    if exc.errno in (errno.EPERM, errno.EACCES):
+                        self.skipTest("sandbox does not allow Unix sockets")
+                    raise
+            stop = threading.Event()
+            stderr = StringIO()
+            with patch("sys.stderr", stderr), contextmanager(setup_summary_socket)(path) as send:
+                reader = threading.Thread(target=read_setup_summary, args=(path, stop, ["Setting up…"], False))
+                reader.start()
+                try:
+                    send([(0, "Setting up…", 0, 2)])
+                    self.assertRegex(stderr.getvalue(), r"^✓ Setting up… +2\.0s\n$")
+                finally:
+                    stop.set()
+                    reader.join(3)
+                self.assertFalse(reader.is_alive())
+            self.assertFalse(os.path.exists(path))
+
+    def test_setup_checks_follow_readiness_and_drop_eliminated_branches(self):
+        timeline = SetupTimeline()
+        event = timeline.event
+        event("setup-start", 0)
+        for name, dependencies in (("rclone", ()), ("config", ()), ("git", ()),
+                                   ("mount", ("rclone", "config")), ("seal", ("mount",))):
+            event("setup-job", name, name if name != "seal" else None, dependencies)
+        for name in ("rclone", "config", "git"):
+            event("setup-active", name, 0)
+        event("setup-done", "rclone", 4, 0)
+        self.assertEqual(timeline.candidates(), set())
+        event("setup-done", "config", 6, 0)
+        event("setup-active", "mount", 6)
+        self.assertEqual(timeline.candidates(), {"config"})
+        self.assertEqual([name for _, name, *_ in timeline.rows(False)], ["Setting up…", "git", "mount"])
+        event("setup-done", "mount", 7, 0)
+        event("setup-active", "seal", 7)
+        event("setup-done", "git", 8, 0)
+        event("setup-done", "seal", 9, 0)
+        event("setup-finish", 9, 0)
+        self.assertEqual(timeline.rows(True), [(0, "Setting up…", 0, 9), (2, "config", 0, 6), (2, "mount", 6, 7)])
+        self.assertEqual(timeline.rows(False), [])
+        event("setup-finish", 9, 130)
+        self.assertEqual(timeline.rows(True), [])
+        event("setup-done", "git", 8, 7)
+        self.assertEqual(timeline.candidates(), set())
+
+    def test_tty_setup_has_a_parent_in_both_modes_and_retains_only_timings_checks(self):
+        script = """
+import asyncio
+from time import monotonic
+from oncolab.progress import progress
+
+async def exercise(run):
+    event = run.setup_event
+    started = monotonic()
+    event("setup-start", started)
+    event("setup-job", "first", "First job…", ())
+    event("setup-job", "next", "Next job…", ("first",))
+    event("setup-active", "first", started)
+    await asyncio.sleep(.25)
+    event("setup-done", "first", monotonic(), 0)
+    event("setup-active", "next", monotonic())
+    await asyncio.sleep(.25)
+    event("setup-done", "next", monotonic(), 0)
+    event("setup-finish", monotonic(), 0)
+
+progress(exercise, True, False, setup=True, timings=TIMINGS,
+         labels=["Setting up…", "  First job…", "  Next job…"])
+print("COMMAND_OUTPUT")
+"""
+        for timings in (False, True):
+            with self.subTest(timings=timings):
+                raw = self.render_progress(script.replace("TIMINGS", repr(timings)), 60).decode()
+                plain = self.without_ansi(raw)
+                self.assertIn("Setting up…", plain)
+                self.assertRegex(plain, r"  [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] First job…")
+                self.assertIn("Next job…", plain)
+                if timings:
+                    self.assertRegex(plain, r"✓ Setting up… +0\.\ds\r?\n  ✓ First job… +0\.\ds\r?\n"
+                                            r"  ✓ Next job… +0\.\ds\r?\nCOMMAND_OUTPUT")
+                else:
+                    self.assertNotIn("✓", plain)
+                    self.assertRegex(raw, r"\x1b\[J[^\r\n]*COMMAND_OUTPUT")
 
     def test_tty_setup_steps_share_elapsed_column_and_leave_no_final_row(self):
         script = """

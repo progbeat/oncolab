@@ -174,8 +174,8 @@ def receive(peer, buffer, timeout=None):
 
 async def observe_setup(run, peer, buffer, live):
     loop = asyncio.get_running_loop()
-    tasks = {}
     output = []
+    finished = None
 
     async def read():
         while b"\n" not in buffer:
@@ -190,30 +190,25 @@ async def observe_setup(run, peer, buffer, live):
         del buffer[:i + 1]
         return json.loads(line)
 
-    try:
-        while True:
-            kind, *fields = await read()
-            if kind == "start":
-                key, label, started = fields
-                done = asyncio.Event()
-                tasks[key] = (done, asyncio.create_task(run(label, done.wait, started_at=started)))
-            elif kind == "done":
-                done, task = tasks.pop(fields[0])
-                done.set()
-                await task
-            elif kind == "diag":
-                if live:
-                    output.append(fields[0])
-                else:
-                    pipeline_stderr(base64.b64decode(fields[0]))
-            elif kind == "end-output":
-                return output, await read()
+    while True:
+        kind, *fields = await read()
+        if kind == "setup-finish":
+            finished = fields
+        elif kind.startswith("setup-"):
+            run.setup_event(kind, *fields)
+        elif kind == "diag":
+            if live:
+                output.append(fields[0])
             else:
-                raise ValueError("Invalid setup event")
-    finally:
-        for done, _ in tasks.values():
-            done.set()
-        await asyncio.gather(*(task for _, task in tasks.values()))
+                pipeline_stderr(base64.b64decode(fields[0]))
+        elif kind == "end-output":
+            result = await read()
+            if finished is not None:
+                ended, status = finished
+                run.setup_event("setup-finish", ended, status if result[0] == "run" else status or 1)
+            return output, result
+        else:
+            raise ValueError("Invalid setup event")
 
 
 def pipeline_stderr(data):
@@ -379,7 +374,9 @@ def command_gate(path, plan, color, command, render, takeover):
         try:
             output, result = render(lambda run: observe_setup(run, peer, buffer, live), live, color,
                                     labels=plan.get("progress_labels", ()),
-                                    idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False))
+                                    idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False),
+                                    setup=True, timings=plan.get("timings", False),
+                                    summary_path=plan.get("summary_path"))
         except KeyboardInterrupt:
             takeover()
             pipeline_stderr(b"[cancelled]\n")

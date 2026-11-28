@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 from oncolab import ssh_pipeline
 from oncolab.cli import call_command_ssh, embedded_gate
 from oncolab.duration import format_duration
-from oncolab.progress import progress
+from oncolab.progress import SetupTimeline, completed_steps, display_label, progress, setup_summary_socket
 from oncolab.ssh_pipeline import SETUP_LISTENING, packet
 
 
@@ -48,7 +48,11 @@ async def run(argv, env=None, *args, **kwargs):
         assert env["SETUP_VALUE"] == "early"
         (root / "prerequisites").touch()
         return None
-    return await real(argv, env, *args, **kwargs)
+    result = await real(argv, env, *args, **kwargs)
+    if 'Path("independent").touch()' in argv[-1]:
+        # The script's own marker appears before its process exits.
+        (root / "independent-finished").touch()
+    return result
 
 accept = remote.SetupGate.accept
 async def tracked_accept(self):
@@ -209,6 +213,9 @@ class ParallelSSH(unittest.TestCase):
     def test_setup_precedes_drive_config_and_command_waits(self):
         self.run_pipeline()
 
+    def test_timings_retains_only_the_blocking_jobs_on_stderr(self):
+        self.run_pipeline(timings=True)
+
     def test_command_disconnect_cancels_setup_and_releases_vm(self):
         self.run_pipeline(disconnect=True)
 
@@ -238,7 +245,7 @@ class ParallelSSH(unittest.TestCase):
 
     def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, cancel_client=False,
                      release_fails=False, native_env=False, slow_stderr=False, payload_status=255,
-                     preflight_fails=False):
+                     preflight_fails=False, timings=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             if release_fails:
@@ -295,13 +302,13 @@ class ParallelSSH(unittest.TestCase):
                     f'print(sys.stdin.read(), end=""); raise SystemExit({payload_status})'
                 )
                 gate = embedded_gate(inspect.getsource(ssh_pipeline),
-                                     (inspect.getsource(format_duration), inspect.getsource(progress)))
+                                     tuple(inspect.getsource(fn) for fn in (format_duration, display_label, SetupTimeline, completed_steps, setup_summary_socket, progress)))
                 command = ["/bin/sh", "-c", 'test "$PYTHONHOME" = /nonexistent && cat; exit 255'] if native_env else [
                     sys.executable, "-c", spawn]
                 if cancel_owner:
                     command = ["/bin/sh", "-c", '(sleep .8; touch command-escaped) & touch command-active; wait']
                 client = subprocess.Popen(
-                    [sys.executable, "-c", gate, control, "0", "{}", *command],
+                    [sys.executable, "-c", gate, control, "0", json.dumps({"timings": timings}), *command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 command_env = {"COMMAND_VALUE": "late"}
@@ -338,6 +345,9 @@ class ParallelSSH(unittest.TestCase):
                     self.assertTrue((root / "unassigned").exists())
                     self.assertFalse((root / "mount-started").exists())
                     return
+                if timings:
+                    # Make config, not process teardown, the final blocker.
+                    wait_file(root / "independent-finished")
                 owner.stdin.write(b'"cHJpdmF0ZSBjb25maWd1cmF0aW9u"\n')
                 owner.stdin.flush()
                 if cancel_owner:
@@ -370,7 +380,14 @@ class ParallelSSH(unittest.TestCase):
                     self.assertEqual((client.returncode, out), (7, b""))
                     self.assertEqual(early_error + err, b"[Setup failed] Independent setup (exit 7).\n")
                 else:
-                    self.assertEqual((client.returncode, out, err), (payload_status, b"untouched stdin\n", b""))
+                    self.assertEqual((client.returncode, out), (payload_status, b"untouched stdin\n"))
+                    if timings:
+                        for label in ("Setting up…", "Receiving Drive config…", "Starting Drive mounts…",
+                                      "Mounting work…"):
+                            self.assertIn(("✓ " + label).encode(), err)
+                        self.assertNotIn(b"Independent setup", err)
+                    else:
+                        self.assertEqual(err, b"")
                 _, err = owner.communicate(timeout=10)
                 expected = 125 if release_fails else (7 if setup_fails else payload_status)
                 self.assertEqual((owner.returncode, err), (expected, b""))

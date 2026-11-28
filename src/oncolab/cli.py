@@ -3,6 +3,7 @@ import asyncio
 import base64
 import inspect
 import json
+import math
 import os
 import re
 import secrets
@@ -18,7 +19,7 @@ from importlib.resources import files
 from pathlib import Path
 from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
-from threading import Event
+from threading import Event, Thread
 from time import monotonic, sleep
 
 from . import diagnostics, ssh_pipeline
@@ -28,7 +29,10 @@ from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_ar
 from .diagnostics import outcome, safe_subprocess_details
 from .duration import format_duration
 from .env import parse_env
-from .progress import CONNECTING, STARTING_RUNNER, WAITING, preparation_labels, progress, run_step
+from .progress import (
+    ALLOCATING, CONNECTING, STARTING_RUNNER, WAITING, SetupTimeline, completed_steps, display_label, preparation_labels,
+    progress, run_step, setup_summary_socket,
+)
 
 
 @contextmanager
@@ -104,6 +108,7 @@ def allocate(args, terminal, color, store, labels):
     try:
         previous = signal(SIGINT, cancellation.request)
         try:
+            started = monotonic()
             with without_echo(terminal) as echo_was_on:
                 status = run_allocator(args, store, name, terminal, color, cancellation, labels)
         finally:
@@ -119,6 +124,8 @@ def allocate(args, terminal, color, store, labels):
         if cancellation.requested or status == 130:
             cancel_footer(echo_was_on, color)
             return None, 130
+        if status == 0 and getattr(args, "timings", False):
+            completed_steps([(0, ALLOCATING, started, monotonic())], labels, color)
         return (name, 0) if status == 0 else (None, status)
     finally:
         cancellation.close()
@@ -486,6 +493,42 @@ def feed_staging(stream, data):
             pass
 
 
+def read_setup_summary(path, stop, labels, color):
+    while not stop.is_set():
+        try:
+            with socket.socket(socket.AF_UNIX) as peer:
+                peer.settimeout(.25)
+                peer.connect(path)
+                buffer = bytearray()
+                while not stop.is_set():
+                    try:
+                        data = peer.recv(65536)
+                    except TimeoutError:
+                        continue
+                    if not data:
+                        break  # The remote listener may not be up yet.
+                    buffer.extend(data)
+                    if len(buffer) > ssh_pipeline.CONTROL_LIMIT:
+                        return
+                    if buffer.endswith(b"\n"):
+                        rows = json.loads(buffer)
+                        if not isinstance(rows, list) or any(
+                            not isinstance(row, list) or len(row) != 4 or type(row[0]) is not int or row[0] not in (0, 2)
+                            or not isinstance(row[1], str)
+                            or any(type(n) not in (int, float) or not math.isfinite(n) for n in row[2:])
+                            or row[2] > row[3] for row in rows
+                        ):
+                            return
+                        try:
+                            completed_steps(rows, labels, color)
+                        finally:
+                            peer.sendall(b"1")
+                        return
+        except (OSError, OverflowError, ValueError):
+            pass
+        stop.wait(.12)
+
+
 async def wait_setup_listener(process):
     loop = asyncio.get_running_loop()
     fd = process.stdout.fileno()
@@ -521,11 +564,12 @@ def embedded_gate(protocol, render_source):
 
 
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
-                copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None):
+                copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None, timings=False):
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    render_source = (inspect.getsource(format_duration), inspect.getsource(progress))
+    render_source = tuple(inspect.getsource(item) for item in
+                          (format_duration, display_label, SetupTimeline, completed_steps, setup_summary_socket, progress))
     remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", *render_source, inspect.getsource(diagnostics),
                         files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
@@ -573,7 +617,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     # The bootstrap channel must never read the command's stdin.
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
-    config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
+    timings = timings and sys.stderr is not None
+    summary_path = drive_stage + "-summary.sock" if timings else None
+    if summary_path:
+        config["summary_path"] = summary_path
+    config.update(debug=debug, timings=timings, progress_labels=labels, recovery_hint=allocation_hint(name, store))
     if live_payload:
         config["terminal_handoff"] = STARTING_RUNNER
     parallel = os.environ.get("ONCOLAB_PARALLEL_SETUP", "1") == "1"
@@ -584,7 +632,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
         remote = protocol + "\n" + remote
         gate_code = embedded_gate(protocol, render_source)
-        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint") if key in config}
+        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint", "timings", "summary_path") if key in config}
         command_plan.update(pipeline_role="command")
         payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
                               *config["entrypoint"], *command])
@@ -634,6 +682,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
         if endpoint:
             connect_options.extend(("-L", f"{endpoint}:{jobdir}/stdin.sock"))
+        summary_stop = Event()
+        summary_reader = None
+        local_summary = f"{tmp}/summary.sock" if summary_path else None
+        if local_summary:
+            connect_options.extend(("-L", f"{local_summary}:{summary_path}"))
         for local, remote_port in ports:
             connect_options.extend(("-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}"))
         terminal_connect = False
@@ -697,9 +750,41 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 return await bootstrap_ssh([*ssh, *connect_options, "-N", "-f", target], b"")
             return await bootstrap_ssh([*ssh, *connect_options, target, stage], staged_input)
 
+        owner_log = Path(tmp) / "owner-ssh.log"
+
+        async def start_owner():
+            nonlocal owner
+            # The first exec publishes its socket; setup can then overlap the
+            # config transfer and the second exec as before.
+            attempted.set()
+            try:
+                owner = sp.Popen(
+                    [*ssh, "-E", str(owner_log), "-T", "-o", "ProxyCommand=false",
+                     "-o", "ControlMaster=no", target, owner_code],
+                    stdin=sp.PIPE, stdout=sp.PIPE, stderr=owner_errors,
+                )
+            except OSError:
+                attempted.clear()
+                raise
+            transfers.submit(feed_staging, owner.stdin, staged_input)
+            try:
+                return await asyncio.wait_for(wait_setup_listener(owner), timeout=45)
+            except TimeoutError:
+                return False
+
+        async def connect_and_prepare():
+            nonlocal bootstrap_ready
+            connected = await connect()
+            if connected.returncode:
+                return connected, False
+            bootstrap_ready = True
+            return connected, await start_owner() if parallel and terminal_connect else True
+
         try:
+            connect_started = monotonic()
             with without_echo(terminal_connect):
-                connected = run_step(connect_label, connect, terminal_connect, color, labels=labels)
+                connected, ready = run_step(connect_label, connect_and_prepare, terminal_connect, color,
+                                            labels=labels, started_at=connect_started)
             if connected.returncode:
                 if connected.returncode in (-SIGINT, 130):
                     raise KeyboardInterrupt
@@ -710,43 +795,15 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 raise failure
             with suppress(OSError):
                 proxy_log.unlink(missing_ok=True)
-            bootstrap_ready = True
             if unclaimed is not None and not parallel:
                 unclaimed.clear()
-            if live_payload:
-                show_remote_handoff(color)
             if parallel:
-                # Keep the status visible while the first exec publishes its
-                # socket. Setup and config upload then overlap the second exec.
-                owner_log = Path(tmp) / "owner-ssh.log"
-                attempted.set()
-                try:
-                    owner = sp.Popen(
-                        [*ssh, "-E", str(owner_log), "-T", "-o", "ProxyCommand=false",
-                         "-o", "ControlMaster=no", target, owner_code],
-                        stdin=sp.PIPE, stdout=sp.PIPE, stderr=owner_errors,
-                    )
-                except OSError:
-                    attempted.clear()
-                    if live_payload:
-                        erase_remote_handoff()
-                    raise
-                transfers.submit(feed_staging, owner.stdin, staged_input)
-
-                async def wait_owner():
-                    return await asyncio.wait_for(wait_setup_listener(owner), timeout=45)
-
-                try:
-                    ready = asyncio.run(wait_owner())
-                except TimeoutError:
-                    ready = False
-                except KeyboardInterrupt:
-                    if live_payload:
-                        erase_remote_handoff()
-                    raise
+                if not terminal_connect:
+                    # Native prompts own the terminal during authentication.
+                    # Once they are done, continue the same SSH phase.
+                    ready = run_step(connect_label, start_owner, live_payload, color,
+                                     labels=labels, started_at=connect_started)
                 if not ready:
-                    if live_payload:
-                        erase_remote_handoff()
                     log = log_tail(owner_log)
                     try:
                         status = owner.wait(timeout=1) or 255
@@ -766,6 +823,14 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                             return 127, True
                         show_ssh_error(log, debug, recovery=allocation_hint(name, store), status=status)
                     return status, False
+            if timings:
+                completed_steps([(0, CONNECTING, connect_started, monotonic())], labels, color)
+            if live_payload:
+                show_remote_handoff(color)
+            if local_summary:
+                summary_reader = Thread(target=read_setup_summary,
+                                        args=(local_summary, summary_stop, labels, color), daemon=True)
+                summary_reader.start()
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
             attempted.set()
@@ -824,16 +889,21 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     status = status or 1
             return status, False
         finally:
+            summary_stop.set()
             try:
                 close_master()
             finally:
-                if owner is not None:
-                    try:
-                        owner.wait(timeout=5)
-                    except sp.TimeoutExpired:
-                        owner.kill()
-                        owner.wait()
-                    owner.stdout.close()
+                try:
+                    if owner is not None:
+                        try:
+                            owner.wait(timeout=5)
+                        except sp.TimeoutExpired:
+                            owner.kill()
+                            owner.wait()
+                        owner.stdout.close()
+                finally:
+                    if summary_reader is not None:
+                        summary_reader.join(.3)
 
 
 def ssh_transport_error(log):
@@ -992,6 +1062,7 @@ def parse_args():
                           help="Request a TPU: V5E1, V6E1 (subject to availability)")
     parser.add_argument("--attempts", type=int, metavar="N",
                         help="Attempts per VM allocation and SSH connection (default 4; 0 until cancelled)")
+    parser.add_argument("--timings", action="store_true", help="Show preparation timings and the steps that delayed launch")
     parser.add_argument("--debug", action="store_true", help="Show internal diagnostic details")
     parser.add_argument("--high-mem", action="store_true", help="Request a high-memory VM")
     parser.add_argument("-A", "--forward-agent", action="store_true", help="Forward the local SSH agent")
@@ -1054,7 +1125,7 @@ def retry_ssh(name, args, config, ini, known_hosts, command, copies, task_groups
                 return run_session(name, config, ini, known_hosts, command,
                                    args.forward_agent, terminal, color, attempted, copies=copies,
                                    store=store, debug=args.debug, task_copies=task_groups,
-                                   connect_label=connection, unclaimed=unclaimed)
+                                   connect_label=connection, unclaimed=unclaimed, timings=args.timings)
             except SSHBootstrapError as exc:
                 if attempted.is_set():
                     raise

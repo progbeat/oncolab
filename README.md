@@ -101,7 +101,9 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   `--attempts` overrides the last one.
 - Eligible setup steps can start while the Drive configuration is still transferring. The command
   uses its own channel on the same SSH connection and starts only once setup is ready.
-- Interactive preparation is transient and disappears before the command starts. If OpenSSH may
+- Interactive preparation, including `Setting up…` and its running jobs, disappears before the
+  command starts by default. Add `--timings` to keep completed phase timings on stderr,
+  with only the setup jobs that determined when setup could finish. If OpenSSH may
   need a key passphrase or password, it owns the terminal during authentication. With redirected
   stdout there is no live display. After allocation, SSH connection failures without a definite
   cause are retried against the same VM, with a fresh `--attempts` budget. Key or host verification
