@@ -49,11 +49,9 @@ class AllocationLabel:
         return self.state[0]
 
     def detail(self):
-        _, detail, deadline, attempt = self.state
-        if deadline is None:
-            return detail
-        remaining = format_duration(deadline - monotonic(), round_up=True)
-        return " · ".join(part for part in (f"attempt {attempt}" if attempt else "", remaining, detail) if part)
+        _, detail, deadline, prefix = self.state
+        remaining = "" if deadline is None else format_duration(deadline - monotonic(), round_up=True)
+        return " · ".join(part for part in (prefix, remaining, detail) if part)
 
 
 def colab_python():
@@ -169,7 +167,7 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, budget):
                     continue
                 if message := event.get("label"):
                     deadline = event.get("deadline")
-                    label.state = (message, event.get("detail", ""), deadline, event.get("attempt"))
+                    label.state = (message, event.get("detail", ""), deadline, event.get("prefix"))
                     hard_deadline = (deadline or monotonic()) + budget
                 if message := event.get("error"):
                     explained = True
