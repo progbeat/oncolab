@@ -16,6 +16,20 @@ from oncolab import allocation, allocation_worker as worker, cli
 
 
 class Protocol(unittest.TestCase):
+    def test_default_retry_starts_at_one_second_and_respects_server_delay(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "argv", ["oncolab", "true"]):
+            _, args, _ = cli.parse_args()
+        self.assertEqual(args.retry_backoff, 1)
+        allocator = worker.Allocation(None, "NONE", "DEFAULT", False)
+        allocator.attempt = Mock(side_effect=[
+            worker.Failure("temporary", retry=True),
+            worker.Failure("temporary", retry=True, delay=9),
+            {"endpoint": "fixture"},
+        ])
+        with patch.object(worker, "sleep") as sleep, patch.object(worker, "emit"):
+            self.assertEqual(allocator.run(4), {"endpoint": "fixture"})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 9])
+
     def test_auth_flow_is_not_entered_when_credentials_are_missing(self):
         hidden_login = Mock(side_effect=AssertionError("unexpected interactive login"))
         auth = SimpleNamespace(_run_remote_flow=hidden_login)

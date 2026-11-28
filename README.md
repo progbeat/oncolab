@@ -93,7 +93,8 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or
   `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator, session limit, or rate limit ends that run with a
   distinct error. Temporary connection errors can be retried during either the lookup or the
-  allocation request. On a retryable response, a bounded run reports server holdoffs longer than two
+  allocation request. The initial retry delay is one second and increases on subsequent attempts.
+  The server's Retry-After is never shortened. On a retryable response, a bounded run reports server holdoffs longer than two
   minutes and exits rather than retrying early. With `--attempts 0`, it shows the countdown and
   waits for that holdoff to finish or for Ctrl+C. The existing `COLAB_CLI_REQUEST_TIMEOUT`,
   `COLAB_CLI_RETRY_BACKOFF`, and `COLAB_CLI_ASSIGN_RETRIES` environment settings still apply;
