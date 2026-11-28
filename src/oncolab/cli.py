@@ -18,7 +18,7 @@ from importlib.resources import files
 from pathlib import Path
 from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
-from threading import Event
+from threading import Event, Thread
 from time import monotonic, sleep
 
 from . import diagnostics, ssh_pipeline
@@ -683,6 +683,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         if endpoint:
             connect_options.extend(("-L", f"{endpoint}:{jobdir}/stdin.sock"))
         summary_stop = Event()
+        summary_reader = None
         local_summary = f"{tmp}/summary.sock" if summary_path else None
         if local_summary:
             connect_options.extend(("-L", f"{local_summary}:{summary_path}"))
@@ -829,7 +830,9 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     if live_payload:
                         show_remote_handoff(color)
             if local_summary:
-                transfers.submit(read_setup_summary, local_summary, summary_stop, labels, color)
+                summary_reader = Thread(target=read_setup_summary,
+                                        args=(local_summary, summary_stop, labels, color), daemon=True)
+                summary_reader.start()
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
             attempted.set()
@@ -889,6 +892,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             return status, False
         finally:
             summary_stop.set()
+            if summary_reader is not None:
+                summary_reader.join(.3)
             try:
                 close_master()
             finally:

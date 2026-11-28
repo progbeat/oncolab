@@ -102,6 +102,8 @@ class SetupTimeline:
 def completed_steps(rows, labels, color):
     """Write the retained transcript apart from both live UI and stdout."""
     import os
+    import select
+    import stat
     from contextlib import suppress
 
     try:
@@ -123,6 +125,7 @@ def completed_steps(rows, labels, color):
     except (AttributeError, OSError, ValueError):
         fd = None
     with suppress(OSError, ValueError):
+        pipe = fd is not None and stat.S_ISFIFO(os.fstat(fd).st_mode)
         for indent, label, started, ended in rows:
             duration = format_duration(ended - started)
             padding = width - indent - get_cwidth(label)
@@ -151,7 +154,9 @@ def completed_steps(rows, labels, color):
             # and could replace a legitimate command exit code with 120.
             pending = memoryview(line.encode("utf-8"))
             while pending:
-                written = os.write(fd, pending)
+                if pipe and not select.select([], [fd], [], .05)[1]:
+                    return  # A blocked diagnostic sink must not block the command.
+                written = os.write(fd, pending[:select.PIPE_BUF] if pipe else pending)
                 if not written:
                     return
                 pending = pending[written:]

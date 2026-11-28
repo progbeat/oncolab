@@ -84,6 +84,25 @@ class Progress(unittest.TestCase):
             os.close(writer)
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
+    def test_full_summary_pipe_does_not_block_command(self):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(writer, False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(writer, b"x" * 512)
+            os.set_blocking(writer, True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5,
+            )
+            self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
     def test_control_characters_in_job_labels_stay_on_one_line(self):
         self.assertEqual(display_label("line 1\nline 2\tfoo\x1b[31m"), "line 1 line 2 foo\\x1b[31m")
 
