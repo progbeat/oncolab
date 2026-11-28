@@ -68,8 +68,10 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                     remaining = output.get_size().columns - 3
                     if timed:
                         remaining -= timer.get_width(progress_bar).preferred + 2
-                    if any(hasattr(c.label, "detail") for c in progress_bar.counters):
-                        remaining -= min(28, max(0, remaining // 2))
+                    # Reserve the allocation details space for the whole
+                    # preparation plan, not just while that row is active.
+                    if labels:
+                        remaining -= min(30, max(0, (remaining + 1) // 2))
                     available = remaining
                     return Dimension.exact(max(1, min(planned_width, available)))
 

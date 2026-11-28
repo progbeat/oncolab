@@ -17,11 +17,12 @@ LOGIN = "No usable Colab credentials. Run 'colab sessions' in a terminal to sign
 
 
 class Failure(Exception):
-    def __init__(self, message, *, retry=False, delay=0, uncertain=False):
+    def __init__(self, message, *, retry=False, delay=0, uncertain=False, detail=None):
         super().__init__(message)
         self.retry = retry
         self.delay = delay
         self.uncertain = uncertain
+        self.detail = detail or message
 
 
 def emit(**event):
@@ -88,7 +89,8 @@ class Allocation:
             raise Failure(LOGIN, uncertain=method == "POST") from None
         except (Timeout, ConnectionError, TransportError) as exc:
             message = "Colab request timed out" if isinstance(exc, Timeout) else "Could not reach Google Colab"
-            raise Failure(message, retry=True, uncertain=method == "POST") from None
+            raise Failure(message, retry=True, uncertain=method == "POST",
+                          detail="time out" if isinstance(exc, Timeout) else "network error") from None
         code = response.status_code
         if not 200 <= code < 300:
             reason = {400: "invalid request or accelerator not available to this account",
@@ -96,9 +98,11 @@ class Allocation:
                       412: "Allocation refused (session, usage or capacity limit); check 'colab sessions'",
                       429: "Colab is rate limiting requests", 502: "Colab gateway error",
                       503: "Colab service unavailable", 504: "Colab gateway timed out"}.get(code, "unexpected response")
-            raise Failure(f"HTTP {code}: {reason}", retry=code in (429, 502, 503, 504),
+            retry_details = {429: "429 rate limited", 502: "502 gateway error",
+                             503: "503 unavailable", 504: "504 gateway timeout"}
+            raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details,
                           delay=retry_after(response.headers.get("Retry-After", "")),
-                          uncertain=method == "POST" and code >= 500)
+                          uncertain=method == "POST" and code >= 500, detail=retry_details.get(code))
         raw = response.text.removeprefix(")]}'\n")
         try:
             data = json.loads(raw) if raw.strip() else {}
@@ -151,7 +155,7 @@ class Allocation:
                 if not exc.retry or (attempts and number >= attempts):
                     raise
                 delay = max(exc.delay, min(30, 2 ** min(number + 1, 5)))
-                emit(label="Waiting to retry…", detail=str(exc), deadline=monotonic() + delay)
+                emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay)
                 sleep(delay)
 
     def cleanup(self):

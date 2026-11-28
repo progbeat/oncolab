@@ -741,5 +741,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        internal_error("remote execution", exc, False)
+        internal_error("remote execution", exc, globals().get("_ONCOLAB_DEBUG", False))
         raise SystemExit(1) from None

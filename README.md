@@ -86,7 +86,7 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 
 - If Colab needs credentials, run `colab sessions` in a terminal and complete sign-in. `oncolab` does not hold your command's input open for a hidden login prompt.
 - Creating a VM can take several attempts. The progress view shows the current attempt and, on a transient failure, why it is waiting and when it will retry. Use `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator or session-limit response is not retried.
-- Use `--debug` for internal diagnostic locations. Output from your own command is not filtered.
+- Use `--debug` for internal diagnostic locations without raw credential data. Output from your own command is not filtered.
 
 - **Command not found:** run `uv tool update-shell` and reopen your terminal.
 - **SSH fails:** check [key selection](https://github.com/progbeat/oncolab/blob/master/docs/configuration.md#ssh); `oncolab`

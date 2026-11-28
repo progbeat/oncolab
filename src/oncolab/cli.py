@@ -19,7 +19,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
-from .allocation import AllocationError, run_allocator
+from .allocation import AllocationError, Cancellation, run_allocator
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
@@ -72,27 +72,23 @@ def release(name, terminal, color, store=None):
 
 
 def allocate(args, terminal, color, store, labels):
-    cancelled = False
+    cancellation = Cancellation()
     name = "oncolab-" + secrets.token_hex(6)
-
-    def cancel(*_):
-        nonlocal cancelled
-        cancelled = True
-
-    previous = signal(SIGINT, cancel)
+    previous = signal(SIGINT, cancellation.request)
     try:
         with without_echo(terminal) as echo_was_on:
-            status = run_allocator(args, store, name, terminal, color, lambda: cancelled, labels)
-        if (cancelled or status != 0) and store.is_file():
+            status = run_allocator(args, store, name, terminal, color, cancellation, labels)
+        if (cancellation.requested or status != 0) and store.is_file():
             # The worker may have finished writing the session at the signal
             # boundary. It is ours and SSH has not taken ownership.
             release(name, terminal, color, store)
-        if cancelled or status == 130:
+        if cancellation.requested or status == 130:
             cancel_footer(echo_was_on, color)
             return None, 130
         return (name, 0) if status == 0 else (None, status)
     finally:
         signal(SIGINT, previous)
+        cancellation.close()
 
 
 def cancel_footer(echo, color):
@@ -123,12 +119,16 @@ def ssh_options(name, store=None):
 STAGE = """import base64, json, os, sys
 from pathlib import Path
 os.umask(0o077)
-for directory, entries in json.load(sys.stdin).items():
-    path = Path(directory)
-    path.mkdir(mode=0o700)
-    for name, encoded in entries.items():
-        with (path / name).open("xb") as file:
-            file.write(base64.b64decode(encoded))
+try:
+    for directory, entries in json.load(sys.stdin).items():
+        path = Path(directory)
+        path.mkdir(mode=0o700)
+        for name, encoded in entries.items():
+            with (path / name).open("xb") as file:
+                file.write(base64.b64decode(encoded))
+except Exception as exc:
+    print("oncolab-stage: " + type(exc).__name__, file=sys.stderr)
+    raise SystemExit(1) from None
 """
 
 
@@ -145,8 +145,12 @@ def copy_detail(diagnostic):
     return ""
 
 
-def upload(ssh, target, result, sources=(), targets=(), modes=None):
-    helper = files("oncolab").joinpath("copy.py").read_text()
+def copy_helper(debug):
+    return f"_ONCOLAB_DEBUG = {debug!r}\n" + files("oncolab").joinpath("copy.py").read_text()
+
+
+def upload(ssh, target, result, sources=(), targets=(), modes=None, *, debug=False):
+    helper = copy_helper(debug)
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
     args = [json.dumps(targets)]
     if modes is not None:
@@ -233,9 +237,9 @@ def upload_stream(endpoint, key, source):
     return f"could not stream {source.name} to task stdin: {detail}", notified
 
 
-def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
+def upload_tasks(ssh, target, jobdir, groups, endpoint=None, *, debug=False):
     channel = [*ssh, "-T", "-o", "ProxyCommand=false", "-o", "ControlMaster=no", target]
-    helper = files("oncolab").joinpath("copy.py").read_text()
+    helper = copy_helper(debug)
     types = {key: source is not None for key, (_, source) in groups.items()}
     command = shlex.join(["python3", "-c", helper, "--broker", jobdir, json.dumps(types)])
     jobs, errors = [], []
@@ -268,7 +272,8 @@ def upload_tasks(ssh, target, jobdir, groups, endpoint=None):
             entries, input_source = groups.pop(key)
             if input_source is None:
                 sources, targets, modes = zip(*entries)
-                job = archives.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result", sources, targets, modes)
+                job = archives.submit(upload, ssh, target, f"{jobdir}/{key}/copy-result",
+                                      sources, targets, modes, debug=debug)
             else:
                 job = streams.submit(upload_stream, endpoint, key, input_source)
             jobs.append(job)
@@ -324,7 +329,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    remote = inspect.getsource(progress) + "\n" + files("oncolab").joinpath("remote.py").read_text()
+    remote = (f"_ONCOLAB_DEBUG = {debug!r}\n" + inspect.getsource(progress) + "\n"
+              + files("oncolab").joinpath("remote.py").read_text())
     jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
     labels = preparation_labels(config, bool(copies))
@@ -444,8 +450,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 return connected.returncode, True
             tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
             attempted.set()
-            transfer = transfers.submit(upload, ssh, target, result, sources, targets) if sources else None
-            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint) if groups else None
+            transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
+            task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
             argv = [*ssh, "-o", "ProxyCommand=false", "-o", "ControlMaster=no", tty, target, payload]
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status == 0:
@@ -473,16 +479,32 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
 
 def show_ssh_error(stderr, debug):
     text = (stderr or b"").decode(errors="replace")
-    # The ProxyCommand can emit an entire Typer traceback. Keep recognizable
-    # OpenSSH hints without exposing raw proxy responses or request URLs.
-    reasons = ("Permission denied", "Host key verification failed",
-               "REMOTE HOST IDENTIFICATION HAS CHANGED", "Connection timed out",
-               "Connection refused")
-    hint = next((reason for reason in reasons if reason in text), None)
-    print("oncolab: SSH connection failed" + (f": {hint}." if hint else
-          ". Check your SSH key and Colab session."), file=sys.stderr)
+    # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
+    # the staging protocol can be reported without exposing URLs or tokens.
+    if stage := re.search(r"^oncolab-stage: ([A-Za-z]+)$", text, re.MULTILINE):
+        print("oncolab: Could not stage setup files on the Colab VM.", file=sys.stderr)
+        if debug:
+            print(f"oncolab: staging exception: {stage[1]}", file=sys.stderr)
+        return
+    reasons = (
+        ("Address already in use", "A local port is already in use; choose a different port with -p."),
+        ("Could not request local forwarding", "SSH could not set up local port forwarding."),
+        ("Permission denied", "SSH permission denied; check your SSH key."),
+        ("Host key verification failed", "SSH host key verification failed; check the trusted host key."),
+        ("REMOTE HOST IDENTIFICATION HAS CHANGED", "SSH host key changed; verify it before reconnecting."),
+        ("Connection timed out", "SSH connection timed out."),
+        ("Connection refused", "SSH connection was refused."),
+        ("Connection closed", "The SSH connection closed before setup started."),
+    )
+    hint = next((message for marker, message in reasons if marker in text), None)
+    print("oncolab: " + (hint or "SSH connection failed. Check your SSH key and Colab session."),
+          file=sys.stderr)
     if debug:
-        print(f"oncolab: SSH bootstrap returned {len(stderr or b'')} diagnostic bytes", file=sys.stderr)
+        # Standard Python frame locations are useful without dumping source,
+        # rich traceback locals, or a remote request's headers.
+        for filename, number, function in re.findall(
+                r'^\s*File "[^"\n]*/([A-Za-z0-9_.-]+)", line (\d+), in ([A-Za-z_<>]+)\s*$', text, re.MULTILINE):
+            print(f"  {filename}:{number} in {function}", file=sys.stderr)
 
 
 def debug_internal(exc):

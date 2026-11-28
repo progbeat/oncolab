@@ -193,10 +193,16 @@ def notify_failure(result):
         # The runner already left setup and cleaned its private staging directory.
 
 
-def copy_diagnostic(message):
+def copy_diagnostic(message, exc=None):
     # A separate protocol lets the caller distinguish helper diagnostics
     # from SSH and interpreter output on the managed transfer channel.
-    print("oncolab-copy: " + json.dumps(str(message)), file=sys.stderr)
+    message = str(message)
+    if exc is not None and globals().get("_ONCOLAB_DEBUG"):
+        from traceback import extract_tb
+        stack = " > ".join(f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
+                           for frame in extract_tb(exc.__traceback__))
+        message += f" ({type(exc).__name__}: {stack})"
+    print("oncolab-copy: " + json.dumps(message), file=sys.stderr)
 
 
 def copy_receiver(result, targets, modes=None):
@@ -214,8 +220,8 @@ def copy_receiver(result, targets, modes=None):
         status = "ok"
     except (OSError, ValueError, EOFError, tarfile.TarError) as exc:
         copy_diagnostic(exc)
-    except Exception:
-        copy_diagnostic("Unexpected copy receiver error")
+    except Exception as exc:
+        copy_diagnostic("Unexpected copy receiver error", exc)
     try:
         publish_result(result, status)
     except FileNotFoundError:
@@ -423,6 +429,6 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception:
-        copy_diagnostic("Unexpected internal file transfer error")
+    except Exception as exc:
+        copy_diagnostic("Unexpected internal file transfer error", exc)
         raise SystemExit(1) from None

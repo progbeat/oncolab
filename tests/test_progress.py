@@ -8,6 +8,8 @@ import signal
 import struct
 import sys
 import termios
+
+from prompt_toolkit.utils import get_cwidth
 import time
 import unittest
 
@@ -17,17 +19,21 @@ class Progress(unittest.TestCase):
         script = """
 import asyncio
 from oncolab.progress import progress
-async def work(run):
-    run.reserve("Long planned step with 漢")
-    async def wait():
-        await asyncio.sleep(.8)
-    await run("Short…", wait)
-progress(work, True, True)
+class Allocation:
+    def __call__(self):
+        return "Waiting…"
+    def detail(self):
+        return "4s · 503 unavailable"
+labels = ["Short…", "Long planned step with 漢", "Waiting…"]
+async def wait():
+    await asyncio.sleep(.55)
+progress(lambda run: run(Allocation(), wait), True, True, labels=labels)
+progress(lambda run: run("Short…", wait), True, True, labels=labels)
 print("READY_FOR_COMMAND")
 """
         pid, fd = pty.fork()
         if not pid:
-            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 40, 0, 0))
             os.execve(sys.executable, [sys.executable, "-c", script],
                       dict(os.environ, TERM="xterm-256color"))
         output = bytearray()
@@ -52,8 +58,15 @@ print("READY_FOR_COMMAND")
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)
             self.assertNotIn(b"Traceback", output)
             rendered = bytes(output)
-            # Prompt Toolkit moves the cursor across the reserved gap on its first paint.
-            self.assertRegex(rendered, rb"Short[^\r\n]*?(?:\x1b\[\d+C| {8,})[^\r\n]*?\x1b\[0;36m\s*\d\.\ds")
+            text = rendered.decode()
+            def column(label):
+                match = re.search(label + r"[^\r\n]*?(?=\x1b\[0;36m\s*\d\.\ds)", text)
+                self.assertIsNotNone(match, rendered)
+                prefix = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m[1] or 1), match[0])
+                prefix = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", prefix)
+                return get_cwidth(prefix)
+            self.assertEqual(column("Waiting"), column("Short"))
+            self.assertIn(b"503", rendered)
             self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
         finally:
             os.close(fd)
