@@ -251,7 +251,7 @@ def show_remote_handoff(color):
         (marker + ellipsis).encode(encoding)
     except UnicodeEncodeError:
         marker, ellipsis = "o", "..."
-    label = f"{marker} Waiting for remote setup to start{ellipsis}"
+    label = f"{marker} Waiting for remote to start{ellipsis}"
     width = max(1, columns - 1)
     if len(label) > width:
         label = label[:max(0, width - len(ellipsis))] + ellipsis[:width]
