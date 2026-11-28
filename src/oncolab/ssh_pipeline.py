@@ -322,7 +322,7 @@ def gated_command(peer, buffer, workdir, environment, command):
                     pass
 
 
-def command_gate(path, plan, color, command, render):
+def command_gate(path, plan, color, command, render, takeover):
     with socket.socket(socket.AF_UNIX) as peer:
         deadline = time.monotonic() + 20
         while True:
@@ -337,15 +337,11 @@ def command_gate(path, plan, color, command, render):
         buffer = bytearray()
         live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
 
-        def take_terminal():
-            if plan.get("terminal_handoff"):
-                print("\x1b[A\r", end="", flush=True)
-
-        if not live and plan.get("terminal_handoff"):
-            print("\x1b[A\r\x1b[K", end="", flush=True)
+        if not live:
+            takeover()
         output, result = render(lambda run: observe_setup(run, peer, buffer), live, color,
                                 labels=plan.get("progress_labels", ()),
-                                idle=plan.get("terminal_handoff"), takeover=take_terminal)
+                                idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False))
         peer.setblocking(True)
         for data in output:
             pipeline_stderr(base64.b64decode(data))
@@ -374,12 +370,22 @@ def command_gate(path, plan, color, command, render):
 def command_gate_main(render):
     path, color, raw_plan, *command = sys.argv[1:]
     plan = json.loads(raw_plan)
+    handoff = bool(plan.get("terminal_handoff"))
+
+    def takeover(*, erase=True):
+        nonlocal handoff
+        if handoff:
+            handoff = False
+            print("\x1b[A\r" + ("\x1b[K" if erase else ""), end="", flush=True)
+
     try:
-        return command_gate(path, plan, color == "1", command, render)
+        return command_gate(path, plan, color == "1", command, render, takeover)
     except KeyboardInterrupt:
+        takeover()
         pipeline_stderr(b"[cancelled]\n")
         return 130
     except (OSError, ValueError):
+        takeover()
         hint = plan.get("recovery_hint", "Setup runner disconnected")
         pipeline_stderr(f"[Setup channel closed] {hint}.\n".encode())
         return 1

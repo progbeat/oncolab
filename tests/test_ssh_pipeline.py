@@ -1,5 +1,6 @@
 import errno
 import inspect
+import io
 import json
 import os
 import pty
@@ -11,9 +12,10 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 from oncolab import ssh_pipeline
-from oncolab.cli import embedded_gate
+from oncolab.cli import call_command_ssh, embedded_gate
 from oncolab.duration import format_duration
 from oncolab.progress import progress
 from oncolab.ssh_pipeline import SETUP_LISTENING, packet
@@ -74,6 +76,58 @@ def wait_file(path):
 
 
 class ParallelSSH(unittest.TestCase):
+    def test_command_channel_retries_only_a_confirmed_pre_dispatch_refusal(self):
+        refused = b"mux_client_request_session: session request failed: Session open refused by peer\n"
+        lost = b"mux_client_request_session: read from master failed: Broken pipe\n"
+        exit_255 = b"debug2: Received exit status from master 255\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "ssh.log"
+            owner = Mock()
+            owner.poll.return_value = None
+            for cases, expected, waits in (
+                ([(255, refused), (255, refused), (0, None)], (0, b"", False), [1, 2]),
+                ([(255, refused)] * 3, (255, refused, True), [1, 2]),
+                ([(255, refused), (255, None)], (255, b"", False), [1]),
+                ([(255, lost)], (255, lost, False), []),
+                ([(255, exit_255)], (255, exit_255, False), []),
+            ):
+                with self.subTest(cases=cases):
+                    reports = iter(cases)
+
+                    def run(argv):
+                        self.assertFalse(log.exists())
+                        status, diagnostic = next(reports)
+                        if diagnostic is not None:
+                            log.write_bytes(diagnostic)
+                        return status
+
+                    with patch("oncolab.cli.sp.call", side_effect=run) as ssh, patch("oncolab.cli.sleep") as sleep:
+                        self.assertEqual(call_command_ssh(["ssh"], log, None, owner), expected)
+                        self.assertEqual(ssh.call_count, len(cases))
+                        self.assertEqual([args[0] for args, _ in sleep.call_args_list], waits)
+
+    def test_gate_failure_erases_the_handoff_before_diagnostic(self):
+        for took_over in (False, True):
+            with self.subTest(took_over=took_over):
+                terminal = io.StringIO()
+
+                def fail(*args):
+                    if took_over:
+                        args[-1](erase=False)
+                    raise OSError("connection closed")
+
+                def diagnostic(data):
+                    terminal.write(data.decode())
+
+                with (patch.object(sys, "argv", ["gate", "/socket", "0", '{"terminal_handoff":"waiting"}', "cmd"]),
+                      patch.object(sys, "stdout", terminal),
+                      patch.object(ssh_pipeline, "command_gate", side_effect=fail),
+                      patch.object(ssh_pipeline, "pipeline_stderr", side_effect=diagnostic)):
+                    self.assertEqual(ssh_pipeline.command_gate_main(None), 1)
+                prefix = "\x1b[A\r" if took_over else "\x1b[A\r\x1b[K"
+                self.assertTrue(terminal.getvalue().startswith(prefix + "[Setup channel closed]"))
+                self.assertEqual(terminal.getvalue().count("\x1b[A"), 1)
+
     def test_native_pty_delivers_ctrl_c_to_admitted_foreground_group(self):
         owner, gate = socket.socketpair()
         pid, fd = pty.fork()

@@ -19,6 +19,7 @@ from pathlib import Path
 from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
+from time import sleep
 
 from . import diagnostics, ssh_pipeline
 from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
@@ -261,6 +262,47 @@ def show_remote_handoff(color):
         label = "\x1b[37m" + label[:1] + "\x1b[0;2m" + label[1:] + "\x1b[0m"
     sys.stdout.buffer.write((label + "\n").encode(encoding))
     sys.stdout.buffer.flush()
+
+
+def erase_remote_handoff():
+    sys.stdout.write("\x1b[A\r\x1b[K")
+    sys.stdout.flush()
+
+
+def command_ssh_log(path):
+    try:
+        with path.open("rb") as log:
+            log.seek(max(0, path.stat().st_size - 16_384))
+            return log.read(16_384)
+    except OSError:
+        return b""
+
+
+def session_open_refused(log):
+    # OpenSSH reports this MUX_S_FAILURE before sending the remote command.
+    # A broken pipe or missing reply does not establish that boundary.
+    return (b"master session id:" not in log and b"Received exit status from master" not in log
+            and any(re.search(rb"mux_client_request_session(?:\(\))?:.*"
+                              rb"session request failed: Session open refused by peer\s*$", line)
+                    for line in log.splitlines()))
+
+
+def call_command_ssh(argv, log_path, transfer, owner, *, on_wait_cancel=None):
+    for pause in (1, 2, None):
+        log_path.unlink(missing_ok=True)
+        status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+        log = command_ssh_log(log_path) if status == 255 else b""
+        refused = session_open_refused(log)
+        if not refused or owner is None or pause is None or owner.poll() is not None:
+            return status, log, refused
+        try:
+            sleep(pause)
+        except KeyboardInterrupt:
+            if on_wait_cancel:
+                on_wait_cancel()
+            raise
+        if owner.poll() is not None:
+            return status, log, refused
 
 
 def upload_stream(endpoint, key, source):
@@ -619,14 +661,12 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                                   "-o", "LogVerbose=*:mux_client_request_session():*"]
             argv = [*ssh, *mux_status_logging, "-E", str(ssh_log), "-o", "ProxyCommand=false",
                     "-o", "ControlMaster=no", tty, target, payload]
-            status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            status, ssh_error, refused = call_command_ssh(
+                argv, ssh_log, transfer, owner, on_wait_cancel=erase_remote_handoff if live_payload else None,
+            )
+            if live_payload and refused:
+                erase_remote_handoff()
             if status == 255:
-                try:
-                    with ssh_log.open("rb") as log:
-                        log.seek(max(0, ssh_log.stat().st_size - 16_384))
-                        ssh_error = log.read(16_384)
-                except OSError:
-                    ssh_error = b""
                 if error := ssh_transport_error(ssh_error):
                     show_ssh_error(error, debug, recovery=allocation_hint(name, store))
             if owner is not None:
@@ -712,6 +752,7 @@ def show_ssh_error(stderr, debug, *, recovery=None):
         ("Connection timed out", "SSH connection timed out."),
         ("Connection refused", "SSH connection was refused."),
         ("Connection closed", "The SSH connection closed."),
+        ("Session open refused by peer", "The VM refused to open the SSH command channel."),
         ("mux_client_request_session:", "The SSH session could not be opened."),
         ("mux_client_request_session():", "The SSH session could not be opened."),
         ("mux_client_read_packet:", "The SSH connection closed."),
