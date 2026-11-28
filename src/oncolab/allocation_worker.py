@@ -108,7 +108,9 @@ class Allocation:
                        "variant": variant, "accelerator": accelerator}
         if high_mem and accelerator not in {"L4", "V5E1", "V6E1"}:
             self.params["shape"] = "hm"
-        self.target = accelerator if variant != "DEFAULT" else ("CPU High-RAM" if high_mem else "CPU")
+        self.target = "CPU" if variant == "DEFAULT" else accelerator
+        if self.params.get("shape") == "hm":
+            self.target += " High-RAM"
         self.endpoint = None
         self.uncertain = False
         self.reconcile_after = 0
@@ -210,18 +212,19 @@ class Allocation:
         while True:
             number += 1
             count = f"{number}/{attempts}" if attempts else str(number)
+            prefix = f"{self.target} · attempt {count}"
             try:
                 if self.authenticate is not None:
                     emit(label="Checking Colab sign-in…", detail=f"attempt {count}")
                     self.session, self.write_session = self.authenticate()
                     self.authenticate = None
-                emit(label="Creating Colab VM…", detail=f"{self.target} · attempt {count}")
+                emit(label="Creating Colab VM…", prefix=prefix)
                 return self.attempt()
             except Failure as exc:
                 if not exc.retry or (attempts and (number >= attempts or exc.delay > 120)):
                     raise
                 delay = max(exc.delay, min(120, backoff * 2 ** min(number - 1, 16)))
-                emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay, attempt=count)
+                emit(label="Waiting to retry…", prefix=prefix, detail=exc.detail, deadline=monotonic() + delay)
                 # Keep each platform sleep well within its system time range.
                 while delay > 3600:
                     sleep(3600)

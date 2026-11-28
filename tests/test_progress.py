@@ -78,7 +78,7 @@ from oncolab.progress import progress as installed_progress
 exec(inspect.getsource(installed_format_duration))
 exec(inspect.getsource(installed_progress))
 allocation = AllocationLabel()
-allocation.state = ("Waiting…", "503 unavailable", monotonic() + 3 * 86400, "2/4")
+allocation.state = ("Waiting…", "time out", monotonic() + 3 * 86400, "CPU · attempt 2/4")
 labels = ["Short…", "Long planned step with 漢", "Waiting…"]
 async def wait():
     await asyncio.sleep(.55)
@@ -124,7 +124,7 @@ print("READY_FOR_COMMAND")
             self.assertEqual(column("Waiting"), expected_column)
             self.assertEqual(column("Short"), expected_column)
             plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-            self.assertRegex(plain, r"attempt 2/4 · 3\.0d · 503 unavailable[^\r\n]*[\r\n]")
+            self.assertRegex(plain, r"CPU · attempt 2/4 · 3\.0d · time out[^\r\n]*[\r\n]")
             self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
         finally:
             os.close(fd)

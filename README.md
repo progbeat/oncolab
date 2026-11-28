@@ -86,9 +86,10 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 
 - If Colab needs credentials, run `colab sessions` in a terminal and complete sign-in. `oncolab`
   does not hold your command's input open for a hidden login prompt.
-- Creating a VM can take several attempts. The progress view shows the current attempt and, on a
-  transient failure, keeps the attempt number alongside the retry countdown and reason. Timers use
-  one decimal and switch from seconds to minutes, hours, and days as they grow. Use
+- Creating a VM can take several attempts. The progress view shows the requested runtime and
+  current attempt both during allocation and while waiting to retry. The wait also shows a
+  countdown and reason. Timers use one decimal and switch from seconds to minutes, hours, and
+  days as they grow. Use
   `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or
   `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator, session limit, or rate limit ends that run with a
   distinct error. Temporary connection errors can be retried during either the lookup or the

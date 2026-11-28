@@ -134,18 +134,43 @@ class Protocol(unittest.TestCase):
         self.assertEqual(len({c.kwargs["params"]["nbh"] for c in request.call_args_list}), 1)
         self.assertEqual(backend.params["shape"], "hm")
         waiting, = [c.kwargs for c in emit.call_args_list if c.kwargs["label"] == "Waiting to retry…"]
-        self.assertEqual((waiting["attempt"], waiting["detail"]), ("1/4", "timeout"))
+        self.assertEqual(waiting["detail"], "timeout")
+
+    def test_creating_and_waiting_show_the_same_requested_target_and_attempt(self):
+        for accelerator, variant, high_mem, target in (
+            ("NONE", "DEFAULT", False, "CPU"),
+            ("NONE", "DEFAULT", True, "CPU High-RAM"),
+            ("T4", "GPU", False, "T4"),
+            ("T4", "GPU", True, "T4 High-RAM"),
+            ("L4", "GPU", True, "L4"),
+            ("V5E1", "TPU", True, "V5E1"),
+        ):
+            with self.subTest(target=target):
+                backend = worker.Allocation(None, accelerator, variant, high_mem)
+                with (patch.object(backend, "attempt", side_effect=[
+                    worker.Failure("HTTP 503", retry=True, detail="503 unavailable"),
+                    {"endpoint": "test"},
+                ]), patch.object(worker, "emit") as emit, patch.object(worker, "sleep")):
+                    self.assertEqual(backend.run(4), {"endpoint": "test"})
+                first, wait, second = [call.kwargs for call in emit.call_args_list]
+                self.assertEqual(first, {"label": "Creating Colab VM…", "prefix": f"{target} · attempt 1/4"})
+                self.assertEqual(wait["label"], "Waiting to retry…")
+                self.assertEqual(wait["prefix"], first["prefix"])
+                self.assertEqual(wait["detail"], "503 unavailable")
+                self.assertEqual(second, {"label": "Creating Colab VM…", "prefix": f"{target} · attempt 2/4"})
 
     def test_countdown_preserves_attempt_and_does_not_round_to_zero_early(self):
         label = allocation.AllocationLabel()
-        label.state = ("Waiting to retry…", "time out", 100.01, "3")
+        label.state = ("Creating Colab VM…", "", None, "CPU · attempt 3")
+        self.assertEqual(label.detail(), "CPU · attempt 3")
+        label.state = ("Waiting to retry…", "time out", 100.01, "CPU · attempt 3")
         with patch.object(allocation, "monotonic", return_value=100):
-            self.assertEqual(label.detail(), "attempt 3 · 0.1s · time out")
+            self.assertEqual(label.detail(), "CPU · attempt 3 · 0.1s · time out")
         with patch.object(allocation, "monotonic", return_value=100.2):
-            self.assertEqual(label.detail(), "attempt 3 · 0.0s · time out")
-        label.state = ("Waiting to retry…", "HTTP 503", 90100, "2/4")
+            self.assertEqual(label.detail(), "CPU · attempt 3 · 0.0s · time out")
+        label.state = ("Waiting to retry…", "HTTP 503", 90100, "T4 High-RAM · attempt 2/4")
         with patch.object(allocation, "monotonic", return_value=100):
-            self.assertEqual(label.detail(), "attempt 2/4 · 1.1d · HTTP 503")
+            self.assertEqual(label.detail(), "T4 High-RAM · attempt 2/4 · 1.1d · HTTP 503")
 
     def test_retry_after_preserves_multi_day_delay(self):
         self.assertEqual(worker.retry_after("172800"), 172800)
