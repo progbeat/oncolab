@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from oncolab.diagnostics import outcome
+from oncolab.remote import Lifecycle
 
 
 class Progress(unittest.TestCase):
@@ -24,6 +25,14 @@ class Progress(unittest.TestCase):
                              "\x1b[31m[VM creation failed]\x1b[0m Unavailable.")
             self.assertEqual(outcome("VM creation failed", "Unavailable.", color=False),
                              "[VM creation failed] Unavailable.")
+
+    def test_deferred_setup_output_tolerates_a_closed_terminal(self):
+        lifecycle = Lifecycle()
+        lifecycle.setup_output = [b"fixture\n"]
+        with patch("sys.stderr.fileno", return_value=2), patch("oncolab.remote.os.write", side_effect=BrokenPipeError) as write:
+            lifecycle.flush_setup_output()
+        write.assert_called_once_with(2, b"fixture\n")
+        self.assertIsNone(lifecycle.setup_output)
 
     def test_tty_setup_steps_share_elapsed_column_and_leave_no_final_row(self):
         script = """

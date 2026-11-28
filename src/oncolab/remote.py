@@ -402,8 +402,23 @@ class Lifecycle:
 
     def flush_setup_output(self):
         deferred, self.setup_output = self.setup_output, None
-        for data in deferred or ():
-            self.write_setup_output(data)
+        if deferred:
+            try:
+                fd = sys.stderr.fileno()
+                for data in deferred:
+                    if isinstance(data, str):
+                        data = (data + "\n").encode(sys.stderr.encoding or "utf-8",
+                                                     sys.stderr.errors or "backslashreplace")
+                    pending = memoryview(data)
+                    while pending:
+                        written = os.write(fd, pending)
+                        if not written:
+                            return
+                        pending = pending[written:]
+            except (OSError, ValueError):
+                # Do not poison Python's buffered stderr on a closed sink:
+                # it can replace an already known exit code at shutdown.
+                pass
 
     def interrupt(self, number, _):
         if not self.interrupted:
