@@ -131,7 +131,10 @@ if os.environ.get("TEST_TTY_SETUP_FAILURE"):
 namespace = {"__name__": "fixture", "__package__": None}
 exec(source, namespace)
 namespace["unassign"] = lambda: None
-script = 'assert input("READY_FOR_TEST: ") == "passed through the tty"; print("PTY_ROUND_TRIP_OK")'
+# Keep the fixture prompt on stdout. With fd 2 redirected, Python
+# can select a different input() path than it would on a real SSH PTY.
+script = ('print("READY_FOR_TEST: ", end="", flush=True); '
+          'assert input() == "passed through the tty"; print("PTY_ROUND_TRIP_OK")')
 sys.argv = ["-c", stage, color, json.dumps(config), sys.executable, "-c", script]
 raise SystemExit(namespace["main"]())
 ''')
