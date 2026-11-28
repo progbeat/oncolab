@@ -6,6 +6,7 @@ CHECKING_LOGIN = "Checking Colab sign-in…"
 WAITING = "Waiting to retry…"
 CONNECTING = "Connecting via SSH…"
 COPYING = "Copying files…"
+REFRESH_INTERVAL = 0.1  # Match the elapsed timer’s tenth-second display.
 DRIVE_PREPARATION = ("Preparing FUSE…", "Preparing rclone…", "Starting Drive mounts…")
 
 
@@ -46,7 +47,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                 frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
                 def format(self, progress_bar, progress, width):
-                    frame = self.frames[int(monotonic() / .3) % len(self.frames)]
+                    frame = self.frames[int(monotonic() / REFRESH_INTERVAL) % len(self.frames)]
                     return [("class:spinning-wheel", frame)]
 
             planned_width = max((get_cwidth(label) for label in labels), default=1)
@@ -116,6 +117,18 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
 
             class PreparationBar(ProgressBar):
                 @property
+                def app(self):
+                    return self._preparation_app
+
+                @app.setter
+                def app(self, application):
+                    # ProgressBar starts the renderer immediately after assigning
+                    # its app; set the interval before it starts the refresh task.
+                    application.refresh_interval = REFRESH_INTERVAL
+                    application.erase_when_done = True
+                    self._preparation_app = application
+
+                @property
                 def title(self):
                     # Wrap VM retry details onto their own line when they do
                     # not fit, without moving the elapsed-time column.
@@ -138,7 +151,6 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                 input=keys, output=output,
             )
             stack.enter_context(bar)
-            bar.app.erase_when_done = True
 
         def reserve(label):
             if bar is not None:
