@@ -106,10 +106,14 @@ class Allocation:
                       503: "Colab service unavailable", 504: "Colab gateway timed out"}.get(code, "unexpected response")
             if code == 400 and path == "/assign" and self.params["variant"] != "DEFAULT":
                 reason = f"Colab rejected {self.params['accelerator']}; try another accelerator or omit --gpu/--tpu"
-            retry_details = {429: "429 rate limited", 502: "502 gateway error",
-                             503: "503 unavailable", 504: "504 gateway timeout"}
-            raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details,
-                          delay=retry_after(response.headers.get("Retry-After", "")),
+            retry_details = {502: "502 gateway error", 503: "503 unavailable", 504: "504 gateway timeout"}
+            delay = retry_after(response.headers.get("Retry-After", ""))
+            if code == 429 or delay > 120:
+                reason += f"; retry after {delay}s" if delay else "; wait before trying again"
+            # Respect a long server holdoff without making a normal command
+            # wait for hours, and never start another request before it ends.
+            raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details and delay <= 120,
+                          delay=delay,
                           uncertain=method == "POST" and code >= 500, detail=retry_details.get(code))
         raw = response.text.removeprefix(")]}'\n")
         try:
