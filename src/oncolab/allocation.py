@@ -71,14 +71,48 @@ def colab_python():
     raise AllocationError("Cannot identify the Colab CLI's Python. Install it with 'uv tool install google-colab-cli'.")
 
 
-def launch(argv, label, cancellation, *, debug, live):
+def write_diagnostic(message, *, optional=False):
+    try:
+        from io import UnsupportedOperation
+        try:
+            fd = sys.stderr.fileno()
+        except (AttributeError, UnsupportedOperation):
+            print(message, file=sys.stderr, flush=True)
+            return
+        if optional:
+            from select import select
+            if not select([], [fd], [], 0)[1]:
+                return
+        os.write(fd, (message + "\n").encode())
+    except (OSError, ValueError):
+        # The user may close a diagnostic pipeline while the worker is alive.
+        pass
+
+
+def launch(argv, label, cancellation, diagnostics, *, debug, live, budget):
     if cancellation.requested:
         return 130
     with sp.Popen(argv, stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.DEVNULL,
-                  start_new_session=True, bufsize=0) as proc, selectors.DefaultSelector() as selector:
+                  start_new_session=True, bufsize=0) as proc:
+        try:
+            return supervise(proc, label, cancellation, diagnostics, debug=debug, live=live, budget=budget)
+        finally:
+            if proc.poll() is None:
+                # Do not let an unexpected error in the monitor turn Popen's
+                # context-manager wait into an unbounded wait on an allocator.
+                proc.send_signal(SIGINT)
+                try:
+                    proc.wait(timeout=11)
+                except sp.TimeoutExpired:
+                    proc.kill()
+                    diagnostics.append(f"oncolab: {CHECK}")
+
+
+def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
+    with selectors.DefaultSelector() as selector:
         selector.register(proc.stdout, selectors.EVENT_READ)
         selector.register(cancellation.read, selectors.EVENT_READ)
-        hard_deadline = monotonic() + 45
+        hard_deadline = monotonic() + budget
         interrupt_at = None
         explained = False
         data = b""
@@ -93,9 +127,9 @@ def launch(argv, label, cancellation, *, debug, live):
             if interrupt_at is not None and now - interrupt_at >= 11:
                 proc.kill()
                 if cancellation.requested:
-                    print(f"oncolab: {CHECK}", file=sys.stderr)
+                    diagnostics.append(f"oncolab: {CHECK}")
                     return 130
-                print(f"oncolab: Timed out waiting for Colab. {CHECK}", file=sys.stderr)
+                diagnostics.append(f"oncolab: Timed out waiting for Colab. {CHECK}")
                 return 124
             deadline = hard_deadline if interrupt_at is None else interrupt_at + 11
             ready = selector.select(max(0, deadline - monotonic()))
@@ -120,25 +154,25 @@ def launch(argv, label, cancellation, *, debug, live):
                 if message := event.get("label"):
                     deadline = event.get("deadline")
                     label.state = (message, event.get("detail", ""), deadline)
-                    hard_deadline = (deadline or monotonic()) + 45
+                    hard_deadline = (deadline or monotonic()) + budget
                     if not live and message == WAITING:
-                        print(f"oncolab: {message} {label.detail()}", file=sys.stderr, flush=True)
+                        write_diagnostic(f"oncolab: {message} {label.detail()}", optional=True)
                 if message := event.get("error"):
                     explained = True
-                    print(f"oncolab: {message}", file=sys.stderr, flush=True)
+                    diagnostics.append(f"oncolab: {message}")
                 if debug and (message := event.get("debug")):
-                    print(message, file=sys.stderr)
+                    diagnostics.append(message)
         try:
             status = proc.wait(timeout=1)
         except sp.TimeoutExpired:
             proc.kill()
-            print(f"oncolab: {CHECK}", file=sys.stderr)
+            diagnostics.append(f"oncolab: {CHECK}")
             return 130 if cancellation.requested else 1
         if interrupt_at is not None and not cancellation.requested:
-            print("oncolab: Timed out waiting for Colab. " + CHECK, file=sys.stderr)
+            diagnostics.append("oncolab: Timed out waiting for Colab. " + CHECK)
             return 124
         elif status and not (cancellation.requested or explained):
-            print(f"oncolab: The Colab allocator exited unexpectedly (status {status}). {CHECK}", file=sys.stderr)
+            diagnostics.append(f"oncolab: The Colab allocator exited unexpectedly (status {status}). {CHECK}")
         return status if status >= 0 else (130 if cancellation.requested else 1)
 
 
@@ -147,10 +181,20 @@ def run_allocator(args, store, name, terminal, color, cancellation, labels):
     accelerator = args.gpu or args.tpu or "NONE"
     variant = "GPU" if args.gpu else "TPU" if args.tpu else "DEFAULT"
     argv = [*colab_python(), "-I", script, str(store), name, accelerator, variant,
-            str(int(args.high_mem)), str(args.attempts), str(int(args.debug))]
+            str(int(args.high_mem)), str(args.attempts), str(int(args.debug)),
+            str(args.request_timeout), str(args.retry_backoff)]
+    # One attempt can perform both a lookup and an allocation POST.
+    budget = max(45, 2 * args.request_timeout + 5)
     label = AllocationLabel()
-    status = run_step(label, lambda: launch(argv, label, cancellation, debug=args.debug, live=terminal),
-                      terminal, color, labels=labels)
+    diagnostics = []
+    try:
+        status = run_step(label, lambda: launch(argv, label, cancellation, diagnostics,
+                                                debug=args.debug, live=terminal, budget=budget),
+                          terminal, color, labels=labels)
+    finally:
+        # Do not write diagnostics over the live prompt-toolkit renderer.
+        for message in diagnostics:
+            write_diagnostic(message)
     if status == 0 and not store.is_file():
         raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
     return status

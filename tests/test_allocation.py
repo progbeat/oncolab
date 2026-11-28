@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from shutil import which
@@ -78,11 +79,12 @@ class Protocol(unittest.TestCase):
         backend = worker.Allocation(None, "NONE", "DEFAULT", False)
         backend.uncertain = True
         with (patch.object(backend, "request", side_effect=[
+            {"token": "not-visible"}, {"token": "still-not-visible"},
             {"endpoint": "own-vm"}, {"token": "release"}, {},
-        ]) as request, patch.object(worker, "emit")):
+        ]) as request, patch.object(worker, "emit"), patch.object(worker, "sleep")):
             backend.cleanup()
         self.assertEqual([c.args for c in request.call_args_list],
-                         [("GET", "/assign"), ("GET", "/unassign/own-vm"), ("POST", "/unassign/own-vm")])
+                         [("GET", "/assign")] * 3 + [("GET", "/unassign/own-vm"), ("POST", "/unassign/own-vm")])
 
 
     def test_sigint_at_successful_handoff_releases_vm(self):
@@ -110,7 +112,8 @@ class Protocol(unittest.TestCase):
 class InstalledCLI(unittest.TestCase):
     def run_cli(self, mode, tmp):
         fake_colab(Path(tmp))
-        env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", XDG_CONFIG_HOME=tmp, TEST_ALLOCATION=mode)
+        env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", XDG_CONFIG_HOME=tmp, TEST_ALLOCATION=mode,
+                   TEST_ALLOCATION_READY=str(Path(tmp) / "ready"))
         return subprocess.Popen([which("oncolab"), "--", "true"], env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -121,6 +124,15 @@ class InstalledCLI(unittest.TestCase):
             self.assertEqual(out, "")
             self.assertIn("Run 'colab sessions'", err)
             self.assertNotIn("Traceback", err)
+
+    def test_allocator_crash_is_actionable_without_raw_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp, self.run_cli("crash", tmp) as proc:
+            out, err = proc.communicate(timeout=8)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(out, "")
+            self.assertIn("The Colab allocator exited unexpectedly", err)
+            self.assertNotIn("Traceback", err)
+            self.assertNotIn("secret-token", err)
 
     def test_sigint_during_backoff_exits_promptly(self):
         import select
@@ -134,6 +146,22 @@ class InstalledCLI(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertIn("[cancelled]", err)
                 self.assertNotIn("Traceback", err)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
+
+    def test_closed_diagnostic_pipe_does_not_strand_allocator(self):
+        with tempfile.TemporaryDirectory() as tmp, self.run_cli("cancel", tmp) as proc:
+            proc.stderr.close()
+            ready = Path(tmp) / "ready"
+            try:
+                deadline = time.monotonic() + 8
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(ready.is_file())
+                proc.send_signal(signal.SIGINT)
+                self.assertEqual(proc.wait(timeout=5), 130)
             finally:
                 if proc.poll() is None:
                     proc.kill()

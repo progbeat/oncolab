@@ -14,12 +14,16 @@ import json, os, sys, time
 from pathlib import Path
 assert sys.argv[1] == "-I" and sys.argv[2].endswith("/allocation_worker.py")
 mode = os.environ.get("TEST_ALLOCATION", "success")
+if mode == "crash":
+    print("\033[31mTraceback (most recent call last):\033[0m; secret-token", file=sys.stderr, flush=True)
+    sys.exit(2)
 if mode == "login":
     print(json.dumps({"error": "No usable Colab credentials. Run 'colab sessions' in a terminal to sign in."}), flush=True)
     sys.exit(1)
 if mode == "cancel":
-    print(json.dumps({"label": "Waiting to retry", "deadline": time.monotonic() + 40}), flush=True)
-    print(json.dumps({"error": "TEST_BACKOFF_STARTED"}), flush=True)
+    print(json.dumps({"label": "Waiting to retry…", "detail": "TEST_BACKOFF_STARTED", "deadline": time.monotonic() + 40}), flush=True)
+    if ready := os.environ.get("TEST_ALLOCATION_READY"):
+        Path(ready).touch()
     try:
         time.sleep(40)
     except KeyboardInterrupt:

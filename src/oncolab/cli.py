@@ -19,7 +19,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
-from .allocation import AllocationError, Cancellation, run_allocator
+from .allocation import AllocationError, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
@@ -44,6 +44,18 @@ def without_echo(enabled):
 
 def colab_command(store):
     return ["colab", "--config", str(store)] if store is not None else ["colab"]
+
+
+def stored_session_name(store):
+    try:
+        state = json.loads(store.read_text())
+        if isinstance(state, dict) and len(state) == 1:
+            name = next(iter(state))
+            if re.fullmatch(r"oncolab-[0-9a-f]{12}", name):
+                return name
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def allocation_hint(name, store):
@@ -107,7 +119,7 @@ def cancel_footer(echo, color):
         print_formatted_text(FormattedText([("", prefix), ("class:aborting", "[cancelled]")]),
                              file=sys.stderr, flush=True)
     else:
-        print(prefix + "[cancelled]", file=sys.stderr, flush=True)
+        write_diagnostic(prefix + "[cancelled]")
 
 
 def ssh_options(name, store=None):
@@ -555,13 +567,26 @@ def parse_args():
                           help="Request a GPU: T4, L4, G4, A100, H100 (subject to availability)")
     hardware.add_argument("--tpu", metavar="MODEL",
                           help="Request a TPU: V5E1, V6E1 (subject to availability)")
-    parser.add_argument("--attempts", type=int, default=4, metavar="N",
+    parser.add_argument("--attempts", type=int, metavar="N",
                         help="Total VM allocation attempts for temporary failures (default 4; 0 until cancelled)")
     parser.add_argument("--debug", action="store_true", help="Show internal diagnostic details")
     parser.add_argument("--high-mem", action="store_true", help="Request a high-memory VM")
     parser.add_argument("-A", "--forward-agent", action="store_true", help="Forward the local SSH agent")
     parser.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND")
     args = parser.parse_args()
+    def retry_setting(name, parse, fallback, minimum, maximum):
+        try:
+            value = parse(os.environ.get(name, fallback))
+            if not minimum <= value <= maximum:
+                raise ValueError
+            return value
+        except ValueError:
+            parser.error(f"{name} must be between {minimum} and {maximum}")
+
+    if args.attempts is None:
+        args.attempts = 1 + retry_setting("COLAB_CLI_ASSIGN_RETRIES", int, "3", 0, 10_000)
+    args.request_timeout = retry_setting("COLAB_CLI_REQUEST_TIMEOUT", float, "120", .1, 3600)
+    args.retry_backoff = retry_setting("COLAB_CLI_RETRY_BACKOFF", float, "10", 0, 120)
     if args.attempts < 0:
         parser.error("--attempts must be nonnegative")
     for option, models in (("gpu", ("T4", "L4", "G4", "A100", "H100")), ("tpu", ("V5E1", "V6E1"))):
@@ -607,12 +632,8 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
         return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
         # After SSH takes ownership, the existing remote teardown owns release.
-        if name is None and store.is_file():
-            # SIGINT may land between the allocator restoring the signal
-            # handler and the caller storing its successful return value.
-            saved = json.loads(store.read_text())
-            if len(saved) == 1:
-                name = next(iter(saved))
+        # SIGINT can land before the caller receives the allocation result.
+        name = name or stored_session_name(store)
         if name and not attempted.is_set():
             previous = signal(SIGINT, SIG_IGN)
             try:
@@ -629,6 +650,7 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
         print("oncolab: Unexpected internal error. Use --debug for details.", file=sys.stderr)
         if args.debug:
             debug_internal(exc)
+    name = name or stored_session_name(store)
     if name and not attempted.is_set():
         release(name, terminal, color, store)
     elif name:

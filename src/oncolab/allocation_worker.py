@@ -64,8 +64,9 @@ def credential_session(auth, authorized_session):
 
 
 class Allocation:
-    def __init__(self, session, accelerator, variant, high_mem):
+    def __init__(self, session, accelerator, variant, high_mem, request_timeout=120):
         self.session = session
+        self.request_timeout = request_timeout
         self.params = {"nbh": str(uuid4()).replace("-", "_").ljust(44, "."),
                        "variant": variant, "accelerator": accelerator}
         if high_mem and accelerator not in {"L4", "V5E1", "V6E1"}:
@@ -74,10 +75,11 @@ class Allocation:
         self.endpoint = None
         self.uncertain = False
 
-    def request(self, method, path, *, params=None, token=None, timeout=12):
+    def request(self, method, path, *, params=None, token=None, timeout=None):
         from google.auth.exceptions import RefreshError, TransportError
         from requests.exceptions import ConnectionError, Timeout
 
+        timeout = self.request_timeout if timeout is None else timeout
         headers = {"Accept": "application/json", "X-Colab-Client-Agent": "colab-cli"}
         if token:
             headers["X-Goog-Colab-Token"] = token
@@ -113,7 +115,7 @@ class Allocation:
                           uncertain=method == "POST") from None
         return data
 
-    def lookup(self, timeout=12):
+    def lookup(self, timeout=None):
         data = self.request("GET", "/assign", params=self.params, timeout=timeout)
         endpoint = data.get("endpoint")
         if endpoint is not None:
@@ -143,7 +145,7 @@ class Allocation:
         self.endpoint = endpoint
         return data
 
-    def run(self, attempts):
+    def run(self, attempts, backoff=10):
         number = 0
         while True:
             number += 1
@@ -154,7 +156,7 @@ class Allocation:
             except Failure as exc:
                 if not exc.retry or (attempts and number >= attempts):
                     raise
-                delay = max(exc.delay, min(30, 2 ** min(number + 1, 5)))
+                delay = max(exc.delay, min(120, backoff * 2 ** min(number - 1, 16)))
                 emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay)
                 sleep(delay)
 
@@ -163,14 +165,17 @@ class Allocation:
             return
         emit(label="Checking for an allocated Colab VM…")
         if not self.endpoint:
-            for _ in range(2):
+            # Allow late allocation to become visible, then reserve time
+            # for both release calls inside the supervisor's 11-second grace.
+            deadline = monotonic() + 5.5
+            while (remaining := deadline - monotonic()) > 0:
                 try:
-                    self.lookup(timeout=2)
+                    self.lookup(timeout=min(1.5, remaining))
                 except Failure:
                     pass
                 if self.endpoint:
                     break
-                sleep(.3)
+                sleep(max(0, min(.45, deadline - monotonic())))
         if not self.endpoint:
             emit(error="Could not confirm whether a VM was allocated; check 'colab sessions'.")
             return
@@ -212,13 +217,13 @@ def debug_error(exc, debug):
 
 
 def main():
-    store, name, accelerator, variant, high_mem, attempts, debug = sys.argv[1:]
+    store, name, accelerator, variant, high_mem, attempts, debug, timeout, backoff = sys.argv[1:]
     backend = None
     status = 1
     try:
         emit(label="Checking Colab sign-in…")
-        backend = Allocation(connect(), accelerator, variant, high_mem == "1")
-        result = backend.run(int(attempts))
+        backend = Allocation(connect(), accelerator, variant, high_mem == "1", float(timeout))
+        result = backend.run(int(attempts), float(backoff))
         save_session(store, name, result, backend)
         return 0
     except KeyboardInterrupt:
