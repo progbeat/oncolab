@@ -244,12 +244,20 @@ def show_remote_handoff(color):
     # Give startup diagnostics their own row even if SSH dies before
     # Python takes over. The remote runner reuses this row on success.
     columns = os.get_terminal_size(sys.stdout.fileno()).columns or 80
-    label = "○ Waiting for remote setup to start…"
-    if len(label) >= columns:
-        label = label[:max(0, columns - 2)] + "…"
+    encoding = sys.stdout.encoding or "utf-8"
+    # The union of the six dot positions used by the animated spinner.
+    marker, ellipsis = "⠿", "…"
+    try:
+        (marker + ellipsis).encode(encoding)
+    except UnicodeEncodeError:
+        marker, ellipsis = "o", "..."
+    label = f"{marker} Waiting for remote setup to start{ellipsis}"
+    width = max(1, columns - 1)
+    if len(label) > width:
+        label = label[:max(0, width - len(ellipsis))] + ellipsis[:width]
     if color:
         label = "\x1b[2;36m" + label + "\x1b[0m"
-    sys.stdout.buffer.write((label + "\n").encode(sys.stdout.encoding or "utf-8", errors="replace"))
+    sys.stdout.buffer.write((label + "\n").encode(encoding))
     sys.stdout.buffer.flush()
 
 
