@@ -71,7 +71,7 @@ class Protocol(unittest.TestCase):
               patch.object(worker, "sleep") as sleep, patch.object(worker, "emit")):
             self.assertEqual(backend.run(2), {"endpoint": "test"})
         attempt.assert_called_once()
-        sleep.assert_called_once_with(10)
+        sleep.assert_called_once_with(1)
 
     def test_auth_refresh_is_available_to_read_requests_only(self):
         credentials = object()
