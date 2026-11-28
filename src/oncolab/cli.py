@@ -88,10 +88,10 @@ def release(name, terminal, color, store=None, *, debug=False):
             details.append("  colab stop timed out")
         except OSError as exc:
             details.append(f"  {type(exc).__name__} starting colab stop")
-    write_diagnostic(f"oncolab: could not confirm release; {hint}", optional=True)
+    write_diagnostic(f"oncolab: could not confirm release; {hint}")
     if debug:
         for detail in details:
-            write_diagnostic(detail, optional=True)
+            write_diagnostic(detail)
 
 
 def allocate(args, terminal, color, store, labels):
@@ -130,11 +130,15 @@ def cancel_footer(echo, color):
         print_formatted_text(FormattedText([("", prefix), ("class:aborting", "[cancelled]")]),
                              file=sys.stderr, flush=True)
     else:
-        write_diagnostic(prefix + "[cancelled]", optional=True)
+        write_diagnostic(prefix + "[cancelled]")
 
 
 def ssh_options(name, store=None):
-    proxy = [*colab_command(store), "ssh", "--proxy-mode", "-s", name]
+    proxy = [*colab_command(store), "ssh", "--proxy-mode"]
+    if store is None:
+        proxy += ["-s", name]
+    # With a private one-entry store, let the proxy resolve its sole entry.
+    # A missing explicit name would make colab ssh auto-create another VM.
     for filename in ("id_ed25519.pub", "id_ecdsa.pub"):
         public = Path.home() / ".ssh" / filename
         if public.is_file():
@@ -416,7 +420,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         connect_options = [*identity, "-M", "-T", "-o", "ControlPersist=60",
                            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                           "-o", "ProxyCommand=" + shlex.join(proxy), *trust]
+                           "-o", "ProxyCommand=" + shlex.join(proxy).replace("%", "%%"), *trust]
         endpoint = f"{tmp}/stdin.sock" if any(source is not None for _, source in groups.values()) else None
         if ports or endpoint:
             connect_options.extend(("-o", "ExitOnForwardFailure=yes"))
@@ -511,9 +515,9 @@ def show_ssh_error(stderr, debug):
     # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
     # the staging protocol can be reported without exposing URLs or tokens.
     if stage := re.search(r"^oncolab-stage: ([A-Za-z]+)$", text, re.MULTILINE):
-        print("oncolab: Could not stage setup files on the Colab VM.", file=sys.stderr)
+        write_diagnostic("oncolab: Could not stage setup files on the Colab VM.")
         if debug:
-            print(f"oncolab: staging exception: {stage[1]}", file=sys.stderr)
+            write_diagnostic(f"oncolab: staging exception: {stage[1]}")
         return
     reasons = (
         ("Already-active SSH session", "Colab only allows one SSH connection to this VM; disconnect the other connection."),
@@ -528,20 +532,19 @@ def show_ssh_error(stderr, debug):
         ("Connection closed", "The SSH connection closed before setup started."),
     )
     hint = next((message for marker, message in reasons if marker in text), None)
-    print("oncolab: " + (hint or "SSH connection failed. Check your SSH key and Colab session."),
-          file=sys.stderr)
+    write_diagnostic("oncolab: " + (hint or "SSH connection failed. Check your SSH key and Colab session."))
     if debug:
         # Standard Python frame locations are useful without dumping source,
         # rich traceback locals, or a remote request's headers.
         for detail in safe_subprocess_details(text):
-            print(detail, file=sys.stderr)
+            write_diagnostic(detail)
 
 
 def debug_internal(exc):
     from traceback import extract_tb
-    print(type(exc).__name__, file=sys.stderr)
+    write_diagnostic(type(exc).__name__)
     for frame in extract_tb(exc.__traceback__):
-        print(f"  {Path(frame.filename).name}:{frame.lineno} in {frame.name}", file=sys.stderr)
+        write_diagnostic(f"  {Path(frame.filename).name}:{frame.lineno} in {frame.name}")
 
 
 def main():
@@ -640,7 +643,7 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
         if fallback:
             release(name, terminal, color, store, debug=args.debug)
         if attempted.is_set() and (status == 255 or status < 0):
-            print(f"oncolab: SSH status is ambiguous; {allocation_hint(name, store)}", file=sys.stderr)
+            write_diagnostic(f"oncolab: SSH status is ambiguous; {allocation_hint(name, store)}")
         return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
         # After SSH takes ownership, the existing remote teardown owns release.
@@ -653,18 +656,18 @@ def execute(args, command, config, ini, known_hosts, copies, task_groups, termin
             finally:
                 signal(SIGINT, previous)
         elif name:
-            print(f"oncolab: {allocation_hint(name, store)} if it is still running", file=sys.stderr)
+            write_diagnostic(f"oncolab: {allocation_hint(name, store)} if it is still running")
         cancel_footer(False, color)
         return 130
     except (AllocationError, OSError) as exc:
-        print(f"oncolab: {exc}", file=sys.stderr)
+        write_diagnostic(f"oncolab: {exc}")
     except Exception as exc:
-        print("oncolab: Unexpected internal error. Use --debug for details.", file=sys.stderr)
+        write_diagnostic("oncolab: Unexpected internal error. Use --debug for details.")
         if args.debug:
             debug_internal(exc)
     name = name or stored_session_name(store)
     if name and not attempted.is_set():
         release(name, terminal, color, store, debug=args.debug)
     elif name:
-        print(f"oncolab: {allocation_hint(name, store)} if it is still running", file=sys.stderr)
+        write_diagnostic(f"oncolab: {allocation_hint(name, store)} if it is still running")
     return 1

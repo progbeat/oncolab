@@ -74,7 +74,7 @@ def colab_python():
     raise AllocationError("Cannot identify the Colab CLI's Python. Install it with 'uv tool install google-colab-cli'.")
 
 
-def write_diagnostic(message, *, optional=False):
+def write_diagnostic(message):
     try:
         from io import UnsupportedOperation
         try:
@@ -83,12 +83,11 @@ def write_diagnostic(message, *, optional=False):
             print(message, file=sys.stderr, flush=True)
             return
         data = (message + "\n").encode()
-        if optional:
-            from select import select
-            if not select([], [fd], [], 0)[1]:
-                return
-            if len(data) > 512:
-                data = data[:511] + b"\n"
+        from select import select
+        if not select([], [fd], [], 0)[1]:
+            return
+        if len(data) > 512:
+            data = data[:511] + b"\n"
         os.write(fd, data)
     except (OSError, ValueError):
         # The user may close a diagnostic pipeline while the worker is alive.
@@ -172,7 +171,7 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, live, budget):
                     label.state = (message, event.get("detail", ""), deadline)
                     hard_deadline = (deadline or monotonic()) + budget
                     if not live and message == WAITING:
-                        write_diagnostic(f"oncolab: {message} {label.detail()}", optional=True)
+                        write_diagnostic(f"oncolab: {message} {label.detail()}")
                 if message := event.get("error"):
                     explained = True
                     diagnostics.append(f"oncolab: {message}")
@@ -214,7 +213,7 @@ def run_allocator(args, store, name, terminal, color, cancellation, labels):
         for message in diagnostics:
             # A signal can arrive between this call and os.write. Never
             # block here while the allocation handler is still installed.
-            write_diagnostic(message, optional=True)
+            write_diagnostic(message)
     if status == 0 and not store.is_file():
         raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
     return status

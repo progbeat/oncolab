@@ -25,6 +25,8 @@ argv = sys.argv[1:]
 if "-O" in argv:
     raise SystemExit(0)
 if "-M" in argv:
+    if os.environ.get("TEST_SSH_FAILURE"):
+        raise SystemExit(255)
     assert not sys.stdin.buffer.read(), "SSH bootstrap consumed payload stdin"
     raise SystemExit(0)
 if "-T" in argv:
@@ -52,6 +54,22 @@ print("PTY_ROUND_TRIP_OK")
                                     capture_output=True, timeout=12)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, data)
+
+    def test_failed_ssh_releases_vm_even_when_stderr_is_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oncolab, env = self.fake_commands(root)
+            released = root / "released"
+            env.update(TEST_SSH_FAILURE="1", TEST_RELEASE_MARKER=str(released))
+            reader, writer = os.pipe()
+            os.close(reader)
+            try:
+                result = subprocess.run([oncolab, "--", "true"], env=env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=writer, timeout=8)
+            finally:
+                os.close(writer)
+            self.assertEqual(result.returncode, 255)
+            self.assertTrue(released.is_file())
 
     def test_command_traceback_passes_through(self):
         with tempfile.TemporaryDirectory() as tmp:

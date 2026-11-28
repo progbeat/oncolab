@@ -12,6 +12,12 @@ def fake_colab(root):
     (root / "allocator.py").write_text("""
 import json, os, sys, time
 from pathlib import Path
+if Path(sys.argv[1]).name == "colab":
+    del sys.argv[1]
+if sys.argv[1:2] == ["--config"] and sys.argv[3:4] == ["stop"]:
+    Path(os.environ["TEST_RELEASE_MARKER"]).touch()
+    print("[colab] Session terminated.")
+    sys.exit(0)
 assert sys.argv[1] == "-I" and sys.argv[2].endswith("/allocation_worker.py")
 mode = os.environ.get("TEST_ALLOCATION", "success")
 if mode == "crash":
@@ -34,5 +40,5 @@ store, name = sys.argv[3:5]
 Path(store).write_text(json.dumps({name: {}}))
 """)
     colab = root / "colab"
-    colab.write_text(f"#!{launcher}\n")
+    colab.write_text("#!/bin/sh\n" + "'''exec' " + shlex.quote(str(launcher)) + ' "$0" "$@"\n' + "' '''\n")
     colab.chmod(0o755)

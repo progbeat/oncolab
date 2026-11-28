@@ -25,6 +25,40 @@ class Protocol(unittest.TestCase):
         hidden_login.assert_not_called()
         self.assertIs(auth._run_remote_flow, hidden_login)
 
+    def test_expired_credentials_with_transient_refresh_failure_are_retried(self):
+        class RefreshError(Exception):
+            retryable = True
+
+        class Credentials:
+            def refresh(self, request):
+                raise RefreshError()
+
+        refresh = Credentials.refresh
+        auth = SimpleNamespace(Credentials=Credentials, _run_remote_flow=Mock())
+
+        def load():
+            try:
+                Credentials().refresh(None)
+            except RefreshError:
+                return auth._run_remote_flow({})
+            self.fail("refresh should fail")
+
+        auth.get_credentials = load
+        backend = worker.Allocation(None, "NONE", "DEFAULT", False, authenticate=Mock(side_effect=[
+            worker.Failure("transient", retry=True),
+            (None, None),
+        ]))
+        with self.assertRaisesRegex(worker.Failure, "sign-in service is temporarily unavailable") as observed:
+            worker.credential_session(auth, Mock(), RefreshError)
+        self.assertTrue(observed.exception.retry)
+        self.assertIs(Credentials.refresh, refresh)
+        backend.authenticate.side_effect = [observed.exception, (None, None)]
+        with (patch.object(backend, "attempt", return_value={"endpoint": "test"}) as attempt,
+              patch.object(worker, "sleep") as sleep, patch.object(worker, "emit")):
+            self.assertEqual(backend.run(2), {"endpoint": "test"})
+        attempt.assert_called_once()
+        sleep.assert_called_once_with(10)
+
     def test_auth_refresh_is_available_to_read_requests_only(self):
         credentials = object()
         auth = SimpleNamespace(_run_remote_flow=Mock(),
@@ -38,8 +72,9 @@ class Protocol(unittest.TestCase):
     def test_wire_parameters_and_http_errors(self):
         class NetworkException(Exception):
             pass
-        exceptions = SimpleNamespace(RefreshError=type("RefreshError", (Exception,), {}),
-                                     TransportError=NetworkException)
+        class RefreshError(Exception):
+            retryable = True
+        exceptions = SimpleNamespace(RefreshError=RefreshError, TransportError=NetworkException)
         class TruncatedResponse(Exception):
             pass
         class CertificateError(ConnectionError):
@@ -58,6 +93,7 @@ class Protocol(unittest.TestCase):
                 TruncatedResponse(),
                 CertificateError("certificate verify failed"),
                 ProxyError("Tunnel connection failed: 407 Proxy Authentication Required"),
+                RefreshError("temporary identity backend error"),
             ]
             backend = worker.Allocation(session, "T4", "GPU", True)
             with self.assertRaises(worker.Failure) as refusal:
@@ -82,6 +118,10 @@ class Protocol(unittest.TestCase):
                 with self.assertRaisesRegex(worker.Failure, hint) as refusal:
                     backend.request("POST", "/assign")
                 self.assertFalse(refusal.exception.retry)
+
+            with self.assertRaisesRegex(worker.Failure, "sign-in service is temporarily unavailable") as refusal:
+                backend.request("GET", "/assign")
+            self.assertTrue(refusal.exception.retry)
 
     def test_uncertain_post_reconciles_same_id_before_retry(self):
         backend = worker.Allocation(None, "A100", "GPU", True)
@@ -133,6 +173,16 @@ class Protocol(unittest.TestCase):
         self.assertEqual([c.args for c in request.call_args_list],
                          [("GET", "/assign")] * 3 + [("GET", "/unassign/own-vm"), ("POST", "/unassign/own-vm")])
 
+
+    def test_cancellation_does_not_reconcile_before_server_holdoff(self):
+        backend = worker.Allocation(None, "NONE", "DEFAULT", False)
+        backend.uncertain = True
+        backend.reconcile_after = 280
+        with (patch.object(worker, "monotonic", return_value=100),
+              patch.object(backend, "lookup") as lookup, patch.object(worker, "emit") as emit):
+            backend.cleanup()
+        lookup.assert_not_called()
+        self.assertIn("check 'colab sessions'", emit.call_args.kwargs["error"])
 
     def test_cleanup_is_armed_before_reporting_a_failed_post(self):
         backend = Mock()

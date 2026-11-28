@@ -45,21 +45,46 @@ def retry_after(value):
 def connect():
     try:
         from colab_cli import auth
+        from google.auth.exceptions import RefreshError, TransportError
         from google.auth.transport.requests import AuthorizedSession
     except ImportError:
         raise Failure("Cannot load Colab CLI authentication. Install or update 'google-colab-cli' with uv.") from None
 
-    return credential_session(auth, AuthorizedSession)
+    return credential_session(auth, AuthorizedSession, RefreshError, TransportError)
 
 
-def credential_session(auth, authorized_session):
+def identity_unavailable():
+    return Failure("Colab sign-in service is temporarily unavailable", retry=True,
+                   detail="sign-in service unavailable")
+
+
+def credential_session(auth, authorized_session, refresh_error=(), transport_error=()):
+    temporary_failure = False
+
     def need_login(*args, **kwargs):
-        raise Failure(LOGIN)
+        raise identity_unavailable() if temporary_failure else Failure(LOGIN)
 
-    # Reuse keyring lookup and refresh, but never hide an interactive sign-in
-    # behind the allocator display or read the user's command stdin.
+    # Colab catches failures refreshing expired cached credentials before
+    # calling its login flow. Preserve a transient failure, without asking
+    # for input or rewriting its credential/keyring implementation.
+    credential_type = getattr(auth, "Credentials", None)
+    refresh = getattr(credential_type, "refresh", None)
+
+    def observe_refresh(credentials, request):
+        nonlocal temporary_failure
+        try:
+            return refresh(credentials, request)
+        except refresh_error as exc:
+            temporary_failure = exc.retryable
+            raise
+        except transport_error:
+            temporary_failure = True
+            raise
+
     original = auth._run_remote_flow
     auth._run_remote_flow = need_login
+    if refresh is not None:
+        credential_type.refresh = observe_refresh
     try:
         session = auth.get_credentials()
         # Lookup GETs can refresh and resend authentication just as colab
@@ -67,11 +92,15 @@ def credential_session(auth, authorized_session):
         return session, authorized_session(session.credentials, max_refresh_attempts=0)
     finally:
         auth._run_remote_flow = original
+        if refresh is not None:
+            credential_type.refresh = refresh
 
 
 class Allocation:
-    def __init__(self, session, accelerator, variant, high_mem, request_timeout=120, *, write_session=None):
+    def __init__(self, session, accelerator, variant, high_mem, request_timeout=120, *,
+                 write_session=None, authenticate=None):
         self.session = session
+        self.authenticate = authenticate
         self.write_session = session if write_session is None else write_session
         self.request_timeout = request_timeout
         self.params = {"nbh": str(uuid4()).replace("-", "_").ljust(44, "."),
@@ -81,6 +110,7 @@ class Allocation:
         self.target = accelerator if variant != "DEFAULT" else ("CPU High-RAM" if high_mem else "CPU")
         self.endpoint = None
         self.uncertain = False
+        self.reconcile_after = 0
 
     def request(self, method, path, *, params=None, token=None, timeout=None):
         from google.auth.exceptions import RefreshError, TransportError
@@ -95,7 +125,11 @@ class Allocation:
             response = transport.request(method, API + path, params={"authuser": "0", **(params or {})}, headers=headers,
                                             timeout=(min(4, timeout), timeout), max_allowed_time=timeout,
                                             allow_redirects=False)
-        except RefreshError:
+        except RefreshError as exc:
+            if exc.retryable:
+                failure = identity_unavailable()
+                failure.uncertain = method == "POST"
+                raise failure from None
             raise Failure(LOGIN, uncertain=method == "POST") from None
         except SSLError:
             raise Failure("Could not establish secure TLS with Colab; check the trusted certificates.",
@@ -117,6 +151,8 @@ class Allocation:
                 reason = f"Colab rejected {self.params['accelerator']}; try another accelerator or omit --gpu/--tpu"
             retry_details = {502: "502 gateway error", 503: "503 unavailable", 504: "504 gateway timeout"}
             delay = retry_after(response.headers.get("Retry-After", ""))
+            if path == "/assign" and delay and (code in retry_details or code == 429):
+                self.reconcile_after = max(self.reconcile_after, monotonic() + delay)
             if not math.isfinite(delay):
                 raise Failure(f"HTTP {code}: {reason}; server holdoff is too large to schedule",
                               uncertain=method == "POST" and code >= 500)
@@ -172,8 +208,12 @@ class Allocation:
         while True:
             number += 1
             count = f"{number}/{attempts}" if attempts else str(number)
-            emit(label="Creating Colab VM…", detail=f"{self.target} · attempt {count}")
             try:
+                if self.authenticate is not None:
+                    emit(label="Checking Colab sign-in…", detail=f"attempt {count}")
+                    self.session, self.write_session = self.authenticate()
+                    self.authenticate = None
+                emit(label="Creating Colab VM…", detail=f"{self.target} · attempt {count}")
                 return self.attempt()
             except Failure as exc:
                 if not exc.retry or (attempts and (number >= attempts or exc.delay > 120)):
@@ -195,6 +235,12 @@ class Allocation:
             # for both release calls inside the supervisor's 11-second grace.
             deadline = monotonic() + 5.5
             while (remaining := deadline - monotonic()) > 0:
+                holdoff = self.reconcile_after - monotonic()
+                if holdoff >= remaining:
+                    break
+                if holdoff > 0:
+                    sleep(holdoff)
+                    continue
                 try:
                     self.lookup(timeout=min(1.5, remaining))
                 except Failure:
@@ -250,10 +296,8 @@ def main():
     status = 1
     try:
         try:
-            emit(label="Checking Colab sign-in…")
-            read_session, write_session = connect()
-            backend = Allocation(read_session, accelerator, variant, high_mem == "1", float(timeout),
-                                 write_session=write_session)
+            backend = Allocation(None, accelerator, variant, high_mem == "1", float(timeout),
+                                 authenticate=connect)
             result = backend.run(int(attempts), float(backoff))
             save_session(store, name, result, backend)
             status = 0
