@@ -3,6 +3,7 @@ import asyncio
 import base64
 import inspect
 import json
+import math
 import os
 import re
 import secrets
@@ -520,12 +521,19 @@ def read_setup_summary(path, stop, labels, color):
                         return
                     if buffer.endswith(b"\n"):
                         rows = json.loads(buffer)
+                        if not isinstance(rows, list) or any(
+                            not isinstance(row, list) or len(row) != 4 or row[0] not in (0, 2)
+                            or not isinstance(row[1], str)
+                            or any(type(n) not in (int, float) or not math.isfinite(n) for n in row[2:])
+                            or row[2] > row[3] for row in rows
+                        ):
+                            return
                         try:
                             completed_steps(rows, labels, color)
                         finally:
                             peer.sendall(b"1")
                         return
-        except (OSError, ValueError):
+        except (OSError, OverflowError, ValueError):
             pass
         stop.wait(.12)
 
@@ -892,18 +900,20 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             return status, False
         finally:
             summary_stop.set()
-            if summary_reader is not None:
-                summary_reader.join(.3)
             try:
                 close_master()
             finally:
-                if owner is not None:
-                    try:
-                        owner.wait(timeout=5)
-                    except sp.TimeoutExpired:
-                        owner.kill()
-                        owner.wait()
-                    owner.stdout.close()
+                try:
+                    if owner is not None:
+                        try:
+                            owner.wait(timeout=5)
+                        except sp.TimeoutExpired:
+                            owner.kill()
+                            owner.wait()
+                        owner.stdout.close()
+                finally:
+                    if summary_reader is not None:
+                        summary_reader.join(.3)
 
 
 def ssh_transport_error(log):
