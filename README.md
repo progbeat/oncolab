@@ -88,7 +88,7 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   does not hold your command's input open for a hidden login prompt.
 - Creating a VM can take several attempts. The progress view shows the requested runtime and
   current attempt both during allocation and while waiting to retry. The wait also shows a
-  countdown and reason. Timers use one decimal and switch from seconds to minutes, hours, and
+  countdown and reason, with the reason highlighted in yellow on color terminals. Timers use one decimal and switch from seconds to minutes, hours, and
   days as they grow. Use
   `--attempts N` to set the total (default 4), `--attempts 1` to disable retries, or
   `--attempts 0` to keep retrying transient failures until Ctrl+C. A rejected accelerator, session limit, or rate limit ends that run with a
@@ -99,6 +99,8 @@ Pass `--config path/to/profile.toml`, or save your default profile as
   waits for that holdoff to finish or for Ctrl+C. The existing `COLAB_CLI_REQUEST_TIMEOUT`,
   `COLAB_CLI_RETRY_BACKOFF`, and `COLAB_CLI_ASSIGN_RETRIES` environment settings still apply;
   `--attempts` overrides the last one.
+- Eligible setup steps can start while the Drive configuration is still transferring. The command
+  uses its own channel on the same SSH connection and starts only once setup is ready.
 - Interactive preparation is transient and disappears before the command starts. If OpenSSH may
   need a key passphrase or password, it owns the terminal during authentication. With redirected
   stdout there is no live display. After allocation, SSH connection failures without a definite

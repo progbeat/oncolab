@@ -129,6 +129,8 @@ print("READY_FOR_COMMAND")
                 self.assertRegex(" ".join(lines[start:end + 1]),
                                  r"^CPU High-RAM · attempt 2/4 · 10\.\ds · Colab request timed out "
                                  r"while checking the requested accelerator$")
+                self.assertRegex(rendered, rb"\x1b\[(?:0;)?33mColab")
+                self.assertNotRegex(rendered, rb"\x1b\[(?:0;)?33mCPU")
                 # The terminal gets only changed cells in later frames.
                 self.assertRegex(plain, r"9\.\ds\b")
                 self.assertRegex(plain, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Waiting to retry…[^\r\n]*\d\.\ds")

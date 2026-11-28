@@ -27,6 +27,9 @@ if "-M" in args:
         if option == "-L" and args[i+1].startswith("/"):
             local, remote = args[i+1].split(":", 1)
             os.symlink(remote.replace("/dev/shm/oncolab-", ram), local)
+    if "-N" in args:
+        assert not sys.stdin.buffer.read()
+        raise SystemExit(0)
     # The bootstrap's private JSON also contains the remote directory paths.
     import subprocess
     data = sys.stdin.buffer.read().replace(b"/dev/shm/oncolab-", os.fsencode(ram))
@@ -50,12 +53,11 @@ class Showcase(unittest.TestCase):
         self.assertIsNotNone(executable)
         with tempfile.TemporaryDirectory(prefix="oc-e2e-", dir="/tmp") as directory:
             root = Path(directory).resolve()
-            if streamed:
-                try:
-                    with socket.socket(socket.AF_UNIX) as probe:
-                        probe.bind(str(root / "probe"))
-                except PermissionError:
-                    self.skipTest("sandbox does not allow Unix sockets")
+            try:
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.bind(str(root / "probe"))
+            except PermissionError:
+                self.skipTest("sandbox does not allow Unix sockets")
             work, fake_ram = root / "vm", root / "ram"
             fake_ram.mkdir()
             fake_colab(root)

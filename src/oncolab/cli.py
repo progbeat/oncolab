@@ -12,16 +12,16 @@ import subprocess as sp
 import sys
 import termios
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
 from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
-from time import monotonic
+from time import monotonic, sleep
 
-from . import diagnostics
+from . import diagnostics, ssh_pipeline
 from .allocation import AllocationError, AllocationLabel, Cancellation, run_allocator, write_diagnostic
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
@@ -269,6 +269,38 @@ def show_remote_handoff(color):
     sys.stdout.buffer.flush()
 
 
+def erase_remote_handoff():
+    sys.stdout.write("\x1b[A\r\x1b[K")
+    sys.stdout.flush()
+
+
+def session_open_refused(log):
+    # OpenSSH reports this MUX_S_FAILURE before sending the remote command.
+    # A broken pipe or missing reply does not establish that boundary.
+    return (b"master session id:" not in log and b"Received exit status from master" not in log
+            and any(re.search(rb"mux_client_request_session(?:\(\))?:.*"
+                              rb"session request failed: Session open refused by peer\s*$", line)
+                    for line in log.splitlines()))
+
+
+def call_command_ssh(argv, log_path, transfer, owner, *, on_wait_cancel=None):
+    for pause in (1, 2, None):
+        log_path.unlink(missing_ok=True)
+        status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+        log = log_tail(log_path) if status == 255 else b""
+        refused = session_open_refused(log)
+        if not refused or owner is None or pause is None or owner.poll() is not None:
+            return status, log, refused
+        try:
+            sleep(pause)
+        except KeyboardInterrupt:
+            if on_wait_cancel:
+                on_wait_cancel()
+            raise
+        if owner.poll() is not None:
+            return status, log, refused
+
+
 def upload_stream(endpoint, key, source):
     # Unlike an SSH exec channel, each streamlocal forward is not counted
     # against MaxSessions. Keep data off the control channel and payload stdin.
@@ -430,13 +462,55 @@ def log_tail(path):
         return b""
 
 
+def feed_staging(stream, data):
+    with stream:
+        try:
+            stream.write(data)
+        except BrokenPipeError:
+            pass
+
+
+async def wait_setup_listener(process):
+    loop = asyncio.get_running_loop()
+    fd = process.stdout.fileno()
+    pending = loop.create_future()
+    partial = b""
+
+    def read():
+        nonlocal partial
+        if pending.done():
+            return
+        try:
+            data = os.read(fd, 65536)
+            if not data:
+                pending.set_result(False)
+            else:
+                partial += data
+                if ssh_pipeline.SETUP_LISTENING in partial.splitlines(keepends=True):
+                    pending.set_result(True)
+                elif len(partial) > 65536:
+                    pending.set_result(False)
+        except OSError as exc:
+            pending.set_exception(exc)
+
+    loop.add_reader(fd, read)
+    try:
+        return await pending
+    finally:
+        loop.remove_reader(fd)
+
+
+def embedded_gate(protocol, render_source):
+    return "\n".join((*render_source, protocol, "raise SystemExit(command_gate_main(progress))"))
+
+
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
                 copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None):
     proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
-    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", inspect.getsource(format_duration),
-                        inspect.getsource(progress), inspect.getsource(diagnostics),
+    render_source = (inspect.getsource(format_duration), inspect.getsource(progress))
+    remote = "\n".join((f"_ONCOLAB_DEBUG = {debug!r}", *render_source, inspect.getsource(diagnostics),
                         files("oncolab").joinpath("remote.py").read_text()))
     jobdir = drive_stage + "-job"
     result = jobdir + "/copy-result"
@@ -481,27 +555,51 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             config["setup"][task]["stdin_result"] = f"{directory}/copy-result"
             groups[key] = ((), source)
     # The bootstrap channel must never read the command's stdin.
-    encoded_staging = {
-        directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
-                    for name, value in entries.items()}
-        for directory, entries in staging.items()
-    }
-    if unclaimed:
-        # A previous attempt may have lost its acknowledgement after writing
-        # credentials. Retry with fresh names and scrub only those old names.
-        staged_input = json.dumps([sorted(unclaimed), encoded_staging]).encode()
-    else:
-        staged_input = json.dumps(encoded_staging).encode() if staging else b""
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
     config.update(debug=debug, progress_labels=labels, recovery_hint=allocation_hint(name, store))
     if live_payload:
         config["terminal_handoff"] = STARTING_RUNNER
-    payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
-                          str(int(color)), json.dumps(config), *command])
+    parallel = os.environ.get("ONCOLAB_PARALLEL_SETUP", "1") == "1"
+    python = ["uv", "run", "--no-project", "python3", "-c"]
+    owner_code = None
+    if parallel:
+        control = drive_stage + "-gate/control.sock"
+        protocol = files("oncolab").joinpath("ssh_pipeline.py").read_text()
+        remote = protocol + "\n" + remote
+        gate_code = embedded_gate(protocol, render_source)
+        command_plan = {key: config[key] for key in ("terminal_handoff", "progress_labels", "recovery_hint") if key in config}
+        command_plan.update(pipeline_role="command")
+        payload = shlex.join([*python, gate_code, control, str(int(color)), json.dumps(command_plan),
+                              *config["entrypoint"], *command])
+        config.pop("terminal_handoff", None)
+        config.update(pipeline_role="setup", pipeline_control=control,
+                      pipeline_dirs={path: {name: value for name, value in entries.items()
+                                           if name not in ("env.json", "rclone.conf")}
+                                     for path, entries in staging.items()})
+        owner_code = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config)])
+        staged_input = ssh_pipeline.packet(env, command_env)
+        if rclone_ini is not None:
+            data = rclone_ini.encode() if isinstance(rclone_ini, str) else rclone_ini
+            staged_input += (json.dumps(base64.b64encode(data).decode()) + "\n").encode()
+    else:
+        encoded_staging = {
+            directory: {name: base64.b64encode(value.encode() if isinstance(value, str) else value).decode("ascii")
+                        for name, value in entries.items()}
+            for directory, entries in staging.items()
+        }
+        if unclaimed:
+            # A previous attempt can lose its acknowledgement after writing
+            # credentials. Scrub only the old unclaimed paths.
+            staged_input = json.dumps([sorted(unclaimed), encoded_staging]).encode()
+        else:
+            staged_input = json.dumps(encoded_staging).encode() if staging else b""
+        payload = shlex.join([*python, remote, drive_stage, str(int(color)), json.dumps(config), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
-    with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
+    with (TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp,
+          ThreadPoolExecutor(3 if parallel else 2) as transfers,
+          (TemporaryFile() if parallel else nullcontext()) as owner_errors):
         ssh = ["ssh", "-F", os.devnull, "-S", f"{tmp}/ssh", "-o", "LogLevel=ERROR", "-A" if forward else "-a"]
         # ControlPersist can hide ProxyCommand stderr before SSH exits,
         # including Colab's definitive authentication diagnostics.
@@ -537,8 +635,11 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             connect_options.extend(("-o", "BatchMode=yes"))
         pending = [f"{directory}/{file}" for directory, file in
                    ((drive_stage, "rclone.conf"), (jobdir, "env.json")) if file in staging.get(directory, {})]
+        if parallel:
+            pending = []  # The setup owner directly claims its staged files.
         master_closed = False
         bootstrap_ready = False
+        owner = None
 
         def close_master():
             nonlocal master_closed
@@ -571,6 +672,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         stage = shlex.join(["python3", "-c", STAGE]) if staged_input else "true"
 
         async def connect():
+            # Authenticate without dispatching a runner in parallel mode.
+            # A failed connection is then safe to retry on the same VM.
+            if parallel:
+                return await bootstrap_ssh([*ssh, *connect_options, "-N", "-f", target], b"")
             return await bootstrap_ssh([*ssh, *connect_options, target, stage], staged_input)
 
         try:
@@ -582,19 +687,56 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                 diagnostic = (connected.stderr or b"") + b"\n" + log_tail(proxy_log)
                 failure = SSHBootstrapError(connected.returncode, diagnostic)
                 if failure.rejected:
-                    # Authentication, trust and local forwarding errors happen
-                    # before SSH can send the stage command.
                     pending.clear()
                 raise failure
-            # The proxy stays alive for the mux; its private diagnostics are
-            # not needed after the authenticated bootstrap succeeded.
             with suppress(OSError):
                 proxy_log.unlink(missing_ok=True)
             bootstrap_ready = True
-            if unclaimed is not None:
+            if unclaimed is not None and not parallel:
                 unclaimed.clear()
             if live_payload:
                 show_remote_handoff(color)
+            if parallel:
+                # Keep the status visible while the first exec publishes its
+                # socket. Setup and config upload then overlap the second exec.
+                owner_log = Path(tmp) / "owner-ssh.log"
+                attempted.set()
+                try:
+                    owner = sp.Popen(
+                        [*ssh, "-E", str(owner_log), "-T", "-o", "ProxyCommand=false",
+                         "-o", "ControlMaster=no", target, owner_code],
+                        stdin=sp.PIPE, stdout=sp.PIPE, stderr=owner_errors,
+                    )
+                except OSError:
+                    attempted.clear()
+                    if live_payload:
+                        erase_remote_handoff()
+                    raise
+                transfers.submit(feed_staging, owner.stdin, staged_input)
+
+                async def wait_owner():
+                    return await asyncio.wait_for(wait_setup_listener(owner), timeout=45)
+
+                try:
+                    ready = asyncio.run(wait_owner())
+                except TimeoutError:
+                    ready = False
+                except KeyboardInterrupt:
+                    if live_payload:
+                        erase_remote_handoff()
+                    raise
+                if not ready:
+                    if live_payload:
+                        erase_remote_handoff()
+                    log = log_tail(owner_log)
+                    status = owner.poll() or 255
+                    if session_open_refused(log):
+                        attempted.clear()
+                        raise SSHBootstrapError(status, log)
+                    owner_errors.seek(0)
+                    errors = owner_errors.read(16_384)
+                    show_ssh_error(log or errors, debug, recovery=allocation_hint(name, store))
+                    return status, False
             # No replay after dispatch becomes possible: a lost mux response
             # does not establish whether the remote runner launched.
             attempted.set()
@@ -610,10 +752,32 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                                   "-o", "LogVerbose=*:mux_client_request_session():*"]
             argv = [*ssh, *mux_status_logging, "-E", str(ssh_log), "-o", "ProxyCommand=false",
                     "-o", "ControlMaster=no", tty, target, payload]
-            status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+            status, ssh_error, refused = call_command_ssh(
+                argv, ssh_log, transfer, owner, on_wait_cancel=erase_remote_handoff if live_payload else None,
+            )
+            if live_payload and refused:
+                erase_remote_handoff()
             if status == 255:
-                if error := ssh_transport_error(log_tail(ssh_log)):
+                if error := ssh_transport_error(ssh_error):
                     show_ssh_error(error, debug, recovery=allocation_hint(name, store))
+            if owner is not None:
+                try:
+                    # A rejected payload can't join the gate. Let the owner
+                    # time out and clean up before closing its transport.
+                    owner_status = owner.wait(timeout=25 if refused else 2)
+                except sp.TimeoutExpired:
+                    owner_status = None
+                if owner_status != status:
+                    write_diagnostic(outcome("SSH setup outcome unconfirmed",
+                                             allocation_hint(name, store) + ".", color=color))
+                    status = status or 125
+            if owner is not None and status:
+                # The runner can fail before the display channel connects.
+                # Never replay raw first-channel ProxyCommand diagnostics.
+                owner_errors.seek(0)
+                for line in owner_errors.read(16_384).decode(errors="replace").splitlines():
+                    if line.startswith(("[Remote preparation failed]", "[oncolab failed]", "[Check VM state]")):
+                        write_diagnostic(line)
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
@@ -634,7 +798,16 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     status = status or 1
             return status, False
         finally:
-            close_master()
+            try:
+                close_master()
+            finally:
+                if owner is not None:
+                    try:
+                        owner.wait(timeout=5)
+                    except sp.TimeoutExpired:
+                        owner.kill()
+                        owner.wait()
+                    owner.stdout.close()
 
 
 def ssh_transport_error(log):
@@ -701,6 +874,7 @@ def ssh_failure_reason(text):
         ("Connection refused", "SSH connection was refused."),
         ("Connection reset", "The SSH connection was reset."),
         ("Connection closed", "The SSH connection closed."),
+        ("Session open refused by peer", "The VM refused to open the SSH command channel."),
         ("mux_client_request_session:", "The SSH session could not be opened."),
         ("mux_client_request_session():", "The SSH session could not be opened."),
         ("mux_client_read_packet:", "The SSH connection closed."),

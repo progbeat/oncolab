@@ -347,6 +347,7 @@ target = "/mnt/work"
             self.assertIn("loop", stderr.getvalue())
             allocate.assert_not_called()
 
+    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
     def test_ambiguous_ssh_recovery_removes_only_pending_before_closing_master(self):
         for cleanup_status in (0, 255):
             with self.subTest(cleanup_status=cleanup_status):
@@ -380,6 +381,7 @@ target = "/mnt/work"
                 self.assertEqual(operations[1:], ["recover", "close"])
                 self.assertEqual("Could not confirm cleanup" in stderr.getvalue(), bool(cleanup_status))
 
+    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
     def test_reconnecting_reclaims_staging_from_previous_unconfirmed_attempt(self):
         attempts = []
 
@@ -439,6 +441,7 @@ target = "/mnt/work"
                     self.assertNotIn("Traceback", stderr.getvalue())
                     allocate.assert_not_called()
 
+    @patch.dict(os.environ, {"ONCOLAB_PARALLEL_SETUP": "0"})
     def test_whole_default_rclone_config_uses_only_private_bootstrap_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

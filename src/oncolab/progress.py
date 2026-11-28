@@ -98,27 +98,30 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
             timer = Timer()
             active_label = ActiveLabel()
 
-            def detail_text(progress_bar):
+            def detail_parts(progress_bar):
                 for counter in progress_bar.counters:
+                    if parts := getattr(counter.label, "detail_parts", None):
+                        return parts()
                     if detail := getattr(counter.label, "detail", None):
-                        return detail()
-                return ""
+                        return [("class:label", detail())]
+                return []
 
             def detail_inline(progress_bar, detail):
                 remaining = (output.get_size().columns - 3 - 2
                              - active_label.get_width(progress_bar).preferred
                              - timer.get_width(progress_bar).preferred)
-                return detail and get_cwidth(detail) + 2 <= remaining
+                cells = sum(get_cwidth(value) for _, value in detail)
+                return cells and cells + 2 <= remaining
 
             class Details(Formatter):
                 def get_width(self, progress_bar):
-                    if detail_inline(progress_bar, detail_text(progress_bar)):
+                    if detail_inline(progress_bar, detail_parts(progress_bar)):
                         return Dimension(min=0, weight=1)
                     return Dimension.exact(0)
 
                 def format(self, progress_bar, counter, width):
-                    detail = detail_text(progress_bar)
-                    return [("class:label", clipped("  " + detail, width))] if width else []
+                    parts = detail_parts(progress_bar)
+                    return [("class:label", "  "), *parts] if width else []
 
             class PreparationBar(ProgressBar):
                 @property
@@ -144,19 +147,31 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                         application.layout.container = HSplit([details, application.layout.container])
 
                 def wrapped_detail(self):
-                    detail = detail_text(self)
+                    detail = detail_parts(self)
                     if not detail or detail_inline(self, detail):
                         return []
                     width = max(1, output.get_size().columns - 1)
-                    lines = [""]
-                    for word in detail.split():
-                        line = lines[-1]
-                        if line and get_cwidth(line) + 1 + get_cwidth(word) > width:
-                            lines.append(word)
-                        else:
-                            lines[-1] = f"{line} {word}" if line else word
+                    spans = []
+                    cells = 0
+                    space = False
+                    for style, value in detail:
+                        for word in value.split(" "):
+                            if not word:
+                                space = True
+                                continue
+                            length = get_cwidth(word)
+                            if cells and space:
+                                if cells + 1 + length > width:
+                                    spans.append(("class:label", "\n"))
+                                    cells = 0
+                                else:
+                                    spans.append(("class:label", " "))
+                                    cells += 1
+                            spans.append((style, word))
+                            cells += length
+                            space = True
                     # Window can wrap a single word longer than the terminal.
-                    return [("class:label", "\n".join(lines))]
+                    return spans
 
             keys = stack.enter_context(create_pipe_input())
             output = Vt100_Output.from_pty(sys.stdout)
@@ -164,7 +179,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
             bar = PreparationBar(
                 formatters=[Dots(), Text(" "), active_label,
                             *([Text("  "), timer, Details()] if timed else [])],
-                style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan"} if color else {}),
+                style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan",
+                                       "retry-reason": "ansiyellow"} if color else {}),
                 input=keys, output=output,
             )
             if idle:
@@ -183,14 +199,14 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                 width = get_cwidth(label if isinstance(label, str) else label())
                 planned_width = max(planned_width, width)
 
-        async def run(label, command):
+        async def run(label, command, *, started_at=None):
             reserve(label)
             counter = None
             if bar is not None:
                 # Publish the counter only after its monotonic timestamp is
                 # initialized; the renderer runs in its own thread.
                 counter = ProgressBarCounter(bar, None, label, not idle, None)
-                counter.started = monotonic()
+                counter.started = monotonic() if started_at is None else started_at
                 if idle and bar.counters == [waiting]:
                     bar.counters[:] = [counter]
                 else:

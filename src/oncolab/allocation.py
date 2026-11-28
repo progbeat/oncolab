@@ -16,7 +16,7 @@ from time import monotonic
 
 from .diagnostics import outcome, safe_subprocess_details
 from .duration import format_duration
-from .progress import CHECKING_LOGIN, run_step
+from .progress import CHECKING_LOGIN, WAITING, run_step
 
 CHECK = "Check 'colab sessions' for an unconfirmed VM."
 
@@ -49,9 +49,15 @@ class AllocationLabel:
         return self.state[0]
 
     def detail(self):
-        _, detail, deadline, prefix = self.state
+        return "".join(value for _, value in self.detail_parts())
+
+    def detail_parts(self):
+        label, detail, deadline, prefix = self.state
         remaining = "" if deadline is None else format_duration(deadline - monotonic(), round_up=True)
-        return " · ".join(part for part in (prefix, remaining, detail) if part)
+        plain = " · ".join(part for part in (prefix, remaining) if part)
+        if plain and detail:
+            plain += " · "
+        return [("class:label", plain), ("class:retry-reason" if label == WAITING else "class:label", detail)]
 
 
 def colab_python():

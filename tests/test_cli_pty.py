@@ -129,7 +129,7 @@ sys.argv = ["-c", stage, color, json.dumps(config), sys.executable, "-c", script
 raise SystemExit(namespace["main"]())
 ''')
         ssh.chmod(0o755)
-        env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", NO_COLOR="1",
+        env = dict(os.environ, ONCOLAB_PARALLEL_SETUP="0", PATH=f"{root}:{os.environ['PATH']}", NO_COLOR="1",
                    TERM="xterm-256color", XDG_CONFIG_HOME=str(root))
         return oncolab, env
 
