@@ -163,13 +163,13 @@ class Protocol(unittest.TestCase):
 
 
 class InstalledCLI(unittest.TestCase):
-    def run_cli(self, mode, tmp, debug=False):
+    def run_cli(self, mode, tmp, debug=False, *, stderr=subprocess.PIPE):
         fake_colab(Path(tmp))
         env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", XDG_CONFIG_HOME=tmp, TEST_ALLOCATION=mode,
                    TEST_ALLOCATION_READY=str(Path(tmp) / "ready"))
         flags = ["--debug"] if debug else []
         return subprocess.Popen([which("oncolab"), *flags, "--", "true"], env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                stdout=subprocess.PIPE, stderr=stderr, text=True)
 
     def test_noninteractive_login_fails_with_instruction(self):
         with tempfile.TemporaryDirectory() as tmp, self.run_cli("login", tmp) as proc:
@@ -221,3 +221,22 @@ class InstalledCLI(unittest.TestCase):
             finally:
                 if proc.poll() is None:
                     proc.kill()
+
+
+    def test_full_diagnostic_pipe_does_not_hold_failed_allocator(self):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(writer, False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(writer, b"x" * 4096)
+            os.set_blocking(writer, True)
+            with tempfile.TemporaryDirectory() as tmp, self.run_cli("login", tmp, stderr=writer) as proc:
+                try:
+                    self.assertEqual(proc.wait(timeout=5), 1)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+        finally:
+            os.close(reader)
+            os.close(writer)

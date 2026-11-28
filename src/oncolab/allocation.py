@@ -82,11 +82,14 @@ def write_diagnostic(message, *, optional=False):
         except (AttributeError, UnsupportedOperation):
             print(message, file=sys.stderr, flush=True)
             return
+        data = (message + "\n").encode()
         if optional:
             from select import select
             if not select([], [fd], [], 0)[1]:
                 return
-        os.write(fd, (message + "\n").encode())
+            if len(data) > 512:
+                data = data[:511] + b"\n"
+        os.write(fd, data)
     except (OSError, ValueError):
         # The user may close a diagnostic pipeline while the worker is alive.
         pass
@@ -209,7 +212,9 @@ def run_allocator(args, store, name, terminal, color, cancellation, labels):
     finally:
         # Do not write diagnostics over the live prompt-toolkit renderer.
         for message in diagnostics:
-            write_diagnostic(message, optional=cancellation.requested)
+            # A signal can arrive between this call and os.write. Never
+            # block here while the allocation handler is still installed.
+            write_diagnostic(message, optional=True)
     if status == 0 and not store.is_file():
         raise AllocationError("The Colab allocator did not store the new session. " + CHECK)
     return status
