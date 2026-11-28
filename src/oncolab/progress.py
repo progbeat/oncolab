@@ -68,12 +68,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                     remaining = output.get_size().columns - 3
                     if timed:
                         remaining -= timer.get_width(progress_bar).preferred + 2
-                    # Reserve the allocation details space for the whole
-                    # preparation plan, not just while that row is active.
-                    if labels:
-                        remaining -= min(30, max(0, (remaining + 1) // 2))
-                    available = remaining
-                    return Dimension.exact(max(1, min(planned_width, available)))
+                    return Dimension.exact(max(1, min(planned_width, remaining)))
 
                 def format(self, progress_bar, counter, width):
                     value = "".join(t for _, t, *_ in to_formatted_text(counter.label))
@@ -94,22 +89,50 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True):
                 def format(self, progress_bar, counter, width):
                     return [("class:timer", self.value(counter).rjust(width))]
 
+            timer = Timer()
+            active_label = ActiveLabel()
+
+            def detail_text(progress_bar):
+                for counter in progress_bar.counters:
+                    if detail := getattr(counter.label, "detail", None):
+                        return detail()
+                return ""
+
+            def detail_inline(progress_bar, detail):
+                remaining = (output.get_size().columns - 3 - 2
+                             - active_label.get_width(progress_bar).preferred
+                             - timer.get_width(progress_bar).preferred)
+                return detail and get_cwidth(detail) + 2 <= remaining
+
             class Details(Formatter):
                 def get_width(self, progress_bar):
-                    if any(hasattr(c.label, "detail") for c in progress_bar.counters):
+                    if detail_inline(progress_bar, detail_text(progress_bar)):
                         return Dimension(min=0, weight=1)
                     return Dimension.exact(0)
 
                 def format(self, progress_bar, counter, width):
-                    detail = getattr(counter.label, "detail", None)
-                    return [("class:label", clipped("  " + detail(), width))] if detail else []
+                    detail = detail_text(progress_bar)
+                    return [("class:label", clipped("  " + detail, width))] if width else []
 
-            timer = Timer()
+            class PreparationBar(ProgressBar):
+                @property
+                def title(self):
+                    # Wrap VM retry details onto their own line when they do
+                    # not fit, without moving the elapsed-time column.
+                    detail = detail_text(self) if timed else ""
+                    if detail and not detail_inline(self, detail):
+                        return [("class:label", clipped(detail, output.get_size().columns - 1))]
+                    return None
+
+                @title.setter
+                def title(self, value):
+                    pass  # ProgressBar initializes this field; the view derives it from the active row.
+
             keys = stack.enter_context(create_pipe_input())
             output = Vt100_Output.from_pty(sys.stdout)
             output.enable_cpr = False
-            bar = ProgressBar(
-                formatters=[Dots(), Text(" "), ActiveLabel(),
+            bar = PreparationBar(
+                formatters=[Dots(), Text(" "), active_label,
                             *([Text("  "), timer, Details()] if timed else [])],
                 style=Style.from_dict({"spinning-wheel": "ansigray", "label": "dim", "timer": "ansicyan"} if color else {}),
                 input=keys, output=output,

@@ -65,7 +65,9 @@ print("READY_FOR_COMMAND")
                 prefix = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m[1] or 1), match[0])
                 prefix = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", prefix)
                 return get_cwidth(prefix)
-            self.assertEqual(column("Waiting"), column("Short"))
+            expected_column = get_cwidth("Long planned step with 漢") + 2
+            self.assertEqual(column("Waiting"), expected_column)
+            self.assertEqual(column("Short"), expected_column)
             self.assertIn(b"503", rendered)
             self.assertRegex(rendered, rb"\x1b\[J[^\r\n]*READY_FOR_COMMAND")
         finally:

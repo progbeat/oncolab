@@ -521,20 +521,22 @@ def debug_internal(exc):
 
 
 def main():
+    args = None
     try:
-        return command_line()
+        parser, args, command = parse_args()
+        return command_line(parser, args, command)
     except KeyboardInterrupt:
         cancel_footer(False, not os.environ.get("NO_COLOR"))
         return 130
     except Exception as exc:
         # Includes failures that occur before an allocation can exist.
         print("oncolab: Unexpected internal error. Use --debug for details.", file=sys.stderr)
-        if "--debug" in sys.argv[1:]:
+        if args is not None and args.debug:
             debug_internal(exc)
         return 1
 
 
-def command_line():
+def parse_args():
     parser = argparse.ArgumentParser(description="Run a terminal command on a fresh Google Colab VM.")
     parser.add_argument("--version", action="version", version=f"oncolab {version('oncolab')}")
     parser.add_argument("--copy", action="append", default=[], metavar="LOCAL[:REMOTE]",
@@ -570,6 +572,10 @@ def command_line():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required")
+    return parser, args, command
+
+
+def command_line(parser, args, command):
     try:
         config, rclone_path, known_hosts = plan(args.config, cli_mounts=args.mount, cli_ports=args.publish)
         config["command_env"] = parse_env(args.env)
