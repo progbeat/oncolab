@@ -179,7 +179,7 @@ raise SystemExit(namespace["main"]())
                 try:
                     while time.monotonic() < deadline:
                         if not auth_answered and (root / "waiting-for-passphrase").exists():
-                            self.assertNotIn(b"Waiting for remote to start", output)
+                            self.assertNotIn(b"Waiting for remote setup to start", output)
                             os.write(fd, b"fixture phrase\n")
                             auth_answered = True
                         if not select.select([fd], [], [], .25)[0]:
@@ -193,7 +193,7 @@ raise SystemExit(namespace["main"]())
                         if not fragment:
                             break
                         output.extend(fragment)
-                        if not saw_handoff and b"Waiting for remote to start" in output:
+                        if not saw_handoff and b"Waiting for remote setup to start" in output:
                             saw_handoff = True
                             if outcome == "interrupt":
                                 # Send SIGINT only to oncolab, not SSH, to
@@ -214,17 +214,17 @@ raise SystemExit(namespace["main"]())
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
-                        self.assertIn(b"o Waiting for remote to start...\r\n", output)
+                        self.assertIn(b"o Waiting for remote setup to start...\r\n", output)
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
                     elif outcome == "failure":
-                        self.assertIn("\x1b[2;36m⠿ Waiting for remote to start…\x1b[0m\r\noops\r\n".encode(), output)
+                        self.assertIn("\x1b[37m⠿\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
                     elif outcome == "setup-failure":
                         self.assertRegex(output, rb"Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
                                                  rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")
                         self.assertNotIn(b"READY_FOR_TEST", output)
                     elif outcome == "raw":
-                        self.assertIn("⠿ Waiting for remote to start…\r\n".encode(), output)
+                        self.assertIn("⠿ Waiting for remote setup to start…\r\n".encode(), output)
                         self.assertTrue(output.endswith(b"RAW_FIRST\r\nRAW_LAST\r\n"), output)
                     else:
                         self.assertIn(b"[cancelled]", output)

@@ -251,12 +251,13 @@ def show_remote_handoff(color):
         (marker + ellipsis).encode(encoding)
     except UnicodeEncodeError:
         marker, ellipsis = "o", "..."
-    label = f"{marker} Waiting for remote to start{ellipsis}"
+    label = f"{marker} Waiting for remote setup to start{ellipsis}"
     width = max(1, columns - 1)
     if len(label) > width:
         label = label[:max(0, width - len(ellipsis))] + ellipsis[:width]
     if color:
-        label = "\x1b[2;36m" + label + "\x1b[0m"
+        # Match the spinner (ansigray) and label (dim) of live progress.
+        label = "\x1b[37m" + label[:1] + "\x1b[0;2m" + label[1:] + "\x1b[0m"
     sys.stdout.buffer.write((label + "\n").encode(encoding))
     sys.stdout.buffer.flush()
 
