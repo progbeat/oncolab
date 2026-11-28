@@ -522,7 +522,7 @@ def read_setup_summary(path, stop, labels, color):
                     if buffer.endswith(b"\n"):
                         rows = json.loads(buffer)
                         if not isinstance(rows, list) or any(
-                            not isinstance(row, list) or len(row) != 4 or row[0] not in (0, 2)
+                            not isinstance(row, list) or len(row) != 4 or type(row[0]) is not int or row[0] not in (0, 2)
                             or not isinstance(row[1], str)
                             or any(type(n) not in (int, float) or not math.isfinite(n) for n in row[2:])
                             or row[2] > row[3] for row in rows
@@ -626,6 +626,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
     # The bootstrap channel must never read the command's stdin.
     tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
     live_payload = terminal and tty == "-t"
+    verbose = verbose and sys.stderr is not None
     summary_path = drive_stage + "-summary.sock" if verbose and tty_merges_separate_stderr(tty) else None
     if summary_path:
         config["summary_path"] = summary_path

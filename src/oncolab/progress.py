@@ -115,8 +115,10 @@ def completed_steps(rows, labels, color):
             return sum((2 if east_asian_width(char) in "WF" else 1)
                        for char in value if not combining(char))
 
-    rows = [(indent, display_label(label), started, ended) for indent, label, started, ended in rows]
     stream = sys.stderr
+    if stream is None:
+        return
+    rows = [(indent, display_label(label), started, ended) for indent, label, started, ended in rows]
     tty = stream.isatty() and os.environ.get("TERM", "dumb") != "dumb"
     color = color and tty
     width = max((get_cwidth(label) for label in labels), default=1)
@@ -436,6 +438,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
         def setup_event(kind, *fields):
             timeline.event(kind, *fields)
             if bar is not None:
+                if kind == "setup-finish":
+                    return  # The renderer is about to erase its last live frame.
                 if kind == "setup-job":
                     if fields[1]:
                         reserve("  " + display_label(fields[1]))

@@ -84,6 +84,12 @@ class Progress(unittest.TestCase):
             os.close(writer)
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
+    def test_missing_standard_error_is_ignored(self):
+        from oncolab.progress import completed_steps
+
+        with patch("sys.stderr", None):
+            completed_steps([(0, "Setting up…", 0, 1)], ["Setting up…"], False)
+
     def test_full_summary_pipe_does_not_block_command(self):
         reader, writer = os.pipe()
         try:
