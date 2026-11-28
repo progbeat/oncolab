@@ -44,10 +44,18 @@ if "-T" in argv:
         print("Traceback (most recent call last):\nRuntimeError: user failure", file=sys.stderr)
         raise SystemExit(19)
     if shlex.split(argv[-1])[-1] == "transport-255":
-        Path(argv[argv.index("-E") + 1]).write_text("mux_client_request_session: read from master failed: Broken pipe")
+        Path(argv[argv.index("-E") + 1]).write_text("mux.c:mux_client_request_session():1982 (pid=8): "
+                                                     "read from master failed: Broken pipe")
+        raise SystemExit(255)
+    if shlex.split(argv[-1])[-1] == "transport-lost":
+        assert "LogLevel=ERROR" in argv and "LogVerbose=*:mux_client_request_session():*" in argv
+        Path(argv[argv.index("-E") + 1]).write_text("debug2: mux_client_request_session: master session id: 2\n"
+                                                     "debug2: Control master terminated unexpectedly")
         raise SystemExit(255)
     if shlex.split(argv[-1])[-1] == "exit-255":
+        Path(argv[argv.index("-E") + 1]).write_text("debug2: Received exit status from master 255")
         print("user output")
+        print("mux_client_request_session: this is payload stderr", file=sys.stderr)
         raise SystemExit(255)
     sys.stdout.buffer.write(sys.stdin.buffer.read())
     raise SystemExit(0)
@@ -123,16 +131,20 @@ raise SystemExit(namespace["main"]())
             oncolab, env = self.fake_commands(Path(tmp))
             result = subprocess.run([oncolab, "--", "exit-255"], env=env,
                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=12)
-            self.assertEqual((result.returncode, result.stdout, result.stderr), (255, b"user output\n", b""))
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (255, b"user output\n", b"mux_client_request_session: this is payload stderr\n"))
 
     def test_ssh_exit_255_with_native_error_reports_recovery(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            oncolab, env = self.fake_commands(Path(tmp))
-            result = subprocess.run([oncolab, "--", "transport-255"], env=env,
-                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=12)
-            self.assertEqual((result.returncode, result.stdout), (255, b""))
-            self.assertEqual(result.stderr, b"[SSH connection failed] The SSH session could not be opened. "
-                                            b"Check 'colab sessions' for the VM.\n")
+        for name, explanation in (
+            ("transport-255", "The SSH session could not be opened."),
+            ("transport-lost", "The SSH connection closed before reporting an exit status."),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                oncolab, env = self.fake_commands(Path(tmp))
+                result = subprocess.run([oncolab, "--", name], env=env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=12)
+                self.assertEqual((result.returncode, result.stdout), (255, b""))
+                self.assertEqual(result.stderr, (f"[SSH connection failed] {explanation} "
+                                                 "Check 'colab sessions' for the VM.\n").encode())
 
     def test_delayed_ssh_handoff(self):
         for outcome in ("success", "failure", "interrupt", "raw"):
@@ -144,7 +156,7 @@ raise SystemExit(namespace["main"]())
                 if outcome == "raw":
                     env["TEST_TTY_RAW_OUTPUT"] = "1"
                 if outcome == "success":
-                    env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root))
+                    env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root), PYTHONIOENCODING="ascii")
                 pid, fd = pty.fork()
                 if not pid:
                     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))

@@ -247,7 +247,8 @@ def show_remote_handoff(color):
     label = STARTING_RUNNER if len(STARTING_RUNNER) < columns else STARTING_RUNNER[:max(0, columns - 2)] + "…"
     if color:
         label = "\x1b[2m" + label + "\x1b[0m"
-    print(label, flush=True)
+    sys.stdout.buffer.write((label + "\n").encode(sys.stdout.encoding or "utf-8", errors="replace"))
+    sys.stdout.buffer.flush()
 
 
 def upload_stream(endpoint, key, source):
@@ -497,6 +498,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             if connected.returncode:
                 show_ssh_error(connected.stderr, debug)
                 return connected.returncode, True
+            if live_payload:
+                show_remote_handoff(color)
             attempted.set()
             transfer = transfers.submit(upload, ssh, target, result, sources, targets, debug=debug) if sources else None
             task_upload = transfers.submit(upload_tasks, ssh, target, jobdir, groups, endpoint, debug=debug) if groups else None
@@ -504,19 +507,22 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             # Mux and payload failures can both return 255; only a captured
             # SSH error is evidence for reporting a connection failure.
             ssh_log = Path(tmp) / "payload-ssh.log"
-            argv = [*ssh, "-E", str(ssh_log), "-o", "ProxyCommand=false",
+            # Force only mux-status logging. Globally raising LogLevel
+            # would make OpenSSH print its TTY close footer to the user.
+            mux_status_logging = ["-o", "IgnoreUnknown=LogVerbose",
+                                  "-o", "LogVerbose=*:mux_client_request_session():*"]
+            argv = [*ssh, *mux_status_logging, "-E", str(ssh_log), "-o", "ProxyCommand=false",
                     "-o", "ControlMaster=no", tty, target, payload]
-            if live_payload:
-                show_remote_handoff(color)
             status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status == 255:
                 try:
                     with ssh_log.open("rb") as log:
+                        log.seek(max(0, ssh_log.stat().st_size - 16_384))
                         ssh_error = log.read(16_384)
                 except OSError:
                     ssh_error = b""
-                if ssh_error:
-                    show_ssh_error(ssh_error, debug, recovery=allocation_hint(name, store))
+                if error := ssh_transport_error(ssh_error):
+                    show_ssh_error(error, debug, recovery=allocation_hint(name, store))
             if status == 0:
                 pending.clear()
             if status and ((transfer and not transfer.done()) or (task_upload and not task_upload.done())):
@@ -540,6 +546,21 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             close_master()
 
 
+def ssh_transport_error(log):
+    # OpenSSH uses 255 for a missing exit packet as well as a valid 255
+    # in an exit packet. Ignore progress/debug chatter on valid exits.
+    if b"Received exit status from master" in log:
+        return b""
+    lost = b"Control master terminated unexpectedly"
+    if lost in log:
+        return lost
+    errors = (b"mux_client_request_session:", b"mux_client_request_session():",
+              b"mux_client_read_packet:", b"Connection closed",
+              b"Connection timed out", b"Connection refused", b"Permission denied", b"proxy dialer failed")
+    return b"\n".join(line for line in log.splitlines()
+                      if not line.startswith(b"debug") and any(marker in line for marker in errors))
+
+
 def show_ssh_error(stderr, debug, *, recovery=None):
     text = (stderr or b"").decode(errors="replace")
     # Never replay free-form ProxyCommand output. OpenSSH diagnostics and
@@ -561,7 +582,9 @@ def show_ssh_error(stderr, debug, *, recovery=None):
         ("Connection refused", "SSH connection was refused."),
         ("Connection closed", "The SSH connection closed."),
         ("mux_client_request_session:", "The SSH session could not be opened."),
+        ("mux_client_request_session():", "The SSH session could not be opened."),
         ("mux_client_read_packet:", "The SSH connection closed."),
+        ("Control master terminated unexpectedly", "The SSH connection closed before reporting an exit status."),
     )
     hint = next((message for marker, message in reasons if marker in text), None)
     message = hint or ("OpenSSH could not complete the session." if recovery else "Check your SSH key and Colab session.")
