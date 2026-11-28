@@ -12,7 +12,7 @@ import subprocess as sp
 import sys
 import termios
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
@@ -386,6 +386,41 @@ def prepare_copies(config, specs, explicit):
     return cli_copies, task_groups
 
 
+async def bootstrap_ssh(argv, data):
+    # Stay in the caller's foreground process group so OpenSSH can still read
+    # a password or key passphrase from /dev/tty. Own cancellation explicitly:
+    # a signal may reach oncolab alone rather than the whole process group.
+    loop = asyncio.get_running_loop()
+    spawn = asyncio.create_task(loop.subprocess_exec(
+        lambda: asyncio.subprocess.SubprocessStreamProtocol(limit=64 * 1024, loop=loop),
+        *argv, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE,
+    ))
+    transport = exchange = None
+    try:
+        transport, protocol = await asyncio.shield(spawn)
+        proc = asyncio.subprocess.Process(transport, protocol, loop)
+        exchange = asyncio.create_task(proc.communicate(data))
+        stdout, stderr = await asyncio.shield(exchange)
+        return sp.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    except asyncio.CancelledError:
+        # Shield the short spawn so even Ctrl+C during startup cannot leave
+        # an unowned SSH process. OpenSSH's exit handler closes its proxy.
+        transport = transport or (await spawn)[0]
+        with suppress(ProcessLookupError):
+            transport.terminate()
+        try:
+            if exchange is not None:
+                await asyncio.wait_for(asyncio.shield(exchange), timeout=1)
+        except asyncio.TimeoutError:
+            # SSH helpers may still have inherited stderr open even when
+            # SSH itself exits. Do not wait on their pipe indefinitely.
+            transport.close()
+            await asyncio.gather(exchange, return_exceptions=True)
+        finally:
+            transport.close()
+        raise
+
+
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
                 copies=(), task_copies=None, store=None, debug=False, connect_label=CONNECTING, unclaimed=None):
     proxy, identity, public = ssh_options(name, store)
@@ -520,12 +555,13 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
                     pass
 
         stage = shlex.join(["python3", "-c", STAGE]) if staged_input else "true"
+
+        async def connect():
+            return await bootstrap_ssh([*ssh, *connect_options, target, stage], staged_input)
+
         try:
             with without_echo(terminal_connect):
-                connected = run_step(connect_label, lambda: sp.run(
-                    [*ssh, *connect_options, target, stage],
-                    input=staged_input, capture_output=True,
-                ), terminal_connect, color, labels=labels)
+                connected = run_step(connect_label, connect, terminal_connect, color, labels=labels)
             if connected.returncode:
                 if connected.returncode in (-SIGINT, 130):
                     raise KeyboardInterrupt
@@ -613,6 +649,9 @@ def ssh_failure_reason(text):
     permanent = (
         ("no SSH public key found", "No SSH public key was found; create one with ssh-keygen -t ed25519."),
         ("[colab] failed to derive public key", "Colab could not read the SSH public key; check your SSH key."),
+        ("[colab] Server rejected request: missing pubkey header", "Colab did not receive an SSH public key."),
+        ("[colab] Server rejected pubkey: unsupported key type", "Colab rejected your SSH key type; use Ed25519 or ECDSA."),
+        ("[colab] Server rejected pubkey:", "Colab rejected your public key; check your SSH key."),
         ("[colab] Server rejected pubkey (HTTP 400)", "Colab rejected your public key; check your SSH key."),
         ("[colab] Authentication failed (HTTP 401)", "Colab rejected the connection credentials for this VM."),
         ("[colab] Forbidden (HTTP 403)", "Colab did not authorize SSH access to this VM."),

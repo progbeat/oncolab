@@ -370,6 +370,7 @@ target = "/mnt/work"
                     return subprocess.CompletedProcess(argv, 0)
 
                 with (patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+                      patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: run(argv, input=data)),
                       patch.object(cli.sp, "run", side_effect=run), patch.object(cli.sp, "call", return_value=255),
                       patch("sys.stderr", new_callable=io.StringIO) as stderr):
                     result = cli.run_session("failed-session", {"setup": {}, "env": {"TEST_SECRET": "fixture"}},
@@ -397,6 +398,7 @@ target = "/mnt/work"
               patch.object(cli, "plan", return_value=(config, None, None)),
               patch.object(cli, "allocate", return_value=("session", 0)) as allocate,
               patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+              patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: ssh(argv, input=data)),
               patch.object(cli.sp, "run", side_effect=ssh),
               patch.object(cli.sp, "call", return_value=0) as run_payload,
               patch("sys.stderr", new_callable=io.StringIO) as stderr):
@@ -462,6 +464,7 @@ target = "/mnt/work"
                   patch.dict(os.environ, {"HOME": tmp, "XDG_CONFIG_HOME": tmp}, clear=True),
                   patch("oncolab.config.which", return_value=None),
                   patch.object(cli, "ssh_options", return_value=(["colab"], [], None)),
+                  patch.object(cli, "bootstrap_ssh", side_effect=lambda argv, data: run(argv, input=data)),
                   patch.object(cli.sp, "run", side_effect=run),
                   patch.object(cli.sp, "call", side_effect=lambda argv: run(argv).returncode),
                   patch("sys.stderr", new_callable=io.StringIO) as stderr):
@@ -480,6 +483,18 @@ target = "/mnt/work"
             self.assertEqual(staged.read_bytes(), raw)
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
             self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_colab_400_ssh_rejections_are_permanent_and_masked(self):
+        for diagnostic in (
+            b"[colab] Server rejected pubkey: unsupported key type. fixture-secret",
+            b"[colab] Server rejected pubkey (HTTP 400): fixture-secret",
+            b"[colab] Server rejected request: missing pubkey header. fixture-secret",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                failure = cli.SSHBootstrapError(255, diagnostic)
+                self.assertFalse(failure.retry)
+                self.assertTrue(failure.rejected)
+                self.assertNotIn("fixture-secret", failure.reason)
 
     def test_named_copy_and_cli_copy_reject_overlapping_destinations(self):
         with tempfile.TemporaryDirectory() as tmp:

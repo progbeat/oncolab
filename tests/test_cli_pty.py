@@ -24,13 +24,20 @@ class Terminal(unittest.TestCase):
         fake_colab(root)
         ssh = root / "ssh"
         ssh.write_text(f"#!{sys.executable}\n" + r'''
-import json, os, shlex, sys, time
+import json, os, shlex, signal, subprocess, sys, time
 from pathlib import Path
 argv = sys.argv[1:]
 if "-O" in argv:
     raise SystemExit(0)
 if "-M" in argv:
     root = Path(os.environ["XDG_CONFIG_HOME"])
+    if os.environ.get("TEST_SSH_HANG"):
+        # Model a wedged client plus a proxy that inherited SSH's stderr.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        proxy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        (root / "hung-ssh").write_text(f"{os.getpid()} {proxy.pid}")
+        while True:
+            time.sleep(1)
     if mode := os.environ.get("TEST_SSH_RETRY"):
         log = root / "bootstrap-stores"
         count = len(log.read_text().splitlines()) if log.exists() else 0
@@ -191,6 +198,41 @@ raise SystemExit(namespace["main"]())
                     self.assertTrue(released.is_file())
                     self.assertEqual(len(log.read_text().splitlines()), 1)
                 finally:
+                    if proc.poll() is None:
+                        proc.kill()
+
+    def test_targeted_sigint_during_inflight_ssh_reaps_client_and_releases_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oncolab, env = self.fake_commands(root)
+            released = root / "released"
+            env.update(TEST_SSH_HANG="1", TEST_RELEASE_MARKER=str(released))
+            with subprocess.Popen([oncolab, "--attempts", "0", "--", "true"], env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                ssh_pid = proxy_pid = None
+                try:
+                    marker = root / "hung-ssh"
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline and proc.poll() is None:
+                        if marker.exists() and (pids := marker.read_text().split()):
+                            ssh_pid, proxy_pid = map(int, pids)
+                            break
+                        time.sleep(.02)
+                    self.assertIsNotNone(ssh_pid)
+                    # Signal oncolab only, not the terminal's process group.
+                    proc.send_signal(signal.SIGINT)
+                    output, errors = proc.communicate(timeout=8)
+                    self.assertEqual((proc.returncode, output, errors), (130, b"", b"[cancelled]\n"))
+                    self.assertTrue(released.is_file())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(ssh_pid, 0)
+                finally:
+                    for pid in (ssh_pid, proxy_pid):
+                        if pid is not None:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                     if proc.poll() is None:
                         proc.kill()
 
