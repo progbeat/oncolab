@@ -224,7 +224,7 @@ raise SystemExit(namespace["main"]())
                                                  rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")
                         self.assertNotIn(b"READY_FOR_TEST", output)
                     elif outcome == "raw":
-                        self.assertIn("⠿ Waiting for remote setup to start…\r\n".encode(), output)
+                        self.assertIn("⠛ Waiting for remote setup to start…\r\n".encode(), output)
                         self.assertTrue(output.endswith(b"RAW_FIRST\r\nRAW_LAST\r\n"), output)
                     else:
                         self.assertIn(b"[cancelled]", output)

@@ -245,8 +245,7 @@ def show_remote_handoff(color):
     # Python takes over. The remote runner reuses this row on success.
     columns = os.get_terminal_size(sys.stdout.fileno()).columns or 80
     encoding = sys.stdout.encoding or "utf-8"
-    # The union of the six dot positions used by the animated spinner.
-    marker, ellipsis = "⠿", "…"
+    marker, ellipsis = "⠛", "…"
     try:
         (marker + ellipsis).encode(encoding)
     except UnicodeEncodeError:
