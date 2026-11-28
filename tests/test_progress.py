@@ -125,6 +125,25 @@ class Progress(unittest.TestCase):
             )
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
+    def test_stopped_stderr_terminal_does_not_block_command(self):
+        reader, writer = pty.openpty()
+        try:
+            os.set_blocking(writer, False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    os.write(writer, b"x" * 512)
+            os.set_blocking(writer, True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=writer, timeout=5, env=dict(os.environ, TERM="xterm"),
+            )
+            self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+        finally:
+            os.close(reader)
+            os.close(writer)
+
     def test_summary_uses_local_relay_for_a_pty_or_piped_stderr(self):
         self.assertTrue(needs_summary_relay("-t"))
         reader, writer = os.pipe()

@@ -128,7 +128,7 @@ def completed_steps(rows, labels, color):
         fd = None
     with suppress(OSError, ValueError, sp.TimeoutExpired):
         mode = os.fstat(fd).st_mode if fd is not None else 0
-        pipe = stat.S_ISFIFO(mode)
+        bounded = stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)
         sock = stat.S_ISSOCK(mode)
         lines = bytearray()
         for indent, label, started, ended in rows:
@@ -156,7 +156,7 @@ def completed_steps(rows, labels, color):
                 stream.flush()
                 continue
             data = line.encode("utf-8")
-            if pipe:
+            if bounded:
                 lines.extend(data)
                 continue
             # A failed buffered write would be retried by Python at shutdown
@@ -175,8 +175,8 @@ def completed_steps(rows, labels, color):
                     return
                 pending = pending[written:]
         if lines:
-            # Another writer may fill the pipe after a readiness check.
-            # Bound the entire write without changing the shared fd flags.
+            # Pipes and terminals may stop draining at any moment. Bound
+            # the write without changing the caller's shared fd flags.
             sp.run(["/bin/cat"], input=bytes(lines), stdout=fd, stderr=sp.DEVNULL, timeout=.2)
 
 
