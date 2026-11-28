@@ -84,6 +84,31 @@ class Progress(unittest.TestCase):
             os.close(writer)
         self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
 
+    def test_completed_rows_return_to_column_zero_in_raw_and_cooked_terminals(self):
+        code = """
+from oncolab.progress import completed_steps
+completed_steps([(0, "Setting up…", 0, 2), (2, "Mounting Drive…", 1, 2)],
+                ["Setting up…", "  Mounting Drive…"], False)
+"""
+        for output_flags in (0, termios.OPOST | termios.ONLCR):
+            with self.subTest(output_flags=output_flags):
+                reader, writer = pty.openpty()
+                try:
+                    attrs = termios.tcgetattr(writer)
+                    attrs[1] = output_flags
+                    termios.tcsetattr(writer, termios.TCSANOW, attrs)
+                    process = subprocess.run([sys.executable, "-c", code], stderr=writer,
+                                             env=dict(os.environ, TERM="dumb"), timeout=5)
+                    self.assertEqual(process.returncode, 0)
+                    saved = bytearray()
+                    while select.select([reader], [], [], .1)[0]:
+                        saved.extend(os.read(reader, 8192))
+                    self.assertRegex(saved.decode(), r"^✓ Setting up… +2\.0s\r\n"
+                                                     r"  ✓ Mounting Drive… +1\.0s\r\n$")
+                finally:
+                    os.close(writer)
+                    os.close(reader)
+
     def test_missing_standard_error_is_ignored(self):
         from oncolab.progress import completed_steps
 

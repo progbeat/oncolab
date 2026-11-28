@@ -102,6 +102,7 @@ class SetupTimeline:
 def completed_steps(rows, labels, color):
     """Write the retained transcript apart from both live UI and stdout."""
     import os
+    import termios
     from contextlib import suppress
 
     try:
@@ -117,13 +118,23 @@ def completed_steps(rows, labels, color):
     if stream is None:
         return
     rows = [(indent, display_label(label), started, ended) for indent, label, started, ended in rows]
-    tty = stream.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+    terminal = stream.isatty()
+    tty = terminal and os.environ.get("TERM", "dumb") != "dumb"
     color = color and tty
     width = max((get_cwidth(label) for label in labels), default=1)
     try:
         fd = stream.fileno()
     except (AttributeError, OSError, ValueError):
         fd = None
+    newline = "\n"
+    if terminal and fd is not None:
+        # Local OpenSSH puts a shared terminal in raw mode while the remote
+        # relay sends these rows back. Raw LF advances without returning to
+        # column zero; supply CR only if the terminal won't add it itself.
+        with suppress(OSError, termios.error):
+            flags = termios.tcgetattr(fd)[1]
+            if not (flags & termios.OPOST and flags & termios.ONLCR):
+                newline = "\r\n"
     with suppress(OSError, ValueError, sp.TimeoutExpired):
         lines = bytearray()
         for indent, label, started, ended in rows:
@@ -145,7 +156,7 @@ def completed_steps(rows, labels, color):
             if color:
                 label = f"\x1b[2m{label}\x1b[0m"
                 timer = f"\x1b[36m{timer}\x1b[0m"
-            line = f"{' ' * indent}{mark} {label}{' ' * max(0, padding)}  {timer}\n"
+            line = f"{' ' * indent}{mark} {label}{' ' * max(0, padding)}  {timer}{newline}"
             if fd is None:
                 stream.write(line)
                 stream.flush()
