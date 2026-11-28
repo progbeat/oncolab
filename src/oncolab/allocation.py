@@ -9,7 +9,6 @@ import subprocess as sp
 import sys
 from contextlib import nullcontext
 from importlib.resources import files
-from math import ceil
 from pathlib import Path
 from signal import SIGINT
 from tempfile import TemporaryFile
@@ -53,8 +52,7 @@ class AllocationLabel:
         _, detail, deadline, attempt = self.state
         if deadline is None:
             return detail
-        # Round up to a tenth of a second so the countdown does not show zero early.
-        remaining = format_duration(ceil((deadline - monotonic()) * 10) / 10)
+        remaining = format_duration(deadline - monotonic(), round_up=True)
         return " · ".join(part for part in (f"attempt {attempt}" if attempt else "", remaining, detail) if part)
 
 
@@ -177,7 +175,7 @@ def supervise(proc, label, cancellation, diagnostics, *, debug, budget):
                     explained = True
                     delay = event.get("retry_after")
                     if type(delay) in (int, float) and 0 < delay < float("inf"):
-                        message += f"; retry after {format_duration(delay)}"
+                        message += f"; retry after {format_duration(delay, round_up=True)}"
                     if event.get("unconfirmed"):
                         # Group the original refusal and the next action, not
                         # two separate failure messages for the same request.

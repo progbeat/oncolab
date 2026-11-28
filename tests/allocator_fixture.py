@@ -33,7 +33,7 @@ if mode == "unconfirmed":
     print(json.dumps({"error": "Could not confirm allocation; check 'colab sessions'.", "unconfirmed": True}), flush=True)
     sys.exit(1)
 if mode == "holdoff":
-    print(json.dumps({"error": "HTTP 429: Colab is rate limiting requests", "retry_after": 172800}), flush=True)
+    print(json.dumps({"error": "HTTP 429: Colab is rate limiting requests", "retry_after": 90000}), flush=True)
     sys.exit(1)
 if mode == "cancel":
     print(json.dumps({"label": "Waiting to retry…", "detail": "TEST_BACKOFF_STARTED", "deadline": time.monotonic() + 40}), flush=True)

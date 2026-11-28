@@ -29,6 +29,26 @@ class Progress(unittest.TestCase):
             with self.subTest(seconds=seconds):
                 self.assertEqual(format_duration(seconds), expected)
 
+    def test_rounded_elapsed_time_carries_to_the_next_unit(self):
+        for seconds, expected in (
+            (59.94, "59.9s"), (59.95, "1.0m"),
+            (3596.9, "59.9m"), (3597, "1.0h"),
+            (86219, "23.9h"), (86220, "1.0d"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds), expected)
+
+    def test_rounded_remaining_time_never_understates_the_wait(self):
+        for seconds, expected in (
+            (0, "0.0s"), (0.001, "0.1s"),
+            (59.9, "59.9s"), (59.91, "1.0m"), (60.01, "1.1m"),
+            (3594, "59.9m"), (3594.1, "1.0h"), (3601, "1.1h"),
+            (86040, "23.9h"), (86041, "1.0d"), (86401, "1.1d"),
+            (90000, "1.1d"), (95040, "1.1d"), (95040.01, "1.2d"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds, round_up=True), expected)
+
     def test_outcome_only_colors_the_heading_on_a_terminal(self):
         with patch("sys.stderr.isatty", return_value=True), patch.dict(os.environ, TERM="xterm"):
             self.assertEqual(outcome("VM creation failed", "Unavailable.", color=True),

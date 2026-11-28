@@ -143,6 +143,9 @@ class Protocol(unittest.TestCase):
             self.assertEqual(label.detail(), "attempt 3 · 0.1s · time out")
         with patch.object(allocation, "monotonic", return_value=100.2):
             self.assertEqual(label.detail(), "attempt 3 · 0.0s · time out")
+        label.state = ("Waiting to retry…", "HTTP 503", 90100, "2/4")
+        with patch.object(allocation, "monotonic", return_value=100):
+            self.assertEqual(label.detail(), "attempt 2/4 · 1.1d · HTTP 503")
 
     def test_retry_after_preserves_multi_day_delay(self):
         self.assertEqual(worker.retry_after("172800"), 172800)
@@ -283,7 +286,7 @@ class InstalledCLI(unittest.TestCase):
             out, err = proc.communicate(timeout=8)
             self.assertEqual(proc.returncode, 1)
             self.assertEqual(out, "")
-            self.assertEqual(err, "[VM creation failed] HTTP 429: Colab is rate limiting requests; retry after 2.0d\n")
+            self.assertEqual(err, "[VM creation failed] HTTP 429: Colab is rate limiting requests; retry after 1.1d\n")
 
     def test_sigint_during_backoff_exits_promptly(self):
         with tempfile.TemporaryDirectory() as tmp, self.run_cli("cancel", tmp) as proc:
