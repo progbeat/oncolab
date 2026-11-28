@@ -84,13 +84,13 @@ class SetupTimeline:
             todo.extend(blockers(self.jobs[key][1]))
         return keep
 
-    def rows(self, verbose):
+    def rows(self, timings):
         if self.started is None:
             return []
-        if self.finished is not None and (not verbose or self.status != 0):
+        if self.finished is not None and (not timings or self.status != 0):
             return []
         rows = [(0, "Setting up…", self.started, self.finished)]
-        keep = self.candidates() if verbose else set()
+        keep = self.candidates() if timings else set()
         jobs = [key for key in self.starts if key in keep or key not in self.ends]
         for key in jobs:
             label, _ = self.jobs[key]
@@ -213,7 +213,7 @@ def setup_summary_socket(path):
 
 
 def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None, takeover=None,
-             setup=False, verbose=False, summary_path=None):
+             setup=False, timings=False, summary_path=None):
     import asyncio
     from contextlib import ExitStack, contextmanager
     from inspect import iscoroutinefunction
@@ -450,7 +450,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                         reserve("  " + display_label(fields[1]))
                     return
                 counters = []
-                for indent, label, started, ended in timeline.rows(verbose):
+                for indent, label, started, ended in timeline.rows(timings):
                     counter = ProgressBarCounter(bar, None, label, False, None)
                     counter.started, counter.ended, counter.indent = started, ended, indent
                     counters.append(counter)
@@ -462,7 +462,7 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
             run.setup_event = setup_event
         result = asyncio.run(work(run))
         stack.close()
-        if verbose and timeline is not None and timeline.status == 0:
+        if timings and timeline is not None and timeline.status == 0:
             rows = timeline.rows(True)
             if send_summary is not None:
                 send_summary(rows)

@@ -297,7 +297,7 @@ raise SystemExit(namespace["main"]())
                 self.assertEqual(result.stderr, (f"[SSH connection failed] {explanation} "
                                                  "Check 'colab sessions' for the VM.\n").encode())
 
-    def test_verbose_ssh_finishes_before_the_remote_handoff(self):
+    def test_timings_ssh_finishes_before_the_remote_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             oncolab, env = self.fake_commands(root)
@@ -305,7 +305,7 @@ raise SystemExit(namespace["main"]())
             pid, fd = pty.fork()
             if not pid:
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-                os.execve(oncolab, [oncolab, "--verbose", "--", "example"], env)
+                os.execve(oncolab, [oncolab, "--timings", "--", "example"], env)
             output = bytearray()
             deadline = time.monotonic() + 12
             try:
@@ -339,7 +339,7 @@ raise SystemExit(namespace["main"]())
                     os.waitpid(pid, 0)
 
     def test_delayed_ssh_handoff(self):
-        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure", "verbose"):
+        for outcome in ("success", "failure", "interrupt", "raw", "setup-failure", "timings"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 oncolab, env = self.fake_commands(root)
@@ -352,7 +352,7 @@ raise SystemExit(namespace["main"]())
                     env["TEST_TTY_SETUP_FAILURE"] = "1"
                 if outcome == "success":
                     env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root), PYTHONIOENCODING="ascii")
-                if outcome == "verbose":
+                if outcome == "timings":
                     import socket
 
                     with socket.socket(socket.AF_UNIX) as probe:
@@ -366,11 +366,11 @@ raise SystemExit(namespace["main"]())
                 if not pid:
                     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
                     extra = []
-                    if outcome == "verbose":
+                    if outcome == "timings":
                         stderr = os.open(root / "diagnostics", os.O_WRONLY | os.O_CREAT, 0o600)
                         os.dup2(stderr, 2)
                         os.close(stderr)
-                        extra = ["--verbose"]
+                        extra = ["--timings"]
                     os.execve(oncolab, [oncolab, *extra, "--", "example", "arg with $ and spaces"], env)
                 output = bytearray()
                 deadline = time.monotonic() + 12
@@ -411,14 +411,14 @@ raise SystemExit(namespace["main"]())
                     pid = None
                     self.assertTrue(saw_handoff, output)
                     expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19,
-                                "setup-failure": 7, "verbose": 0}[outcome]
+                                "setup-failure": 7, "timings": 0}[outcome]
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
                         self.assertIn(b"o Waiting for remote setup to start...\r\n", output)
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
-                    elif outcome == "verbose":
+                    elif outcome == "timings":
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertNotIn("✓".encode(), output)
                         diagnostics = (root / "diagnostics").read_text()

@@ -102,7 +102,7 @@ Pass `--config path/to/profile.toml`, or save your default profile as
 - Eligible setup steps can start while the Drive configuration is still transferring. The command
   uses its own channel on the same SSH connection and starts only once setup is ready.
 - Interactive preparation, including `Setting up…` and its running jobs, disappears before the
-  command starts by default. Add `--verbose` to keep completed phase timings on stderr,
+  command starts by default. Add `--timings` to keep completed phase timings on stderr,
   with only the setup jobs that determined when setup could finish. If OpenSSH may
   need a key passphrase or password, it owns the terminal during authentication. With redirected
   stdout there is no live display. After allocation, SSH connection failures without a definite

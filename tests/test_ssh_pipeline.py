@@ -213,8 +213,8 @@ class ParallelSSH(unittest.TestCase):
     def test_setup_precedes_drive_config_and_command_waits(self):
         self.run_pipeline()
 
-    def test_verbose_retains_only_the_blocking_jobs_on_stderr(self):
-        self.run_pipeline(verbose=True)
+    def test_timings_retains_only_the_blocking_jobs_on_stderr(self):
+        self.run_pipeline(timings=True)
 
     def test_command_disconnect_cancels_setup_and_releases_vm(self):
         self.run_pipeline(disconnect=True)
@@ -245,7 +245,7 @@ class ParallelSSH(unittest.TestCase):
 
     def run_pipeline(self, *, disconnect=False, setup_fails=False, cancel_owner=False, cancel_client=False,
                      release_fails=False, native_env=False, slow_stderr=False, payload_status=255,
-                     preflight_fails=False, verbose=False):
+                     preflight_fails=False, timings=False):
         with tempfile.TemporaryDirectory(prefix="ocp-", dir="/tmp") as directory:
             root = Path(directory)
             if release_fails:
@@ -308,7 +308,7 @@ class ParallelSSH(unittest.TestCase):
                 if cancel_owner:
                     command = ["/bin/sh", "-c", '(sleep .8; touch command-escaped) & touch command-active; wait']
                 client = subprocess.Popen(
-                    [sys.executable, "-c", gate, control, "0", json.dumps({"verbose": verbose}), *command],
+                    [sys.executable, "-c", gate, control, "0", json.dumps({"timings": timings}), *command],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 command_env = {"COMMAND_VALUE": "late"}
@@ -345,7 +345,7 @@ class ParallelSSH(unittest.TestCase):
                     self.assertTrue((root / "unassigned").exists())
                     self.assertFalse((root / "mount-started").exists())
                     return
-                if verbose:
+                if timings:
                     # Make config, not process teardown, the final blocker.
                     wait_file(root / "independent-finished")
                 owner.stdin.write(b'"cHJpdmF0ZSBjb25maWd1cmF0aW9u"\n')
@@ -381,7 +381,7 @@ class ParallelSSH(unittest.TestCase):
                     self.assertEqual(early_error + err, b"[Setup failed] Independent setup (exit 7).\n")
                 else:
                     self.assertEqual((client.returncode, out), (payload_status, b"untouched stdin\n"))
-                    if verbose:
+                    if timings:
                         for label in ("Setting up…", "Receiving Drive config…", "Starting Drive mounts…",
                                       "Mounting work…"):
                             self.assertIn(("✓ " + label).encode(), err)

@@ -375,7 +375,7 @@ def command_gate(path, plan, color, command, render, takeover):
             output, result = render(lambda run: observe_setup(run, peer, buffer, live), live, color,
                                     labels=plan.get("progress_labels", ()),
                                     idle=plan.get("terminal_handoff"), takeover=lambda: takeover(erase=False),
-                                    setup=True, verbose=plan.get("verbose", False),
+                                    setup=True, timings=plan.get("timings", False),
                                     summary_path=plan.get("summary_path"))
         except KeyboardInterrupt:
             takeover()

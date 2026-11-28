@@ -226,7 +226,7 @@ completed_steps([(0, "Setting up…", 0, 2), (2, "Mounting Drive…", 1, 2)],
         event("setup-done", "git", 8, 7)
         self.assertEqual(timeline.candidates(), set())
 
-    def test_tty_setup_has_a_parent_in_both_modes_and_retains_only_verbose_checks(self):
+    def test_tty_setup_has_a_parent_in_both_modes_and_retains_only_timings_checks(self):
         script = """
 import asyncio
 from time import monotonic
@@ -246,18 +246,18 @@ async def exercise(run):
     event("setup-done", "next", monotonic(), 0)
     event("setup-finish", monotonic(), 0)
 
-progress(exercise, True, False, setup=True, verbose=VERBOSE,
+progress(exercise, True, False, setup=True, timings=TIMINGS,
          labels=["Setting up…", "  First job…", "  Next job…"])
 print("COMMAND_OUTPUT")
 """
-        for verbose in (False, True):
-            with self.subTest(verbose=verbose):
-                raw = self.render_progress(script.replace("VERBOSE", repr(verbose)), 60).decode()
+        for timings in (False, True):
+            with self.subTest(timings=timings):
+                raw = self.render_progress(script.replace("TIMINGS", repr(timings)), 60).decode()
                 plain = self.without_ansi(raw)
                 self.assertIn("Setting up…", plain)
                 self.assertRegex(plain, r"  [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] First job…")
                 self.assertIn("Next job…", plain)
-                if verbose:
+                if timings:
                     self.assertRegex(plain, r"✓ Setting up… +0\.\ds\r?\n  ✓ First job… +0\.\ds\r?\n"
                                             r"  ✓ Next job… +0\.\ds\r?\nCOMMAND_OUTPUT")
                 else:

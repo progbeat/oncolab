@@ -897,7 +897,7 @@ def main():
             try:
                 status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
                                   capture=True, idle=handoff, takeover=lambda: takeover(erase=False),
-                                  setup=True, verbose=plan.get("verbose", False),
+                                  setup=True, timings=plan.get("timings", False),
                                   summary_path=plan.get("summary_path"), **options)
             finally:
                 lifecycle.flush_setup_output()
