@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import sys
 
 from allocator_fixture import fake_colab
-from oncolab import allocation_worker as worker, cli
+from oncolab import allocation, allocation_worker as worker, cli
 
 
 class Protocol(unittest.TestCase):
@@ -133,7 +133,19 @@ class Protocol(unittest.TestCase):
         self.assertEqual([c.args[0] for c in request.call_args_list], ["GET", "POST", "GET"])
         self.assertEqual(len({c.kwargs["params"]["nbh"] for c in request.call_args_list}), 1)
         self.assertEqual(backend.params["shape"], "hm")
-        self.assertTrue(any("Waiting to retry" in c.kwargs["label"] for c in emit.call_args_list))
+        waiting, = [c.kwargs for c in emit.call_args_list if c.kwargs["label"] == "Waiting to retry…"]
+        self.assertEqual((waiting["attempt"], waiting["detail"]), ("1/4", "timeout"))
+
+    def test_countdown_preserves_attempt_and_does_not_round_to_zero_early(self):
+        label = allocation.AllocationLabel()
+        label.state = ("Waiting to retry…", "time out", 100.01, "3")
+        with patch.object(allocation, "monotonic", return_value=100):
+            self.assertEqual(label.detail(), "attempt 3 · 0.1s · time out")
+        with patch.object(allocation, "monotonic", return_value=100.2):
+            self.assertEqual(label.detail(), "attempt 3 · 0.0s · time out")
+        label.state = ("Waiting to retry…", "HTTP 503", 90100, "2/4")
+        with patch.object(allocation, "monotonic", return_value=100):
+            self.assertEqual(label.detail(), "attempt 2/4 · 1.1d · HTTP 503")
 
     def test_retry_after_preserves_multi_day_delay(self):
         self.assertEqual(worker.retry_after("172800"), 172800)
@@ -268,6 +280,13 @@ class InstalledCLI(unittest.TestCase):
             self.assertEqual(out, "")
             self.assertEqual(err, "[VM creation unconfirmed] HTTP 503: Colab service unavailable. "
                                   "Could not confirm allocation; check 'colab sessions'.\n")
+
+    def test_server_holdoff_uses_compact_duration_in_final_error(self):
+        with tempfile.TemporaryDirectory() as tmp, self.run_cli("holdoff", tmp) as proc:
+            out, err = proc.communicate(timeout=8)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(out, "")
+            self.assertEqual(err, "[VM creation failed] HTTP 429: Colab is rate limiting requests; retry after 1.1d\n")
 
     def test_sigint_during_backoff_exits_promptly(self):
         with tempfile.TemporaryDirectory() as tmp, self.run_cli("cancel", tmp) as proc:

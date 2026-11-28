@@ -218,7 +218,7 @@ raise SystemExit(namespace["main"]())
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
                         self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
                     elif outcome == "failure":
-                        self.assertIn("\x1b[37m⠿\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
+                        self.assertIn("\x1b[37m⠛\x1b[0;2m Waiting for remote setup to start…\x1b[0m\r\noops\r\n".encode(), output)
                     elif outcome == "setup-failure":
                         self.assertRegex(output, rb"Failing test hook.*?\x1b\[J[^\r\n]*HOOK_FIRST\r\n"
                                                  rb"HOOK_LAST\r\n\[Setup failed\] Failing test hook \(exit 7\).")

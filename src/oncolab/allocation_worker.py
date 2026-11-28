@@ -17,12 +17,13 @@ LOGIN = "No usable Colab credentials. Run 'colab sessions' in a terminal to sign
 
 
 class Failure(Exception):
-    def __init__(self, message, *, retry=False, delay=0, uncertain=False, detail=None):
+    def __init__(self, message, *, retry=False, delay=0, uncertain=False, detail=None, retry_after_hint=False):
         super().__init__(message)
         self.retry = retry
         self.delay = delay
         self.uncertain = uncertain
         self.detail = detail or message
+        self.retry_after_hint = retry_after_hint
 
 
 def emit(**event):
@@ -156,12 +157,13 @@ class Allocation:
             if not math.isfinite(delay):
                 raise Failure(f"HTTP {code}: {reason}; server holdoff is too large to schedule",
                               uncertain=method == "POST" and code >= 500)
-            if code == 429 or delay > 120:
-                reason += f"; retry after {delay}s" if delay else "; wait before trying again"
+            show_holdoff = code == 429 or delay > 120
+            if show_holdoff and not delay:
+                reason += "; wait before trying again"
             # Respect a long server holdoff without making a normal command
             # wait for hours, and never start another request before it ends.
             raise Failure(f"HTTP {code}: {reason}", retry=code in retry_details,
-                          delay=delay,
+                          delay=delay, retry_after_hint=show_holdoff and bool(delay),
                           uncertain=method == "POST" and code >= 500, detail=retry_details.get(code))
         raw = response.text.removeprefix(")]}'\n")
         try:
@@ -219,7 +221,7 @@ class Allocation:
                 if not exc.retry or (attempts and (number >= attempts or exc.delay > 120)):
                     raise
                 delay = max(exc.delay, min(120, backoff * 2 ** min(number - 1, 16)))
-                emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay)
+                emit(label="Waiting to retry…", detail=exc.detail, deadline=monotonic() + delay, attempt=count)
                 # Keep each platform sleep well within its system time range.
                 while delay > 3600:
                     sleep(3600)
@@ -309,7 +311,10 @@ def main():
     except KeyboardInterrupt:
         status = 130
     except Failure as exc:
-        emit(error=str(exc))
+        if exc.retry_after_hint:
+            emit(error=str(exc), retry_after=exc.delay)
+        else:
+            emit(error=str(exc))
         debug_error(exc, debug == "1")
     except Exception as exc:
         emit(error="Unexpected error while creating a Colab VM. Use --debug for details.")
