@@ -109,6 +109,22 @@ class Progress(unittest.TestCase):
             os.close(reader)
             os.close(writer)
 
+    def test_full_stderr_socket_does_not_block_command(self):
+        connector, sink = socket.socketpair()
+        with connector, sink:
+            sink.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    sink.send(b"x" * 512)
+            sink.setblocking(True)
+            result = subprocess.run(
+                [sys.executable, "-c", "from oncolab.progress import completed_steps; "
+                 "completed_steps([(0, 'Setting up…', 0, 1)], ['Setting up…'], False); "
+                 "print('command output'); raise SystemExit(37)"],
+                stdout=subprocess.PIPE, stderr=sink, timeout=5,
+            )
+        self.assertEqual((result.returncode, result.stdout), (37, b"command output\n"))
+
     def test_piped_stderr_uses_local_relay_even_without_a_pty(self):
         reader, writer = os.pipe()
         try:
