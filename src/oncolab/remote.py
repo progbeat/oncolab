@@ -513,6 +513,9 @@ async def setup_all(run, plan, drive, lifecycle=None):
         if "description" not in step:
             step = {**step, "description": description}
         lifecycle.nodes[name] = (step, dependencies)
+        reserve = getattr(run, "reserve", None)
+        if reserve is not None:
+            reserve(description)
 
         async def execute():
             results = await asyncio.gather(*(tasks[dep] for dep in dependencies))
@@ -700,6 +703,9 @@ def main():
     except (OSError, RuntimeError) as exc:
         print(f"oncolab: {exc}", file=sys.stderr)
         status = status or 1
+    except Exception as exc:
+        internal_error("remote preparation", exc, plan.get("debug"))
+        status = status or 1
     finally:
         lifecycle.command = None
         try:
@@ -709,12 +715,30 @@ def main():
         except OSError as exc:
             print(f"oncolab: cleanup failed; leaving the VM running: {exc.strerror}", file=sys.stderr)
             released = False
-        if released:
-            unassign()
-        for number, handler in previous.items():
-            signal(number, handler)
+        except Exception as exc:
+            internal_error("remote cleanup; leaving the VM running", exc, plan.get("debug"))
+            released = False
+        try:
+            if released:
+                unassign()
+        finally:
+            for number, handler in previous.items():
+                signal(number, handler)
     return (status if status >= 0 else 128 - status) if released else 125
 
 
+def internal_error(operation, exc, debug):
+    print(f"oncolab: Unexpected internal error during {operation}. Use --debug for details.", file=sys.stderr)
+    if debug:
+        from traceback import extract_tb
+        print(type(exc).__name__, file=sys.stderr)
+        for frame in extract_tb(exc.__traceback__):
+            print(f"  {Path(frame.filename).name}:{frame.lineno} in {frame.name}", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        internal_error("remote execution", exc, False)
+        raise SystemExit(1) from None

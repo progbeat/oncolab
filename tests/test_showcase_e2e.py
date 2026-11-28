@@ -1,6 +1,8 @@
 """Run the installed CLI and remote runner together without allocating a VM."""
 import os
 from pathlib import Path
+
+from allocator_fixture import fake_colab
 import shutil
 import socket
 import subprocess
@@ -56,11 +58,10 @@ class Showcase(unittest.TestCase):
                     self.skipTest("sandbox does not allow Unix sockets")
             work, fake_ram = root / "vm", root / "ram"
             fake_ram.mkdir()
-            colab, ssh = root / "colab", root / "ssh"
-            colab.write_text("#!/bin/sh\nprintf \"[colab] Creating session 'showcase-test'...\\n\"\n")
+            fake_colab(root)
+            ssh = root / "ssh"
             ssh.write_text(f"#!{sys.executable}\n{SSH}")
-            for script in (colab, ssh):
-                script.chmod(0o755)
+            ssh.chmod(0o755)
             # Task stdin writes a file before the dependent copy is materialized.
             (root / "prepare.sh").write_text('test "$VALUE" = shared\nprintf setup > prepared\n')
             (root / "data.txt").write_text("copied")

@@ -10,14 +10,14 @@ import time
 import unittest
 from pathlib import Path
 
+from allocator_fixture import fake_colab
+
 
 class Terminal(unittest.TestCase):
     def fake_commands(self, root):
         oncolab = shutil.which("oncolab")
         self.assertIsNotNone(oncolab)
-        colab = root / "colab"
-        colab.write_text("#!/bin/sh\nprintf \"[colab] Creating session 'test1'...\\n\"\n")
-        colab.chmod(0o755)
+        fake_colab(root)
         ssh = root / "ssh"
         ssh.write_text(f"#!{sys.executable}\n" + r'''
 import os, shlex, sys

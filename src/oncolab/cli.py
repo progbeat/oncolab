@@ -19,6 +19,7 @@ from signal import SIGINT, SIG_IGN, signal
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 
+from .allocation import AllocationError, run_allocator
 from .config import plan, read_rclone_config
 from .copy import ARCHIVE_WORKERS, COPY_FAILED, INPUT_CLOSED, copy_plan, send_archive, send_input
 from .env import parse_env
@@ -41,69 +42,45 @@ def without_echo(enabled):
         termios.tcsetattr(fd, termios.TCSANOW, original)
 
 
-def release(name, terminal, color):
+def colab_command(store):
+    return ["colab", "--config", str(store)] if store is not None else ["colab"]
+
+
+def release(name, terminal, color, store=None):
     with without_echo(terminal):
-        result = run_step("Releasing Colab VM…", lambda: sp.run(
-            ["colab", "stop", "-s", name], capture_output=True, stdin=sp.DEVNULL,
-        ), terminal, color)
-    if result.returncode:
-        print(f"oncolab: could not confirm release of {name!r}; check colab sessions", file=sys.stderr)
+        try:
+            result = run_step("Releasing Colab VM…", lambda: sp.run(
+                [*colab_command(store), "stop", "-s", name], capture_output=True,
+                stdin=sp.DEVNULL, timeout=12,
+            ), terminal, color)
+            if result.returncode == 0:
+                return
+        except (OSError, sp.TimeoutExpired):
+            pass
+    print(f"oncolab: could not confirm release of {name!r}; check colab sessions", file=sys.stderr)
 
 
-def allocate(flags, terminal, color):
+def allocate(args, terminal, color, store):
     cancelled = False
+    name = "oncolab-" + secrets.token_hex(6)
 
     def cancel(*_):
         nonlocal cancelled
-        if not cancelled and not terminal:
-            print("Cancelling: waiting for Colab…", file=sys.stderr, flush=True)
         cancelled = True
-
-    def label():
-        return "Cancelling: waiting for Colab…" if cancelled else "Creating Colab VM…"
 
     previous = signal(SIGINT, cancel)
     try:
         with without_echo(terminal) as echo_was_on:
-            result = run_step(label, lambda: sp.run(
-                ["colab", "new", *flags], capture_output=True, start_new_session=True,
-            ), terminal, color)
+            status = run_allocator(args, store, name, terminal, color, lambda: cancelled)
+        if cancelled or status == 130:
+            if status == 0:
+                release(name, terminal, color, store)
+            cancel_footer(echo_was_on, color)
+            return None, 130
+        return (name, 0) if status == 0 else (None, status)
     finally:
         signal(SIGINT, previous)
-    match = re.search(rb"^\[colab\] Creating session '([A-Za-z0-9_-]+)'", result.stdout, re.MULTILINE)
-    name = match[1].decode() if match and not result.returncode else None
-    if cancelled:
-        signal(SIGINT, SIG_IGN)
-        try:
-            if name:
-                release(name, terminal, color)
-            else:
-                print("oncolab: could not confirm allocation; check colab sessions", file=sys.stderr)
-            cancel_footer(echo_was_on, color)
-        finally:
-            signal(SIGINT, previous)
-        return None, 130
-    if name:
-        return name, 0
-    error = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", result.stderr)
-    if allocation_unavailable(error):
-        print("oncolab: Google Colab could not allocate a VM (503 Service Unavailable). "
-              "Try again in a moment.", file=sys.stderr)
-    else:
-        sys.stderr.buffer.write(result.stdout + result.stderr)
-    return None, result.returncode or 1
 
-
-
-def allocation_unavailable(stderr):
-    # Rich may wrap the URL in the final exception across terminal lines.
-    _, found, message = stderr.rpartition(b"ColabRequestError:")
-    return bool(found and re.fullmatch(
-        rb"\s*Failed to issue request POST\s+"
-        rb"https://colab\.research\.google\.com/tun/m/assign\?[^:]*:"
-        rb"\s*Service Unavailable\s*",
-        message,
-    ))
 
 def cancel_footer(echo, color):
     tty = sys.stderr.isatty() and os.environ.get("TERM", "dumb") != "dumb"
@@ -118,8 +95,8 @@ def cancel_footer(echo, color):
         print(prefix + "[cancelled]", file=sys.stderr, flush=True)
 
 
-def ssh_options(name):
-    proxy = ["colab", "ssh", "--proxy-mode", "-s", name]
+def ssh_options(name, store=None):
+    proxy = [*colab_command(store), "ssh", "--proxy-mode", "-s", name]
     for filename in ("id_ed25519.pub", "id_ecdsa.pub"):
         public = Path.home() / ".ssh" / filename
         if public.is_file():
@@ -317,8 +294,8 @@ def prepare_copies(config, specs, explicit):
 
 
 def run_session(name, config, rclone_ini, known_hosts, command, forward, terminal, color, attempted, *,
-                copies=(), task_copies=None):
-    proxy, identity, public = ssh_options(name)
+                copies=(), task_copies=None, store=None, debug=False):
+    proxy, identity, public = ssh_options(name, store)
     target = "root@colab-runtime"
     drive_stage = "/dev/shm/oncolab-" + secrets.token_hex(12)
     remote = inspect.getsource(progress) + "\n" + files("oncolab").joinpath("remote.py").read_text()
@@ -370,7 +347,7 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
         for directory, entries in staging.items()
     }).encode() if staging else b""
     payload = shlex.join(["uv", "run", "--no-project", "python3", "-c", remote, drive_stage,
-                          str(int(color)), json.dumps(config), *command])
+                          str(int(color)), json.dumps(config | {"debug": debug}), *command])
     trust = (["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}"]
              if known_hosts else ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
     with TemporaryDirectory(prefix="oc-", dir="/tmp") as tmp, ThreadPoolExecutor(2) as transfers:
@@ -422,13 +399,10 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             with without_echo(terminal_connect):
                 connected = run_step("Connecting via SSH…", lambda: sp.run(
                     [*ssh, *connect_options, target, stage],
-                    input=staged_input, capture_output=terminal_connect,
+                    input=staged_input, capture_output=True,
                 ), terminal_connect, color)
-            if terminal_connect:
-                # Setup diagnostics must not mix with payload stdout.
-                sys.stderr.buffer.write(connected.stderr)
-                sys.stderr.flush()
             if connected.returncode:
+                show_ssh_error(connected.stderr, debug)
                 return connected.returncode, True
             tty = "-t" if sys.stdin.isatty() and sys.stdout.isatty() else "-T"
             attempted.set()
@@ -459,6 +433,27 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             close_master()
 
 
+def show_ssh_error(stderr, debug):
+    text = (stderr or b"").decode(errors="replace")
+    # The ProxyCommand can emit an entire Typer traceback. Keep recognizable
+    # OpenSSH hints without exposing raw proxy responses or request URLs.
+    reasons = ("Permission denied", "Host key verification failed",
+               "REMOTE HOST IDENTIFICATION HAS CHANGED", "Connection timed out",
+               "Connection refused")
+    hint = next((reason for reason in reasons if reason in text), None)
+    print("oncolab: SSH connection failed" + (f": {hint}." if hint else
+          ". Check your SSH key and Colab session."), file=sys.stderr)
+    if debug:
+        print(f"oncolab: SSH bootstrap returned {len(stderr or b'')} diagnostic bytes", file=sys.stderr)
+
+
+def debug_internal(exc):
+    from traceback import extract_tb
+    print(type(exc).__name__, file=sys.stderr)
+    for frame in extract_tb(exc.__traceback__):
+        print(f"  {Path(frame.filename).name}:{frame.lineno} in {frame.name}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run a terminal command on a fresh Google Colab VM.")
     parser.add_argument("--version", action="version", version=f"oncolab {version('oncolab')}")
@@ -478,10 +473,20 @@ def main():
                           help="Request a GPU: T4, L4, G4, A100, H100 (subject to availability)")
     hardware.add_argument("--tpu", metavar="MODEL",
                           help="Request a TPU: V5E1, V6E1 (subject to availability)")
+    parser.add_argument("--attempts", type=int, default=4, metavar="N",
+                        help="Total VM allocation attempts for temporary failures (default 4; 0 until cancelled)")
+    parser.add_argument("--debug", action="store_true", help="Show internal diagnostic details")
     parser.add_argument("--high-mem", action="store_true", help="Request a high-memory VM")
     parser.add_argument("-A", "--forward-agent", action="store_true", help="Forward the local SSH agent")
     parser.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND")
     args = parser.parse_args()
+    if args.attempts < 0:
+        parser.error("--attempts must be nonnegative")
+    for option, models in (("gpu", ("T4", "L4", "G4", "A100", "H100")), ("tpu", ("V5E1", "V6E1"))):
+        if value := getattr(args, option):
+            if value.upper() not in models:
+                parser.error(f"--{option} must be one of {', '.join(models)}")
+            setattr(args, option, value.upper())
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("a command is required")
@@ -492,37 +497,48 @@ def main():
         ini = read_rclone_config(rclone_path) if rclone_path is not None else None
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    flags = ["--gpu", args.gpu] if args.gpu else ["--tpu", args.tpu] if args.tpu else []
-    if args.high_mem:
-        flags.append("--high-mem")
     color = not os.environ.get("NO_COLOR")
     terminal = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+    with TemporaryDirectory(prefix="oncolab-session-") as directory:
+        return execute(args, command, config, ini, known_hosts, copies, task_groups,
+                       terminal, color, Path(directory) / "sessions.json")
+
+
+def execute(args, command, config, ini, known_hosts, copies, task_groups, terminal, color, store):
     name = None
     attempted = Event()
     try:
-        name, status = allocate(flags, terminal, color)
+        name, status = allocate(args, terminal, color, store)
         if not name:
             return status
         status, fallback = run_session(name, config, ini, known_hosts, command,
                                        args.forward_agent, terminal, color, attempted, copies=copies,
-                                       **({"task_copies": task_groups} if task_groups else {}))
+                                       store=store, debug=args.debug, task_copies=task_groups)
         if fallback:
-            release(name, terminal, color)
+            release(name, terminal, color, store)
         if attempted.is_set() and (status == 255 or status < 0):
             print(f"oncolab: SSH status is ambiguous; check Colab session {name!r}", file=sys.stderr)
         return status if status >= 0 else 128 - status
     except KeyboardInterrupt:
-        # After allocation, an interrupted SSH connection may leave the mount
-        # running. Do not force-stop a VM with potentially pending writes.
+        # After SSH takes ownership, the existing remote teardown owns release.
         if name and not attempted.is_set():
-            signal(SIGINT, SIG_IGN)
-            release(name, terminal, color)
+            previous = signal(SIGINT, SIG_IGN)
+            try:
+                release(name, terminal, color, store)
+            finally:
+                signal(SIGINT, previous)
         elif name:
             print(f"oncolab: check colab sessions for {name!r} if it is still running", file=sys.stderr)
         cancel_footer(False, color)
         return 130
-    except OSError as exc:
+    except (AllocationError, OSError) as exc:
         print(f"oncolab: {exc}", file=sys.stderr)
-        if name and not attempted.is_set():
-            release(name, terminal, color)
-        return 1
+    except Exception as exc:
+        print("oncolab: Unexpected internal error. Use --debug for details.", file=sys.stderr)
+        if args.debug:
+            debug_internal(exc)
+    if name and not attempted.is_set():
+        release(name, terminal, color, store)
+    elif name:
+        print(f"oncolab: check colab sessions for {name!r} if it is still running", file=sys.stderr)
+    return 1

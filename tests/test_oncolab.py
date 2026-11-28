@@ -465,7 +465,7 @@ target = "/mnt/work"
         with patch.object(cli, "plan", return_value=({"env": {}, "workdir": "/content", "mounts": {}}, None, None)), patch.object(cli, "release") as release, \
                 patch.object(cli, "allocate", return_value=("test-session", 0)), \
                 patch("sys.argv", ["oncolab", "--", "test", "spaces and $metacharacters"]):
-            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, copies):
+            def session(name, config, ini, hosts, command, forward, terminal, color, attempted, *, copies, **kwargs):
                 self.assertEqual(command, ["test", "spaces and $metacharacters"])
                 attempted.set()
                 return 255, False
@@ -489,9 +489,12 @@ target = "/mnt/work"
         result = subprocess.run([*config["entrypoint"], *payload], capture_output=True)
         self.assertEqual((result.returncode, result.stdout), (0, b"hello world\na b $c\n"))
 
-    def test_recognizes_wrapped_colab_service_unavailable(self):
-        self.assertTrue(cli.allocation_unavailable(
-            b"Trail\nColabRequestError: Failed to issue request POST \r\n"
-            b"https://colab.research.google.com/tun/m/assign?nbh=ab\r\nc&variant=DEFAULT:"
-            b"\r\n Service Unavailable\r\n"))
-        self.assertFalse(cli.allocation_unavailable(b"ColabRequestError: Unrelated Service Unavailable"))
+    def test_internal_exception_is_quiet_unless_debugging(self):
+        for debug in (False, True):
+            argv = ["oncolab", *(["--debug"] if debug else []), "--", "true"]
+            with (patch("sys.argv", argv), patch.object(cli, "allocate", side_effect=RuntimeError("secret")),
+                  patch("sys.stderr", new_callable=io.StringIO) as stderr):
+                self.assertEqual(cli.main(), 1)
+                self.assertIn("Unexpected internal error", stderr.getvalue())
+                self.assertNotIn("secret", stderr.getvalue())
+                self.assertEqual("RuntimeError" in stderr.getvalue(), debug)
