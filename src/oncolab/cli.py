@@ -74,20 +74,26 @@ def release(name, terminal, color, store=None):
 def allocate(args, terminal, color, store, labels):
     cancellation = Cancellation()
     name = "oncolab-" + secrets.token_hex(6)
-    previous = signal(SIGINT, cancellation.request)
     try:
-        with without_echo(terminal) as echo_was_on:
-            status = run_allocator(args, store, name, terminal, color, cancellation, labels)
+        previous = signal(SIGINT, cancellation.request)
+        try:
+            with without_echo(terminal) as echo_was_on:
+                status = run_allocator(args, store, name, terminal, color, cancellation, labels)
+        finally:
+            # Stop recording cancellation before choosing the outcome.
+            # A subsequent Ctrl+C reaches execute's pre-SSH cleanup.
+            signal(SIGINT, previous)
         if (cancellation.requested or status != 0) and store.is_file():
-            # The worker may have finished writing the session at the signal
-            # boundary. It is ours and SSH has not taken ownership.
-            release(name, terminal, color, store)
+            cleanup_handler = signal(SIGINT, SIG_IGN)
+            try:
+                release(name, terminal, color, store)
+            finally:
+                signal(SIGINT, cleanup_handler)
         if cancellation.requested or status == 130:
             cancel_footer(echo_was_on, color)
             return None, 130
         return (name, 0) if status == 0 else (None, status)
     finally:
-        signal(SIGINT, previous)
         cancellation.close()
 
 

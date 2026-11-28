@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import sys
 
 from allocator_fixture import fake_colab
-from oncolab import allocation_worker as worker
+from oncolab import allocation_worker as worker, cli
 
 
 class Protocol(unittest.TestCase):
@@ -83,6 +83,28 @@ class Protocol(unittest.TestCase):
             backend.cleanup()
         self.assertEqual([c.args for c in request.call_args_list],
                          [("GET", "/assign"), ("GET", "/unassign/own-vm"), ("POST", "/unassign/own-vm")])
+
+
+    def test_sigint_at_successful_handoff_releases_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "sessions.json"
+            store.write_text("{}")
+            installed = []
+
+            def change_handler(number, handler):
+                installed.append(handler)
+                if len(installed) == 2:
+                    # The last signal delivered to the allocator's handler
+                    # arrives just before restoring the previous handler.
+                    installed[0]()
+                return signal.default_int_handler
+
+            with (patch.object(cli, "signal", side_effect=change_handler),
+                  patch.object(cli, "run_allocator", return_value=0),
+                  patch.object(cli, "release") as release,
+                  patch.object(cli, "cancel_footer")):
+                self.assertEqual(cli.allocate(None, False, False, store, ()), (None, 130))
+            release.assert_called_once()
 
 
 class InstalledCLI(unittest.TestCase):

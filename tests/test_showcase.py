@@ -197,7 +197,7 @@ class Transfers(unittest.TestCase):
             def wait(self):
                 return 0
 
-        def archive(*_):
+        def archive(*_, debug=False):
             if not all(started.wait(1) for started in blockers):
                 return "input streams did not start", True
             archived.set()
