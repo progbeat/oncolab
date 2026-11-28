@@ -48,7 +48,11 @@ async def run(argv, env=None, *args, **kwargs):
         assert env["SETUP_VALUE"] == "early"
         (root / "prerequisites").touch()
         return None
-    return await real(argv, env, *args, **kwargs)
+    result = await real(argv, env, *args, **kwargs)
+    if 'Path("independent").touch()' in argv[-1]:
+        # The script's own marker appears before its process exits.
+        (root / "independent-finished").touch()
+    return result
 
 accept = remote.SetupGate.accept
 async def tracked_accept(self):
@@ -341,6 +345,9 @@ class ParallelSSH(unittest.TestCase):
                     self.assertTrue((root / "unassigned").exists())
                     self.assertFalse((root / "mount-started").exists())
                     return
+                if verbose:
+                    # Make config, not process teardown, the final blocker.
+                    wait_file(root / "independent-finished")
                 owner.stdin.write(b'"cHJpdmF0ZSBjb25maWd1cmF0aW9u"\n')
                 owner.stdin.flush()
                 if cancel_owner:
