@@ -662,6 +662,14 @@ def main():
     _ONCOLAB_COLOR = color == "1"
     plan = json.loads(raw_plan)
     live = sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+    handoff = plan.get("terminal_handoff")
+
+    def takeover(*, erase=True):
+        nonlocal handoff
+        if handoff:
+            handoff = None
+            print("\x1b[A\r" + ("\x1b[K" if erase else ""), end="", flush=True)
+
     os.environ["PATH"] = str(Path.home() / ".local/bin") + ":" + os.environ["PATH"]
     drive = None
     jobdir = Path(plan["jobdir"]) if "jobdir" in plan else None
@@ -703,9 +711,8 @@ def main():
             os.environ["COLAB_DRIVE"] = work["target"]
         lifecycle.environment = os.environ | setup_env
         options = {"labels": plan["progress_labels"]} if "progress_labels" in plan else {}
-        handoff = plan.get("terminal_handoff")
         status = progress(lambda run: lifecycle.prepare(run, plan, drive), live, color == "1",
-                          capture=True, idle=handoff, **options)
+                          capture=True, idle=handoff, takeover=lambda: takeover(erase=False), **options)
         if lifecycle.interrupted:
             status = 128 + lifecycle.interrupted
         elif not status:
@@ -714,10 +721,7 @@ def main():
             try:
                 environment = {name: value for name, value in (lifecycle.environment | command_env).items()
                                if value is not None}
-                if handoff and not live:
-                    # Let the local relay yield even if the command is silent
-                    # and SSH did not negotiate a usable remote terminal.
-                    print("\x1b[0m", end="", flush=True)
+                takeover()
                 with sp.Popen(argv, env=environment) as cmd:
                     lifecycle.command = cmd
                     code = cmd.wait()
@@ -726,9 +730,11 @@ def main():
                 report("Command could not start", f"{argv[0]}: {exc.strerror}.")
                 status = 127 if isinstance(exc, FileNotFoundError) else 126
     except (OSError, RuntimeError) as exc:
+        takeover()
         report("Remote preparation failed", str(exc))
         status = status or 1
     except Exception as exc:
+        takeover()
         internal_error("remote preparation", exc, plan.get("debug"))
         status = status or 1
     finally:

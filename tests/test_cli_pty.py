@@ -59,6 +59,15 @@ while not (root / "finish-bootstrap").exists():
 if os.environ.get("TEST_TTY_START_FAILURE"):
     print("oops", file=sys.stderr)
     raise SystemExit(7)
+if os.environ.get("TEST_TTY_RAW_OUTPUT"):
+    import termios, tty
+    original = termios.tcgetattr(0)
+    try:
+        tty.setraw(0)
+        os.write(1, b"RAW_FIRST\r\nRAW_LAST\r\n")
+    finally:
+        termios.tcsetattr(0, termios.TCSANOW, original)
+    raise SystemExit(19)
 parts = shlex.split(argv[-1])
 assert parts[-1] == "arg with $ and spaces"
 source, stage, color, plan, *_ = parts[5:]
@@ -126,12 +135,14 @@ raise SystemExit(namespace["main"]())
                                             b"Check 'colab sessions' for the VM.\n")
 
     def test_delayed_ssh_handoff(self):
-        for outcome in ("success", "failure", "interrupt"):
+        for outcome in ("success", "failure", "interrupt", "raw"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 oncolab, env = self.fake_commands(root)
                 if outcome == "failure":
                     env["TEST_TTY_START_FAILURE"] = "1"
+                if outcome == "raw":
+                    env["TEST_TTY_RAW_OUTPUT"] = "1"
                 if outcome == "success":
                     env.update(TEST_SSH_AUTH_PROMPT="1", HOME=str(root))
                 pid, fd = pty.fork()
@@ -176,14 +187,16 @@ raise SystemExit(namespace["main"]())
                     _, status = os.waitpid(pid, 0)
                     pid = None
                     self.assertTrue(saw_handoff, output)
-                    expected = {"success": 0, "failure": 7, "interrupt": 130}[outcome]
+                    expected = {"success": 0, "failure": 7, "interrupt": 130, "raw": 19}[outcome]
                     self.assertEqual(os.waitstatus_to_exitcode(status), expected, output)
                     if outcome == "success":
                         self.assertTrue(auth_answered, output)
                         self.assertIn(b"PTY_ROUND_TRIP_OK", output)
-                        self.assertRegex(output, rb"Preparing remote command.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
+                        self.assertRegex(output, rb"\x1b\[A\r.*?\x1b\[J[^\r\n]*READY_FOR_TEST")
                     elif outcome == "failure":
-                        self.assertRegex(output, rb"Preparing remote command.*?\x1b\[J[^\r\n]*oops")
+                        self.assertRegex(output, rb"Preparing remote command[^\r\n]*\r\noops\r\n")
+                    elif outcome == "raw":
+                        self.assertTrue(output.endswith(b"RAW_FIRST\r\nRAW_LAST\r\n"), output)
                     else:
                         self.assertIn(b"[cancelled]", output)
                 finally:

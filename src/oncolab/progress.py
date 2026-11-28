@@ -23,7 +23,7 @@ def preparation_labels(plan, has_copy=False):
     return labels
 
 
-def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None):
+def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=None, takeover=None):
     import asyncio
     from contextlib import ExitStack
     from inspect import iscoroutinefunction
@@ -158,6 +158,8 @@ def progress(work, live, color, *, capture=False, labels=(), timed=True, idle=No
                 waiting = ProgressBarCounter(bar, None, idle, False, None)
                 waiting.started = monotonic()
                 bar.counters.append(waiting)
+            if takeover:
+                takeover()
             stack.enter_context(bar)
 
         def reserve(label):

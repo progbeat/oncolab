@@ -1,12 +1,10 @@
 import argparse
-import asyncio
 import base64
 import inspect
 import json
 import os
 import re
 import secrets
-import selectors
 import shlex
 import socket
 import subprocess as sp
@@ -242,55 +240,14 @@ def call_with_upload(argv, transfer):
             process.terminate()
             process.wait()
 
-def call_tty_payload(argv, transfer, color, labels):
-    # SSH keeps the actual stdin for terminal modes, signals, escape keys and
-    # window size. Only the authenticated mux exec has its output relayed.
-    with sp.Popen(argv, stdout=sp.PIPE, stderr=sp.PIPE) as process, selectors.DefaultSelector() as outputs:
-        outputs.register(process.stdout, selectors.EVENT_READ, sys.stdout.buffer)
-        outputs.register(process.stderr, selectors.EVENT_READ, sys.stderr.buffer)
-
-        def stalled_copy():
-            return transfer is not None and transfer.done() and not transfer.result()[1] and process.poll() is None
-
-        def read_output(timeout):
-            for key, _ in outputs.select(timeout):
-                data = os.read(key.fd, 65536)
-                if data:
-                    return key.data, data
-                outputs.unregister(key.fd)
-            return None
-
-        async def initial_output():
-            # Poll without a worker thread: cancellation must not wait for
-            # a blocked reader before it can terminate SSH.
-            while outputs.get_map() and not stalled_copy():
-                if chunk := read_output(0):
-                    return chunk
-                if outputs.get_map():
-                    await asyncio.sleep(.05)
-            return None
-
-        try:
-            # Erase the local status before the first terminal bytes (also
-            # on early SSH errors), or on EOF if SSH produced no output.
-            chunk = run_step(STARTING_RUNNER, initial_output, True, color, labels=labels)
-            while chunk is not None or outputs.get_map():
-                if chunk is not None:
-                    output, data = chunk
-                    try:
-                        output.write(data)
-                        output.flush()
-                    except BrokenPipeError:
-                        # Still drain SSH if the diagnostic sink closes.
-                        pass
-                if stalled_copy():
-                    return 255
-                chunk = read_output(.2)
-            return 255 if stalled_copy() else process.wait()
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                process.wait()
+def show_remote_handoff(color):
+    # Give startup diagnostics their own row even if SSH dies before
+    # Python takes over. The remote runner reuses this row on success.
+    columns = os.get_terminal_size(sys.stdout.fileno()).columns or 80
+    label = STARTING_RUNNER if len(STARTING_RUNNER) < columns else STARTING_RUNNER[:max(0, columns - 2)] + "…"
+    if color:
+        label = "\x1b[2m" + label + "\x1b[0m"
+    print(label, flush=True)
 
 
 def upload_stream(endpoint, key, source):
@@ -550,9 +507,8 @@ def run_session(name, config, rclone_ini, known_hosts, command, forward, termina
             argv = [*ssh, "-E", str(ssh_log), "-o", "ProxyCommand=false",
                     "-o", "ControlMaster=no", tty, target, payload]
             if live_payload:
-                status = call_tty_payload(argv, transfer, color, labels)
-            else:
-                status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
+                show_remote_handoff(color)
+            status = call_with_upload(argv, transfer) if transfer else sp.call(argv)
             if status == 255:
                 try:
                     with ssh_log.open("rb") as log:
